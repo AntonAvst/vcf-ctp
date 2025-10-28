@@ -1,0 +1,27 @@
+# Ultralytics BoT-SORT tracker config (compatible with YOLOv8)
+tracker_type: botsort
+
+# Association thresholds
+proximity_thresh: 0.5      # IoU/position gate (higher = looser)
+appearance_thresh: 0.25    # cosine distance gate for ReID (lower = stricter)
+match_thresh: 0.8
+
+# Detection/track thresholds
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 30           # max lost frames kept alive
+
+# Motion model / GMC
+gmc_method: sparseOptFlow  # camera motion compensation
+gmc: True
+
+# ReID
+with_reid: True
+model: auto                # let Ultralytics pick/download a lightweight ReID
+fuse_score: True 
+# reid_weights: ""         # (optional) path to a custom ReID .pt if you have one
+
+# Misc
+conf_thres: 0.001
+low_conf_thres: 0.001

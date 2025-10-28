@@ -1,0 +1,23 @@
+# Ultralytics BoT-SORT config
+tracker_type: botsort
+
+# Detection score thresholds
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+
+# Association / lifecycle
+match_thresh: 0.8
+track_buffer: 30
+max_age: 45
+min_hits: 3
+
+# Appearance matching gates
+proximity_thresh: 0.5         # distance gate for candidate matching
+appearance_thresh: 0.25       # stricter -> fewer switches, more breaks # cosine distance gate (lower = stricter)
+
+# Misc
+min_box_area: 10
+gmc_method: none              # set 'orb' if camera moves
+fuse_score: true
+mot20: false
