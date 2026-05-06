@@ -1,0 +1,27 @@
+1: nose
+2: eye_r
+3: eye_l
+4: neck
+5: withers
+6: spine_mid
+7: secrum
+8: tail_base
+9: tail_mid
+10: tail_tip
+11: shoulder_l
+12: carpus_l
+13: fetlock_fore_l
+14: hoof_fore_l
+15: shoulder_r
+16: carpus_r
+17: fetlock_fore_r
+18: hoof_fore_r
+19: hip_l
+20: hock_l
+21: fetlock_back_l
+22: hoof_back_l
+23: hip_r
+24: hock_r
+25: fetlock_back_r
+26: hoof_back_r
+
