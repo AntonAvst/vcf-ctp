@@ -12,8 +12,9 @@ track_and_dump.py — detector + tracker (+ optional pose + appearance embedding
 WSL-friendly, no GUI required.
 """
 
-import argparse, csv, json, os
+import argparse, csv, json, os, re
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from time import time
 
 import cv2
@@ -29,7 +30,21 @@ from collections import defaultdict  # per-ID crop counting
 
 EXPECTED_KP = 19  # new model: 19 keypoints (nose, forehead, ..., udder_center, neck)
 
+# -------------------- Filename-based epoch extraction --------------------
+# Expects filenames containing _S<YYYYMMDDHHmmss>  e.g.
+#   refet_33_S20241221070000_E20241221080000_6558.mp4
+_FNAME_RE = re.compile(r'_S(\d{14})')
 
+
+def epoch_from_filename(video_path: str) -> datetime | None:
+    """Parse recording start time from filename _S<YYYYMMDDHHmmss> token."""
+    m = _FNAME_RE.search(Path(video_path).stem)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    return None
 def log(msg: str) -> None:
     print(f"[track] {msg}", flush=True)
 
@@ -180,6 +195,7 @@ def main():
         "camera_id",
         "frame_index",
         "frame_time_sec",
+        "frame_datetime",   # wall-clock UTC; empty string if --osd_timestamp not used
         "temp_id",
         "det_conf",
         "x1",
@@ -252,10 +268,25 @@ def main():
 
     t_start = time()
 
+    # Epoch from filename  (e.g. ..._S20241221070000_...)
+    _epoch: datetime | None = epoch_from_filename(args.source)
+    if _epoch is not None:
+        log(f"Epoch from filename: {_epoch.isoformat()}")
+    else:
+        log("Warning: could not parse epoch from filename — frame_datetime will be empty.")
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+
+        t_sec = frame_idx / max(1e-6, fps)
+
+        # ---- frame wall-clock datetime ----
+        frame_datetime_str = ""
+        if _epoch is not None:
+            frame_wall = _epoch + timedelta(seconds=t_sec)
+            frame_datetime_str = frame_wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
         # run detector+tracker on this single frame
         results = det_model.track(
@@ -390,7 +421,6 @@ def main():
                 ]) if sc is not None else "[]"
 
         # write rows + optionally save crops
-        t_sec = frame_idx / max(1e-6, fps)
         for j, (box, tid, conf) in enumerate(zip(xyxy, tids, confs)):
             x1, y1, x2, y2 = box.tolist()
             cx = (x1 + x2) / 2.0
@@ -402,6 +432,7 @@ def main():
                 args.camera_id,
                 frame_idx,
                 round(t_sec, 3),
+                frame_datetime_str,
                 int(tid),
                 float(conf),
                 float(x1),
@@ -427,6 +458,7 @@ def main():
                 "camera_id": args.camera_id,
                 "frame_index": frame_idx,
                 "frame_time_sec": round(t_sec, 3),
+                "frame_datetime": frame_datetime_str,
                 "temp_id": int(tid),
                 "det_conf": float(conf),
                 "x1": float(x1),
@@ -518,3 +550,6 @@ if __name__ == "__main__":
 #   --pose_model "$POSE" --pose_imgsz 384 --pose_conf 0.25 --pose_batch 32 \
 #   --crop_every 100 \
 #   --min_crop_wh 100 100
+#
+# frame_datetime is populated automatically from the _S<YYYYMMDDHHmmss> token in the filename.
+# No extra flags needed.

@@ -3,8 +3,20 @@ import argparse, csv, json, os, sys, subprocess
 from pathlib import Path
 from time import time
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
 import cv2
 import numpy as np
+
+try:
+    import match_identity as mi
+    _MI_AVAILABLE = True
+    print(f"[DEBUG] match_identity import ok", flush=True)
+except Exception as e:
+    _MI_AVAILABLE = False
+    print(f"[DEBUG] match_identity import FAILED!!!! :( exception - {e}) ", flush=True)
 
 
 def log(msg):
@@ -42,11 +54,14 @@ def id_color(tid: int) -> tuple:
     return int(c[0]), int(c[1]), int(c[2])
 
 
-def draw_box(img, x1, y1, x2, y2, tid, conf=None):
+def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None):
     color = id_color(int(tid))
     x1, y1, x2, y2 = [int(round(float(v))) for v in (x1, y1, x2, y2)]
     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-    label = f"id {int(tid)}" + (f" {conf:.2f}" if conf is not None else "")
+    if animal_id is not None:
+        label = f"cow {animal_id} (t{int(tid)})"
+    else:
+        label = f"id {int(tid)}" + (f" {conf:.2f}" if conf is not None else "")
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
     y0 = max(0, y1 - th - 6)
     cv2.rectangle(img, (x1, y0), (x1 + tw + 6, y0 + th + 6), color, -1)
@@ -215,6 +230,17 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
     ap.add_argument("--tracks", required=True)
+    ap.add_argument("--kinetics", default="",
+        help="Path to kinetic_data_*.csv. If provided, identity matching runs "
+             "before playback and labels are shown as AnimalId instead of temp_id.")
+    ap.add_argument("--corr_threshold", type=float, default=0.7,
+        help="Min Pearson r to accept a temp_id->AnimalId match (default: 0.7)")
+    ap.add_argument("--min_active_bins", type=int, default=1,
+        help="Min active kinetics bins required for a match (default: 1 for live mode)")
+    ap.add_argument("--bin_minutes", type=int, default=15,
+        help="Kinetics bin width in minutes (default: 15)")
+    ap.add_argument("--min_temp_id_frames", type=float, default=0.10,
+        help="Min fraction of frames a temp_id must appear to be considered real (default: 0.10)")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--max_fps", type=float, default=0.0)
     ap.add_argument("--show_fps", action="store_true")
@@ -501,6 +527,82 @@ def stream_jsonl(path, start_frame=0, W=0, H=0, want_pose=False):
         yield cur_fi, bucket
 
 
+
+# -------- Match score table overlay ----------
+def draw_score_table(img, scores_df, assignment, margin=10):
+    """
+    Draw a semi-transparent score table (temp_id x AnimalId) in the
+    bottom-left corner of the frame.
+    Green cell = confirmed assignment, yellow = high score but unassigned,
+    gray = low/no score.
+    """
+    if scores_df is None or scores_df.empty:
+        return
+
+    import pandas as pd
+    pivot = scores_df.pivot_table(
+        index="temp_id", columns="AnimalId", values="correlation", aggfunc="first"
+    )
+
+    tids     = list(pivot.index)
+    aids     = list(pivot.columns)
+    n_rows   = len(tids) + 1   # +1 header
+    n_cols   = len(aids) + 1   # +1 row header
+
+    cell_w, cell_h = 90, 22
+    table_w = n_cols * cell_w
+    table_h = n_rows * cell_h
+
+    H, W = img.shape[:2]
+    x0 = margin
+    y0 = H - table_h - margin
+
+    # semi-transparent background
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0 - 4, y0 - 4),
+                  (x0 + table_w + 4, y0 + table_h + 4), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
+
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.38
+    thickness  = 1
+
+    def draw_cell(row, col, text, bg, fg=(255, 255, 255)):
+        cx = x0 + col * cell_w
+        cy = y0 + row * cell_h
+        cv2.rectangle(img, (cx + 1, cy + 1),
+                      (cx + cell_w - 1, cy + cell_h - 1), bg, -1)
+        (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+        tx = cx + (cell_w - tw) // 2
+        ty = cy + (cell_h + th) // 2 - 1
+        cv2.putText(img, text, (tx, ty), font, font_scale, fg, thickness, cv2.LINE_AA)
+
+    # header row
+    draw_cell(0, 0, "tid\aid", (40, 40, 40))
+    for ci, aid in enumerate(aids):
+        draw_cell(0, ci + 1, str(aid), (40, 40, 40))
+
+    # data rows
+    for ri, tid in enumerate(tids):
+        draw_cell(ri + 1, 0, f"t{tid}", (40, 40, 40))
+        for ci, aid in enumerate(aids):
+            val = pivot.loc[tid, aid] if (tid in pivot.index and aid in pivot.columns) else float("nan")
+            assigned = assignment.get(tid) == aid
+            if assigned:
+                bg = (0, 120, 0)      # green — confirmed match
+            elif not pd.isna(val) and val >= 0.5:
+                bg = (0, 100, 150)    # blue — strong but unassigned
+            else:
+                bg = (60, 60, 60)     # gray — weak / no data
+            txt = f"{val:.2f}" if not pd.isna(val) else "—"
+            draw_cell(ri + 1, ci + 1, txt, bg)
+
+    # legend line
+    ly = y0 - 8
+    cv2.putText(img, "green=matched  blue=strong  gray=weak",
+                (x0, ly), font, 0.32, (180, 180, 180), 1, cv2.LINE_AA)
+
+
 # -------- Main ----------
 def main():
     args = parse_args()
@@ -510,6 +612,32 @@ def main():
         raise FileNotFoundError(f"Video not found: {vid}")
     if not trk.exists():
         raise FileNotFoundError(f"Tracks not found: {trk}")
+
+    # ---- live identity matching state ----
+    # Scores and assignment are recomputed each time a new kinetics interval boundary
+    # is crossed during playback, creating the illusion of live matching.
+    assignment    = {}     # {temp_id -> AnimalId}  — updated each interval
+    scores_df     = None   # full score DataFrame    — updated each interval
+    _last_bin     = None   # last kinetics bin boundary we computed at
+    _tracks_df    = None   # full tracks dataframe cached for incremental scoring
+    _kinetics_df  = None   # kinetics dataframe cached
+
+    _live_matching = False
+    if args.kinetics:
+        if not _MI_AVAILABLE:
+            log("WARNING: match_identity.py not on PYTHONPATH — skipping identity matching.")
+        else:
+            kin_path = Path(args.kinetics)
+            if not kin_path.exists():
+                log(f"WARNING: kinetics file not found: {kin_path} — skipping.")
+            else:
+                import pandas as _pd
+                log(f"Loading tracks and kinetics for live matching...")
+                _tracks_df   = _pd.read_csv(str(trk), parse_dates=["frame_datetime"])
+                _kinetics_df = _pd.read_csv(str(kin_path), parse_dates=["datetime"])
+                _live_matching = True
+                log(f"Live matching ready. Scores will update every {args.bin_minutes}-min interval.")
+                log(f"  corr_threshold={args.corr_threshold}  min_active_bins={args.min_active_bins}")
 
     log(f"Opening video: {vid}")
     cap = cv2.VideoCapture(str(vid))
@@ -576,9 +704,10 @@ def main():
             writer = cv2.VideoWriter(args.outmp4, fourcc, fps, (W, H))
 
     paused = False
+    show_table = True   # toggle with 't'
     prev_t = time()
     n_frames = 0
-    log("Press 'p' to pause, 'q' to quit.")
+    log("Press 'p' to pause, 't' to toggle score table, 'q' to quit.")
 
     # decide effective kp threshold (v is 0/1/2)
     kp_thresh_effective = args.kp_thresh
@@ -595,6 +724,9 @@ def main():
             if ch == "p":
                 paused = not paused
                 log("Paused." if paused else "Resumed.")
+            if ch == "t":
+                show_table = not show_table
+                log("Score table: " + ("visible" if show_table else "hidden"))
 
             if paused:
                 if args.sink == "cv2":
@@ -635,6 +767,7 @@ def main():
                     d["y2"],
                     d["temp_id"],
                     d["conf"],
+                    animal_id=assignment.get(int(d["temp_id"])),
                 )
                 if args.draw_pose and ("kps" in d) and d["kps"]:
                     draw_pose(
@@ -652,6 +785,42 @@ def main():
                         index_thickness=args.kp_index_thickness,
                         index_offset=args.kp_index_offset,
                     )
+
+            # ---- live matching: recompute on each new kinetics interval ----
+            if _live_matching and next_fi is not None:
+                # get the frame_datetime for this frame from the tracks df
+                _frame_rows = _tracks_df[_tracks_df["frame_index"] == frame_idx]
+                if not _frame_rows.empty:
+                    import pandas as _pd
+                    _now_dt = _frame_rows["frame_datetime"].iloc[0]
+                    # compute which kinetics bin we are currently in
+                    _cur_bin = _now_dt.floor(f"{args.bin_minutes}min")
+                    if _cur_bin != _last_bin:
+                        # crossed a new interval boundary — recompute
+                        try:
+                            assignment, scores_df = mi.score_up_to(
+                                tracks_df=_tracks_df,
+                                kinetics_df=_kinetics_df,
+                                up_to_datetime=_now_dt,
+                                bin_minutes=args.bin_minutes,
+                                activity_pct=0.25,
+                                min_active_bins=args.min_active_bins,
+                                min_temp_id_frames=args.min_temp_id_frames,
+                            )
+                            _last_bin = _cur_bin
+                            # print update to terminal
+                            n_bins_done = int((_now_dt - _tracks_df["frame_datetime"].min())
+                                              .total_seconds() / 60 / args.bin_minutes)
+                            log(f"[{_now_dt.strftime('%H:%M:%S')}] "
+                                f"Interval {n_bins_done} — "
+                                + (", ".join(f"t{t}->{a}" for t,a in sorted(assignment.items()))
+                                   if assignment else "no confident matches yet"))
+                        except Exception as _exc:
+                            log(f"Live match error: {_exc}")
+
+            # identity match score table overlay
+            if show_table and scores_df is not None:
+                draw_score_table(frame, scores_df, assignment)
 
             # FPS overlay
             if args.show_fps:
@@ -717,9 +886,9 @@ if __name__ == "__main__":
     main()
 
 
-
 # Example usage:
 # python3 display_tracks.py \
 #   --video "/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4" \
-#   --tracks "/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21_pose_13_11_25/tracks.csv" \
-#   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35
+#   --tracks "/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21_pose/tracks.csv" \
+#   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35 \
+#   --kinetics /home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv --corr_threshold 0.7 --min_active_bins 3
