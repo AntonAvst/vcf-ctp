@@ -14,7 +14,7 @@ embed_parquet_row / kps_parquet_row columns are integer pointers into the parque
 WSL-friendly, no GUI required.
 """
 
-import argparse, json, re, sqlite3
+import argparse, json, re, signal, sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 from time import time
@@ -299,6 +299,16 @@ def main():
 
     embed_writer = EmbedWriter(embed_pq_path)
     kps_writer   = KpsWriter(kps_pq_path)
+
+    # ── graceful stop on Ctrl+C ───────────────────────────────────────────────
+    _stop = False
+    def _handle_sigint(sig, frame):
+        nonlocal _stop
+        if not _stop:
+            _stop = True
+            print("\n[track] Ctrl+C received — finishing current frame then saving...",
+                  flush=True)
+    signal.signal(signal.SIGINT, _handle_sigint)
     crop_occurrence       = defaultdict(int)
     warned_kp_mismatch    = False
     embed_row_counter     = 0
@@ -333,6 +343,9 @@ def main():
             last_commit_frame = frame_idx
 
     while True:
+        if _stop:
+            log(f"Stopping at frame {frame_idx} (graceful stop requested).")
+            break
         ok, frame = cap.read()
         if not ok:
             break
@@ -505,7 +518,7 @@ if __name__ == "__main__":
 # POSE=/home/anton/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
 # VID=/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4
 # OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21
-#
+
 # python3 track_and_dump.py \
 #   --model      "$DET" \
 #   --source     "$VID" \
