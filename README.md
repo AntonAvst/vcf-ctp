@@ -1,7 +1,7 @@
 # vcf-ctp
 **V**ision–**C**ollar **F**usion for **C**alving-**T**ype **P**rediction in Dairy Cows
 
-# Calving Prediction System — Full Architecture Reference
+Full Architecture Reference
 
 ## Project
 **Thesis:** Predictive Modelling of Calving Outcomes in Dairy Cows Using Multi-Modal Sensor and Vision Data  
