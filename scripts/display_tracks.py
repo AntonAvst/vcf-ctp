@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, csv, json, os, sys, subprocess
+import argparse, json, os, sqlite3, sys, subprocess
 from pathlib import Path
 from time import time
 
@@ -328,8 +328,11 @@ def draw_pose(
 # -------- CLI ----------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--video", required=True)
-    ap.add_argument("--tracks", required=True)
+    ap.add_argument("--video",      required=True)
+    ap.add_argument("--db",         required=True,
+                    help="Path to calving_project.db (SQLite)")
+    ap.add_argument("--session_id", required=True,
+                    help="session_id to display (must exist in video_sessions table)")
     ap.add_argument("--kinetics", default="",
         help="Path to kinetic_data_*.csv. If provided, identity matching runs "
              "before playback and labels are shown as AnimalId instead of temp_id.")
@@ -425,203 +428,71 @@ def parse_args():
     return ap.parse_args()
 
 
-# -------- Track readers ----------
-def sniff_csv_header_and_delim(path):
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        sample = f.read(4096)
-        f.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
-        except csv.Error:
-            dialect = csv.get_dialect("excel")
-        reader = csv.reader(f, dialect)
-        header = next(reader)
-    return header, dialect
-
-
-def parse_kps_fields(row, col, W, H):
+# -------- Track reader — SQLite ----------
+def stream_sqlite(db_path: str, session_id: str,
+                  start_frame: int = 0, W: int = 0, H: int = 0,
+                  want_pose: bool = False,
+                  kps_parquet_path: str = ""):
     """
-    Return (kps_xyv, kps_conf) where:
-      - kps_xyv is list of (x,y,v) in full-frame pixels
-      - kps_conf is list of per-keypoint confidences (floats) or None
-    If keypoints are not found, returns (None, None).
-    Supports either:
-      - kps: JSON list [x1,y1,v1,...] in full-frame pixels
-      - kps_norm: JSON list [x1n,y1n,v1,...] (x,y) normalized to [0,1] by full frame size
+    Generator that yields (frame_index, [detections]) in frame_index order,
+    matching the contract of the old stream_csv / stream_jsonl.
+    Optionally joins kps.parquet for pose data when want_pose=True.
     """
+    import pandas as _pd
 
-    def as_xyv_list(flat):
-        if not flat or len(flat) % 3 != 0:
-            return None
-        out = []
-        for i in range(0, len(flat), 3):
-            x = float(flat[i])
-            y = float(flat[i + 1])
-            v = float(flat[i + 2])
-            out.append((x, y, v))
-        return out
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
 
-    kps_xyv = None
-    kps_conf = None
+    # load kps parquet once if needed
+    kps_df = None
+    if want_pose and kps_parquet_path and Path(kps_parquet_path).exists():
+        kps_df = _pd.read_parquet(kps_parquet_path)
+        kps_df = kps_df[kps_df["session_id"] == session_id].set_index(
+            ["frame_index", "temp_id"])
 
-    # per-keypoint confidence list (if present)
-    # track_and_dump writes this as 'kps_kconf'
-    if "kps_kconf" in col:
-        rawc = row[col["kps_kconf"]]
-        if rawc and rawc.strip():
+    rows = conn.execute("""
+        SELECT frame_index, temp_id, det_conf,
+               x1, y1, x2, y2,
+               kps_conf, kps_parquet_row
+        FROM   raw_tracks
+        WHERE  session_id = ?
+          AND  frame_index >= ?
+        ORDER  BY frame_index, temp_id
+    """, (session_id, start_frame)).fetchall()
+    conn.close()
+
+    cur_fi  = None
+    bucket  = []
+
+    for row in rows:
+        fi = row["frame_index"]
+        if cur_fi is None:
+            cur_fi = fi
+        if fi != cur_fi:
+            yield cur_fi, bucket
+            bucket  = []
+            cur_fi  = fi
+
+        d = {
+            "temp_id": row["temp_id"] if row["temp_id"] is not None else -1,
+            "conf":    row["det_conf"] or 0.0,
+            "x1":      row["x1"], "y1": row["y1"],
+            "x2":      row["x2"], "y2": row["y2"],
+        }
+
+        if want_pose and kps_df is not None:
             try:
-                kps_conf = json.loads(rawc)
-            except Exception:
-                kps_conf = None
-
-    # prefer absolute pixels if available
-    if "kps" in col:
-        raw = row[col["kps"]]
-        if raw and raw.strip():
-            try:
-                flat = json.loads(raw)
-                kps_xyv = as_xyv_list(flat)
-            except Exception:
+                krow = kps_df.loc[(fi, row["temp_id"])]
+                flat = list(krow["kps"])            # 57 floats [x,y,v, ...]
+                if len(flat) % 3 == 0:
+                    kps_xyv = [(flat[i], flat[i+1], flat[i+2])
+                               for i in range(0, len(flat), 3)]
+                    d["kps"]      = kps_xyv
+                    d["kps_conf"] = list(krow["kps_kconf"])  # 19 floats
+            except (KeyError, TypeError):
                 pass
 
-    # fall back to normalized
-    if "kps_norm" in col:
-        raw = row[col["kps_norm"]]
-        if raw and raw.strip():
-            try:
-                flat = json.loads(raw)
-                if flat and len(flat) % 3 == 0:
-                    out = []
-                    for i in range(0, len(flat), 3):
-                        xn = float(flat[i])
-                        yn = float(flat[i + 1])
-                        v = float(flat[i + 2])
-                        out.append((xn * W, yn * H, v))
-                    kps_xyv = out
-            except Exception:
-                pass
-
-    return kps_xyv, kps_conf
-
-
-def stream_csv(path, start_frame=0, W=0, H=0, want_pose=False):
-    header, dialect = sniff_csv_header_and_delim(path)
-    col = {k: i for i, k in enumerate(header)}
-    req = ["frame_index", "temp_id", "det_conf", "x1", "y1", "x2", "y2"]
-    for k in req:
-        if k not in col:
-            raise ValueError(f"CSV missing column: {k}")
-
-    cur_fi = None
-    bucket = []
-
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f, dialect)
-        _ = next(reader)  # header
-        for row in reader:
-            fi = int(float(row[col["frame_index"]]))
-            if fi < start_frame:
-                continue
-            if cur_fi is None:
-                cur_fi = fi
-            if fi != cur_fi:
-                yield cur_fi, bucket
-                bucket = []
-                cur_fi = fi
-
-            d = {
-                "temp_id": int(float(row[col["temp_id"]]))
-                if row[col["temp_id"]] != ""
-                else -1,
-                "conf": float(row[col["det_conf"]])
-                if row[col["det_conf"]] != ""
-                else 0.0,
-                "x1": float(row[col["x1"]]),
-                "y1": float(row[col["y1"]]),
-                "x2": float(row[col["x2"]]),
-                "y2": float(row[col["y2"]]),
-            }
-            if want_pose:
-                kps, kconf = parse_kps_fields(row, col, W, H)
-                if kps is not None:
-                    d["kps"] = kps
-                if kconf is not None:
-                    d["kps_conf"] = kconf
-            bucket.append(d)
-
-    if bucket:
-        yield cur_fi, bucket
-
-
-def stream_jsonl(path, start_frame=0, W=0, H=0, want_pose=False):
-    cur_fi = None
-    bucket = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            o = json.loads(line)
-            fi = int(o.get("frame_index", 0))
-            if fi < start_frame:
-                continue
-            if cur_fi is None:
-                cur_fi = fi
-            if fi != cur_fi:
-                yield cur_fi, bucket
-                bucket = []
-                cur_fi = fi
-
-            d = {
-                "temp_id": int(o.get("temp_id", -1)),
-                "conf": float(o.get("det_conf", 0.0)),
-                "x1": float(o.get("x1", 0)),
-                "y1": float(o.get("y1", 0)),
-                "x2": float(o.get("x2", 0)),
-                "y2": float(o.get("y2", 0)),
-            }
-
-            if want_pose:
-                kps = None
-                if (
-                    "kps" in o
-                    and isinstance(o["kps"], list)
-                    and len(o["kps"]) % 3 == 0
-                ):
-                    flat = o["kps"]
-                    kps = []
-                    for i in range(0, len(flat), 3):
-                        kps.append(
-                            (
-                                float(flat[i]),
-                                float(flat[i + 1]),
-                                float(flat[i + 2]),
-                            )
-                        )
-                elif (
-                    "kps_norm" in o
-                    and isinstance(o["kps_norm"], list)
-                    and len(o["kps_norm"]) % 3 == 0
-                ):
-                    flat = o["kps_norm"]
-                    kps = []
-                    for i in range(0, len(flat), 3):
-                        kps.append(
-                            (
-                                float(flat[i]) * W,
-                                float(flat[i + 1]) * H,
-                                float(flat[i + 2]),
-                            )
-                        )
-
-                if kps is not None:
-                    d["kps"] = kps
-
-                # optional per-kp confidences (emitted by track_and_dump.py)
-                if "kps_kconf" in o and isinstance(o["kps_kconf"], list):
-                    try:
-                        d["kps_conf"] = [float(v) for v in o["kps_kconf"]]
-                    except Exception:
-                        pass
-
-            bucket.append(d)
+        bucket.append(d)
 
     if bucket:
         yield cur_fi, bucket
@@ -706,21 +577,22 @@ def draw_score_table(img, scores_df, assignment, margin=10):
 # -------- Main ----------
 def main():
     args = parse_args()
-    vid = Path(args.video)
-    trk = Path(args.tracks)
+    vid  = Path(args.video)
+    db   = Path(args.db)
     if not vid.exists():
         raise FileNotFoundError(f"Video not found: {vid}")
-    if not trk.exists():
-        raise FileNotFoundError(f"Tracks not found: {trk}")
+    if not db.exists():
+        raise FileNotFoundError(f"DB not found: {db}")
+
+    # derive kps parquet path (same folder as the db)
+    kps_pq_path = str(db.parent / "kps.parquet")
 
     # ---- live identity matching state ----
-    # Scores and assignment are recomputed each time a new kinetics interval boundary
-    # is crossed during playback, creating the illusion of live matching.
-    assignment    = {}     # {temp_id -> AnimalId}  — updated each interval
-    scores_df     = None   # full score DataFrame    — updated each interval
-    _last_bin     = None   # last kinetics bin boundary we computed at
-    _tracks_df    = None   # full tracks dataframe cached for incremental scoring
-    _kinetics_df  = None   # kinetics dataframe cached
+    assignment    = {}
+    scores_df     = None
+    _last_bin     = None
+    _tracks_df    = None
+    _kinetics_df  = None
 
     _live_matching = False
     if args.kinetics:
@@ -732,11 +604,17 @@ def main():
                 log(f"WARNING: kinetics file not found: {kin_path} — skipping.")
             else:
                 import pandas as _pd
-                log(f"Loading tracks and kinetics for live matching...")
-                _tracks_df   = _pd.read_csv(str(trk), parse_dates=["frame_datetime"])
+                log(f"Loading tracks from DB and kinetics for live matching...")
+                _tracks_df = _pd.read_sql(
+                    "SELECT frame_index, frame_datetime, temp_id, cx, cy "
+                    "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
+                    sqlite3.connect(str(db)),
+                    params=(args.session_id,),
+                    parse_dates=["frame_datetime"],
+                )
                 _kinetics_df = _pd.read_csv(str(kin_path), parse_dates=["datetime"])
                 _live_matching = True
-                log(f"Live matching ready. Scores will update every {args.bin_minutes}-min interval.")
+                log(f"Live matching ready. Scores update every {args.bin_minutes}-min interval.")
                 log(f"  corr_threshold={args.corr_threshold}  min_active_bins={args.min_active_bins}")
 
     log(f"Opening video: {vid}")
@@ -748,12 +626,12 @@ def main():
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     log(f"Video info: {W}x{H} @ {fps:.2f} fps")
 
-    log(f"Opening tracks: {trk.name}")
-    is_csv = trk.suffix.lower() == ".csv"
-    row_stream = (
-        stream_csv(str(trk), args.start, W, H, args.draw_pose)
-        if is_csv
-        else stream_jsonl(str(trk), args.start, W, H, args.draw_pose)
+    log(f"Opening tracks: session '{args.session_id}' from {db.name}")
+    row_stream = stream_sqlite(
+        str(db), args.session_id,
+        start_frame=args.start, W=W, H=H,
+        want_pose=args.draw_pose,
+        kps_parquet_path=kps_pq_path,
     )
 
     # prime stream
@@ -1016,7 +894,9 @@ if __name__ == "__main__":
 
 # Example usage:
 # python3 display_tracks.py \
-#   --video "/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4" \
-#   --tracks "/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21_pose/tracks.csv" \
+#   --video      "/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4" \
+#   --db         "/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db" \
+#   --session_id "refet33_20241221" \
 #   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35 \
-#   --kinetics /home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv --corr_threshold 0.7 --min_active_bins 3
+#   --kinetics   /home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv \
+#   --corr_threshold 0.7 --min_active_bins 3
