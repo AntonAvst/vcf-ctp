@@ -92,6 +92,14 @@ def parse_args():
     ap.add_argument("--commit_every", type=int, default=50,
                     help="Commit SQLite transaction every N frames (default: 50). "
                          "Lower = more crash-safe, slightly more I/O.")
+    # ── reconcile.py integration ──────────────────────────────────────────────
+    ap.add_argument("--kinetics", required=True,
+                    help="kinetic_data_*.csv — passed to reconcile.py after tracking finishes.")
+    ap.add_argument("--gallery_dir", default="./reid_gallery",
+                    help="Gallery directory for reconcile.py (default: ./reid_gallery)")
+    ap.add_argument("--corr_threshold",   type=float, default=0.7)
+    ap.add_argument("--cosine_threshold", type=float, default=0.75)
+    ap.add_argument("--ema_alpha",        type=float, default=0.15)
     return ap.parse_args()
 
 
@@ -506,6 +514,47 @@ def main():
     if crops_dir:
         log(f"crops → {crops_dir}")
 
+    # ── run reconcile.py ──────────────────────────────────────────────────────
+    log("=" * 60)
+    log("Starting reconcile.py ...")
+    log("=" * 60)
+    try:
+        import importlib.util
+        import argparse as _ap
+
+        reconcile_path = Path(__file__).parent / "reconcile.py"
+        if not reconcile_path.exists():
+            raise FileNotFoundError(f"reconcile.py not found at {reconcile_path}")
+
+        spec  = importlib.util.spec_from_file_location("reconcile", reconcile_path)
+        r_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(r_mod)
+
+        r_args = _ap.Namespace(
+            db                 = str(db_path),
+            session            = session_id,
+            kinetics           = args.kinetics,
+            gallery_dir        = args.gallery_dir,
+            embed_parquet      = str(embed_pq_path),
+            corr_threshold     = args.corr_threshold,
+            min_active_bins    = 3,
+            min_temp_id_frames = 0.10,
+            activity_pct       = 0.25,
+            bin_minutes        = 15,
+            ema_alpha          = args.ema_alpha,
+            min_embeds_gallery = 10,
+            cosine_threshold   = args.cosine_threshold,
+            cosine_min_embeds  = 5,
+            dry_run            = False,
+            verbose            = False,
+        )
+
+        r_mod.run(r_args)
+
+    except Exception as exc:
+        log(f"reconcile.py failed: {exc}")
+        log("Tracking output is intact — run reconcile.py manually to retry.")
+
 
 if __name__ == "__main__":
     main()
@@ -518,18 +567,30 @@ if __name__ == "__main__":
 # POSE=/home/anton/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
 # VID=/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4
 # OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21
-
+#
+# KIN=/home/anton/thesis_workspace/raw_data/collar_data/kinetic_data_6366_7507_7513.csv
+#
 # python3 track_and_dump.py \
 #   --model      "$DET" \
 #   --source     "$VID" \
 #   --outdir     "$OUT" \
 #   --session_id "refet33_20241221" \
 #   --camera_id  "refet_33" \
+#   --kinetics   "$KIN" \
+#   --gallery_dir /home/anton/thesis_workspace/reid_gallery \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
 #   --save_crops \
 #   --pose_model "$POSE" --pose_imgsz 384 --pose_conf 0.25 \
 #   --crop_every 100 --min_crop_wh 100 100 \
 #   --commit_every 50
+#
+# reconcile.py runs automatically when tracking finishes (or on Ctrl+C).
+# To run reconcile manually on an existing session:
+#   python3 reconcile.py \
+#     --db      "$OUT/calving_project.db" \
+#     --session "refet33_20241221" \
+#     --kinetics "$KIN" \
+#     --gallery_dir /home/anton/thesis_workspace/reid_gallery
 #
 # Outputs in $OUT/:
 #   calving_project.db   — SQLite (video_sessions + raw_tracks)

@@ -68,8 +68,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--db",       required=True, help="Path to calving_project.db (SQLite)")
     ap.add_argument("--session",  required=True, help="session_id to process (from video_sessions)")
     ap.add_argument("--kinetics", required=True, help="kinetic_data_*.csv for this session's animals")
-    ap.add_argument("--tracks",   required=True, help="tracks.csv produced by track_and_dump.py")
-
     # --- optional paths ---
     ap.add_argument("--gallery_dir",   default="./reid_gallery",
                     help="Directory containing gallery_day.npy / gallery_night.npy (default: ./reid_gallery)")
@@ -939,12 +937,14 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    args = parse_args()
-
+def run(args) -> None:
+    """
+    Core pipeline entry point. Callable from CLI (via main()) or directly when
+    imported by track_and_dump.py. args is an argparse.Namespace with all fields
+    from parse_args() — no --tracks needed; tracks are loaded from the DB.
+    """
     section("reconcile.py — ReID pipeline")
     log(f"session_id  : {args.session}")
-    log(f"tracks      : {args.tracks}")
     log(f"kinetics    : {args.kinetics}")
     log(f"db          : {args.db}")
     log(f"gallery_dir : {args.gallery_dir}")
@@ -953,9 +953,17 @@ def main() -> None:
     # ── database ──────────────────────────────────────────────────────────────
     conn = init_db(args.db)
 
-    # ── load data ────────────────────────────────────────────────────────────
-    log("Loading tracks CSV...")
-    tracks_df = pd.read_csv(args.tracks, parse_dates=["frame_datetime"])
+    # ── load tracks from SQLite ───────────────────────────────────────────────
+    log("Loading tracks from SQLite...")
+    tracks_df = pd.read_sql(
+        "SELECT frame_index, frame_datetime, temp_id, cx, cy, x1, y1, x2, y2 "
+        "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
+        conn, params=(args.session,), parse_dates=["frame_datetime"],
+    )
+    if tracks_df.empty:
+        log(f"No rows in raw_tracks for session '{args.session}' — aborting.")
+        conn.close()
+        return
     log(f"  {len(tracks_df)} rows, {tracks_df['temp_id'].nunique()} temp_ids, "
         f"frames {tracks_df['frame_index'].min()}–{tracks_df['frame_index'].max()}")
 
@@ -963,7 +971,7 @@ def main() -> None:
     kinetics_df = pd.read_csv(args.kinetics, parse_dates=["datetime"])
     log(f"  {len(kinetics_df)} rows, animals: {sorted(kinetics_df['AnimalId'].unique())}")
 
-    # optional behavior CSV (same directory as kinetics, same animal suffix)
+    # optional behavior CSV alongside kinetics
     behavior_df = None
     beh_candidate = Path(args.kinetics).parent / Path(args.kinetics).name.replace(
         "kinetic_data", "behavior_data"
@@ -973,45 +981,45 @@ def main() -> None:
         behavior_df = pd.read_csv(str(beh_candidate), parse_dates=["datetime"])
         log(f"  {len(behavior_df)} rows")
     else:
-        log(f"No behavior CSV found alongside kinetics (looked for {beh_candidate.name}) — sensor d_f12/f23/v will be NaN")
+        log(f"No behavior CSV found (looked for {beh_candidate.name}) — d_f12/f23/v will be NaN")
 
     # detect day/night
     is_night = detect_is_night_from_tracks(tracks_df)
     log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
 
-    # register session if new
-    upsert_session(conn, args.session, args.tracks, is_night)
+    # update is_night on the session row
+    upsert_session(conn, args.session, args.db, is_night)
 
     # ── Step A — kinetic matching ─────────────────────────────────────────────
     kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
 
-    # ── load embeds ───────────────────────────────────────────────────────────
+    # ── load embeds from parquet ──────────────────────────────────────────────
     embed_df = load_embeds_for_session(tracks_df, args.embed_parquet, args.session)
 
-    # ── Step B — gallery builder ───────────────────────────────────────────────
+    # ── Step B — gallery builder ──────────────────────────────────────────────
     gallery = step_b_gallery_builder(
-        tracks_df       = tracks_df,
-        embed_df        = embed_df,
+        tracks_df          = tracks_df,
+        embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
-        is_night        = is_night,
-        conn            = conn,
-        args            = args,
-        gallery_dir     = args.gallery_dir,
-        dry_run         = args.dry_run,
+        is_night           = is_night,
+        conn               = conn,
+        args               = args,
+        gallery_dir        = args.gallery_dir,
+        dry_run            = args.dry_run,
     )
 
-    # ── Step C — cosine resolver ───────────────────────────────────────────────
+    # ── Step C — cosine resolver ──────────────────────────────────────────────
     full_assignment = step_c_cosine_resolver(
-        tracks_df           = tracks_df,
-        embed_df            = embed_df,
-        kinetic_assignment  = kinetic_assignment,
-        gallery             = gallery,
-        is_night            = is_night,
-        conn                = conn,
-        args                = args,
-        gallery_dir         = args.gallery_dir,
-        session_id          = args.session,
-        dry_run             = args.dry_run,
+        tracks_df          = tracks_df,
+        embed_df           = embed_df,
+        kinetic_assignment = kinetic_assignment,
+        gallery            = gallery,
+        is_night           = is_night,
+        conn               = conn,
+        args               = args,
+        gallery_dir        = args.gallery_dir,
+        session_id         = args.session,
+        dry_run            = args.dry_run,
     )
 
     # ── update known_temp_ids ─────────────────────────────────────────────────
@@ -1019,16 +1027,16 @@ def main() -> None:
 
     # ── Step D — sensor sequencer ─────────────────────────────────────────────
     timeline_df = step_d_sensor_sequencer(
-        tracks_df    = tracks_df,
-        kinetics_df  = kinetics_df,
-        behavior_df  = behavior_df,
-        assignment   = full_assignment,
-        bin_minutes  = args.bin_minutes,
+        tracks_df   = tracks_df,
+        kinetics_df = kinetics_df,
+        behavior_df = behavior_df,
+        assignment  = full_assignment,
+        bin_minutes = args.bin_minutes,
     )
     if not timeline_df.empty:
         timeline_df["session_id"] = args.session
 
-    # ── Step E — write to DB ───────────────────────────────────────────────────
+    # ── Step E — write to DB ──────────────────────────────────────────────────
     step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
 
     # ── summary ───────────────────────────────────────────────────────────────
@@ -1047,6 +1055,10 @@ def main() -> None:
     log("Done.")
 
 
+def main() -> None:
+    run(parse_args())
+
+
 if __name__ == "__main__":
     main()
 
@@ -1059,7 +1071,6 @@ if __name__ == "__main__":
 #   --db        calving_project.db \
 #   --session   session_001 \
 #   --kinetics  raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
-#   --tracks    outputs/tracks/session_001/tracks.csv \
 #   --gallery_dir ./reid_gallery \
 #   --corr_threshold 0.7 \
 #   --min_active_bins 3 \
@@ -1074,9 +1085,10 @@ if __name__ == "__main__":
 #
 # After running, validate visually:
 #   python3 display_tracks.py \
-#     --video  raw_data/videos/session_001.mp4 \
-#     --tracks outputs/tracks/session_001/tracks.csv \
-#     --kinetics raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#     --video      raw_data/videos/session_001.mp4 \
+#     --db         outputs/tracks/session_001/calving_project.db \
+#     --session_id session_001 \
+#     --kinetics   raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
 #     --draw_pose --show_fps --sink ffplay
 #
 # Pipeline notes:
