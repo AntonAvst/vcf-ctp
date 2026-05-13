@@ -707,7 +707,10 @@ def main():
     show_table = True   # toggle with 't'
     prev_t = time()
     n_frames = 0
-    log("Press 'p' to pause, 't' to toggle score table, 'q' to quit.")
+    FF_SPEEDS = [1, 2, 4, 8]   # available fast-forward multipliers
+    ff_idx = 0                 # index into FF_SPEEDS (0 = normal speed)
+    ff_speed = 1               # current fast-forward multiplier
+    log("Press 'p' to pause, 'f' to fast-forward (2x/4x/8x/1x), 't' to toggle score table, 'q' to quit.")
 
     # decide effective kp threshold (v is 0/1/2)
     kp_thresh_effective = args.kp_thresh
@@ -727,6 +730,10 @@ def main():
             if ch == "t":
                 show_table = not show_table
                 log("Score table: " + ("visible" if show_table else "hidden"))
+            if ch == "f":
+                ff_idx = (ff_idx + 1) % len(FF_SPEEDS)
+                ff_speed = FF_SPEEDS[ff_idx]
+                log(f"Fast-forward: {ff_speed}x")
 
             if paused:
                 if args.sink == "cv2":
@@ -737,6 +744,26 @@ def main():
             if not ok:
                 log("End of video.")
                 break
+
+            # fast-forward: skip (ff_speed - 1) frames between rendered frames
+            if ff_speed > 1:
+                skip = ff_speed - 1
+                for _ in range(skip):
+                    ok_skip = cap.grab()  # grab without decode — much faster
+                    if not ok_skip:
+                        break
+                    frame_idx += 1
+                    n_frames += 1
+                    # advance track stream past skipped frames
+                    while next_fi < frame_idx:
+                        try:
+                            next_fi, next_rows = next(row_stream)
+                        except StopIteration:
+                            next_rows = []
+                            next_fi = frame_idx
+                            break
+                    if args.limit > 0 and n_frames >= args.limit:
+                        break
 
             # advance track stream to current frame
             while next_fi < frame_idx:
@@ -847,6 +874,17 @@ def main():
                     2,
                     cv2.LINE_AA,
                 )
+
+            # fast-forward speed overlay
+            if ff_speed > 1:
+                spd_label = f">> {ff_speed}x"
+                (sw, sh), _ = cv2.getTextSize(spd_label, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
+                sx = frame.shape[1] - sw - 14
+                sy = 38
+                cv2.putText(frame, spd_label, (sx, sy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, spd_label, (sx, sy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 220, 255), 2, cv2.LINE_AA)
 
             # sink
             if args.sink == "ffplay":
