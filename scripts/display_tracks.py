@@ -23,28 +23,128 @@ def log(msg):
     print(f"[viewer] {msg}", flush=True)
 
 
-# -------- Keyboard (non-blocking, terminal) ----------
-class KB:
-    def __enter__(self):
-        import termios, tty
+# -------- Tkinter control panel (runs in a background thread) ----------
+class TkControls:
+    """
+    A small always-on-top Tkinter window with buttons for all playback controls.
+    Runs in its own daemon thread so the main OpenCV loop is never blocked.
+    State is shared via plain Python attributes (reads/writes are GIL-safe for booleans/ints).
+    """
+    FF_SPEEDS = [1, 2, 4, 8]
 
-        self.fd = sys.stdin.fileno()
-        self.old = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
+    def __init__(self):
+        self.paused     = False
+        self.show_table = True
+        self.ff_idx     = 0
+        self.ff_speed   = 1
+        self.quit       = False
+        self._root      = None
+
+        import threading
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+        # give Tk a moment to appear before the main loop starts
+        import time as _t
+        _t.sleep(0.3)
+
+    def _run(self):
+        import tkinter as tk
+
+        root = tk.Tk()
+        self._root = root
+        root.title("Playback Controls")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+
+        BG     = "#1e1e2e"
+        BTN_BG = "#313244"
+        BTN_ACT= "#45475a"
+        FG     = "#cdd6f4"
+        ACC    = "#89b4fa"
+        WARN   = "#f38ba8"
+        FONT   = ("Helvetica", 13, "bold")
+        SFONT  = ("Helvetica", 10)
+
+        root.configure(bg=BG)
+
+        tk.Label(root, text="▶  Playback Controls", bg=BG, fg=ACC,
+                 font=("Helvetica", 14, "bold")).grid(
+            row=0, column=0, columnspan=2, pady=(12, 4), padx=16)
+
+        def make_btn(parent, text, cmd, row, col, fg=FG, colspan=1):
+            b = tk.Button(parent, text=text, command=cmd,
+                          bg=BTN_BG, fg=fg, activebackground=BTN_ACT,
+                          activeforeground=FG, font=FONT,
+                          relief="flat", bd=0, padx=14, pady=8,
+                          cursor="hand2")
+            b.grid(row=row, column=col, columnspan=colspan,
+                   padx=6, pady=4, sticky="ew")
+            return b
+
+        self._pause_btn = make_btn(root, "⏸  Pause", self._toggle_pause, 1, 0, colspan=2)
+
+        self._ff_label = tk.StringVar(value="Speed: 1×")
+        tk.Label(root, textvariable=self._ff_label, bg=BG, fg=FG,
+                 font=SFONT).grid(row=2, column=0, columnspan=2, pady=(6, 0))
+        self._ff_btn = make_btn(root, "⏩  Fast Forward", self._cycle_ff, 3, 0, colspan=2)
+
+        self._table_btn = make_btn(root, "📊  Hide Score Table", self._toggle_table, 4, 0, colspan=2)
+
+        make_btn(root, "⏹  Quit", self._do_quit, 5, 0, colspan=2, fg=WARN)
+
+        root.bind("<p>", lambda e: self._toggle_pause())
+        root.bind("<f>", lambda e: self._cycle_ff())
+        root.bind("<t>", lambda e: self._toggle_table())
+        root.bind("<q>", lambda e: self._do_quit())
+        root.protocol("WM_DELETE_WINDOW", self._do_quit)
+
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_columnconfigure(1, weight=1)
+
+        root.mainloop()
+
+    def _toggle_pause(self):
+        self.paused = not self.paused
+        if self.paused:
+            self._pause_btn.config(text="▶  Resume")
+            log("Paused.")
+        else:
+            self._pause_btn.config(text="⏸  Pause")
+            log("Resumed.")
+
+    def _cycle_ff(self):
+        self.ff_idx = (self.ff_idx + 1) % len(self.FF_SPEEDS)
+        self.ff_speed = self.FF_SPEEDS[self.ff_idx]
+        self._ff_label.set(f"Speed: {self.ff_speed}×")
+        accent = "#a6e3a1" if self.ff_speed > 1 else "#cdd6f4"
+        self._ff_btn.config(fg=accent)
+        log(f"Fast-forward: {self.ff_speed}x")
+
+    def _toggle_table(self):
+        self.show_table = not self.show_table
+        label = "📊  Show Score Table" if not self.show_table else "📊  Hide Score Table"
+        self._table_btn.config(text=label)
+        log("Score table: " + ("visible" if self.show_table else "hidden"))
+
+    def _do_quit(self):
+        self.quit = True
+        log("Quit requested.")
+        if self._root:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
-        import termios
-
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
-
-    def getch(self):
-        import select
-
-        dr, _, _ = select.select([sys.stdin], [], [], 0)
-        if dr:
-            return sys.stdin.read(1)
-        return None
+    def __exit__(self, *_):
+        if self._root:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
 
 
 # -------- Colors / drawing ----------
@@ -247,7 +347,7 @@ def parse_args():
     ap.add_argument(
         "--sink",
         choices=["ffplay", "cv2", "mp4"],
-        default="ffplay",
+        default="cv2",
         help="ffplay (no GUI deps), cv2 (needs Qt/X11), or mp4 (save to file)",
     )
     ap.add_argument(
@@ -703,14 +803,9 @@ def main():
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(args.outmp4, fourcc, fps, (W, H))
 
-    paused = False
-    show_table = True   # toggle with 't'
     prev_t = time()
     n_frames = 0
-    FF_SPEEDS = [1, 2, 4, 8]   # available fast-forward multipliers
-    ff_idx = 0                 # index into FF_SPEEDS (0 = normal speed)
-    ff_speed = 1               # current fast-forward multiplier
-    log("Press 'p' to pause, 'f' to fast-forward (2x/4x/8x/1x), 't' to toggle score table, 'q' to quit.")
+    log("Use the Tkinter control panel to pause, fast-forward, toggle score table, or quit.")
 
     # decide effective kp threshold (v is 0/1/2)
     kp_thresh_effective = args.kp_thresh
@@ -718,26 +813,20 @@ def main():
         # draw only v >= 2
         kp_thresh_effective = max(kp_thresh_effective, 0.5)
 
-    with KB() as kb:
+    with TkControls() as ctrl:
         while True:
-            ch = kb.getch()
-            if ch == "q":
-                log("Quit requested.")
+            if ctrl.quit:
                 break
-            if ch == "p":
-                paused = not paused
-                log("Paused." if paused else "Resumed.")
-            if ch == "t":
-                show_table = not show_table
-                log("Score table: " + ("visible" if show_table else "hidden"))
-            if ch == "f":
-                ff_idx = (ff_idx + 1) % len(FF_SPEEDS)
-                ff_speed = FF_SPEEDS[ff_idx]
-                log(f"Fast-forward: {ff_speed}x")
+
+            paused    = ctrl.paused
+            show_table= ctrl.show_table
+            ff_speed  = ctrl.ff_speed
 
             if paused:
                 if args.sink == "cv2":
-                    cv2.waitKey(1)
+                    cv2.waitKey(30)
+                else:
+                    import time as _t; _t.sleep(0.03)
                 continue
 
             ok, frame = cap.read()
@@ -895,8 +984,9 @@ def main():
                     break
             elif args.sink == "cv2":
                 cv2.imshow("tracks", frame)
-                if args.max_fps > 0:
-                    cv2.waitKey(int(1000 / args.max_fps))
+                effective_fps = args.max_fps if args.max_fps > 0 else fps
+                wait_ms = max(1, int(1000 / (effective_fps * ff_speed)))
+                cv2.waitKey(wait_ms)
             else:
                 writer.write(frame)
 
