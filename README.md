@@ -25,7 +25,7 @@
 - Draws score table overlay: temp_id × AnimalId correlation matrix
 - Supports ffplay / cv2 / mp4 sinks, TkControls for pause/FF/quit
 
-### `match_identity.py`
+### `match_identity.py` (not uploaded, but imported)
 - Kinetic matching: bbox centroid speed ↔ collar ΔKineticsCountR
 - Pearson correlation per 15-min bin, Hungarian assignment
 - `score_up_to(tracks_df, kinetics_df, up_to_datetime, bin_minutes, ...)` → assignment dict + scores_df
@@ -61,8 +61,8 @@
 **Steps in order:**
 - **A. Kinetic matcher** (existing match_identity.py logic): bbox speed ↔ ΔR · Pearson r · Hungarian → temp_id ↔ AnimalId
 - **B. Pose feature extractor** (new): kps[19×3] → scalar biomechanical features per time window
-- **C. Gallery builder** (new): group embeds by confirmed AnimalId → EMA mean → gallery.npz
-- **D. Cosine resolver** (new): embed vs gallery.npz · sim ≥ threshold → real_id (heals within-video temp_id switches)
+- **C. Gallery builder** (new): group embeds by confirmed AnimalId → EMA mean → separate day/night galleries. Routes based on `video_sessions.is_night`. Never mixes modalities.
+- **D. Cosine resolver** (new): checks `video_sessions.is_night` → queries `gallery_embed_day` or `gallery_embed_night` accordingly. Never cross-queries. Falls back to kinetics-only if the relevant gallery is empty (gallery_n = 0).
 - **E. Sensor feature sequencer** (new): Δf_12/f_23/v/kinR → forward-fill to video time grid
 
 **Output written:** `resolved_cow_timeline` — central join table
@@ -84,6 +84,7 @@
 
 ### `video_sessions` — one row per video file
 - session_id (PK), video_path, camera_id, start_dt, end_dt, collar_csv_path
+- **is_night** (bool) — auto-detected: sample N frames, check if mean per-channel variance is below threshold (IR/grayscale frames have near-zero R/G/B channel divergence)
 - Written when track_and_dump.py is run
 
 ### `collar_signals` — raw sensor time-series
@@ -100,9 +101,26 @@
 - kps_norm[19×3] — normalised coords
 
 ### `reid_registry` — one row per confirmed real identity
-- real_id (PK = AnimalId from collar), gallery_embed[128] (EMA mean), gallery_n
-- known_temp_ids (list of session+tid pairs), first_seen_dt, match_method ('kinetic'|'cosine')
+- real_id (PK = AnimalId from collar)
+- **gallery_embed_day[128]** — EMA mean embedding from daytime sessions (RGB)
+- **gallery_embed_night[128]** — EMA mean embedding from night/IR sessions (grayscale)
+- gallery_n_day, gallery_n_night — session counts contributing to each gallery
+- gallery_confidence_day, gallery_confidence_night — quality score (low when few sessions, high when stable across many)
+- last_updated_day_dt, last_updated_night_dt
+- known_temp_ids (list of {session_id, temp_id} pairs)
+- first_seen_dt, match_method ('kinetic' | 'cosine_day' | 'cosine_night')
 - Updated by reconcile.py after each video
+
+**EMA update rule:**
+```
+gallery_embed_new = α × mean(session_embeds) + (1 − α) × gallery_embed_old
+α = 0.1–0.2  (slow drift, old sightings fade gradually)
+```
+- Day sessions (is_night=False) → update gallery_embed_day only
+- Night sessions (is_night=True) → update gallery_embed_night only
+- Galleries NEVER cross-contaminate across modalities
+- Only kinetic-confirmed sessions trigger a gallery update (full α)
+- Cosine-only confirmed sessions may trigger a smaller update (α/2) — self-referential, weight conservatively
 
 ### `resolved_cow_timeline` — CENTRAL JOIN TABLE
 - real_id (FK → reid_registry, nullable), window_start_dt, session_id
@@ -147,6 +165,7 @@
 6. **Sensor temporal mismatch handled by forward-fill** — behavior ~90s, kinetics ~15min → upsampled into video time grid in resolved_cow_timeline
 7. **kps_coverage column** — tells model how reliable vision features are per window (partial occlusion awareness)
 8. **display_tracks.py is the integration testbed** — use it to visually validate identity assignments before committing to feature extraction
+9. **Dual day/night gallery (Option 2)** — `reid_registry` stores separate `gallery_embed_day` and `gallery_embed_night` vectors per cow. Night sessions (IR/grayscale, auto-detected via per-channel variance in `video_sessions.is_night`) never update or query the day gallery and vice versa. Early night sessions with no gallery yet fall back to kinetics-only matching. Galleries build up independently as more sessions of each type are kinetically confirmed.
 
 ---
 
