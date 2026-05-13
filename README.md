@@ -25,7 +25,7 @@
 - Draws score table overlay: temp_id × AnimalId correlation matrix
 - Supports ffplay / cv2 / mp4 sinks, TkControls for pause/FF/quit
 
-### `match_identity.py` (not uploaded, but imported)
+### `match_identity.py`
 - Kinetic matching: bbox centroid speed ↔ collar ΔKineticsCountR
 - Pearson correlation per 15-min bin, Hungarian assignment
 - `score_up_to(tracks_df, kinetics_df, up_to_datetime, bin_minutes, ...)` → assignment dict + scores_df
