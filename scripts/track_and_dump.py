@@ -173,37 +173,79 @@ def register_session(conn, session_id, video_path, camera_id, start_dt):
     conn.commit()
 
 
-# ── Parquet writers ───────────────────────────────────────────────────────────
-def write_embed_parquet(path: Path, rows: list) -> None:
-    if not rows:
-        return
-    emb_arr = np.stack([r["embed"] for r in rows])
-    tbl = pa.table({
-        "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
-        "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
-        "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
-        "embed": pa.FixedSizeListArray.from_arrays(
-            pa.array(emb_arr.ravel().tolist(), pa.float32()), 128),
-    })
-    pq.write_table(tbl, str(path), compression="snappy")
-    log(f"embeds.parquet  → {path}  ({len(rows)} rows, {path.stat().st_size/1e6:.1f} MB)")
+# ── Incremental Parquet writers ───────────────────────────────────────────────
+# Open the file before the loop; flush one row-group per commit_every interval.
+# Memory stays bounded to one batch at a time rather than the full run.
 
-def write_kps_parquet(path: Path, rows: list) -> None:
-    if not rows:
-        return
-    kps_arr   = np.stack([r["kps"]       for r in rows])
-    kconf_arr = np.stack([r["kps_kconf"] for r in rows])
-    tbl = pa.table({
-        "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
-        "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
-        "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
-        "kps": pa.FixedSizeListArray.from_arrays(
-            pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
-        "kps_kconf": pa.FixedSizeListArray.from_arrays(
-            pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
-    })
-    pq.write_table(tbl, str(path), compression="snappy")
-    log(f"kps.parquet     → {path}  ({len(rows)} rows, {path.stat().st_size/1e6:.1f} MB)")
+EMBED_SCHEMA = pa.schema([
+    pa.field("session_id",  pa.string()),
+    pa.field("frame_index", pa.int32()),
+    pa.field("temp_id",     pa.int32()),
+    pa.field("embed",       pa.list_(pa.float32(), 128)),
+])
+
+KPS_SCHEMA = pa.schema([
+    pa.field("session_id",  pa.string()),
+    pa.field("frame_index", pa.int32()),
+    pa.field("temp_id",     pa.int32()),
+    pa.field("kps",         pa.list_(pa.float32(), 57)),
+    pa.field("kps_kconf",   pa.list_(pa.float32(), 19)),
+])
+
+
+class EmbedWriter:
+    def __init__(self, path: Path):
+        self.path    = path
+        self._writer = pq.ParquetWriter(str(path), EMBED_SCHEMA, compression="snappy")
+        self.total   = 0
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        emb_arr = np.stack([r["embed"] for r in rows])
+        tbl = pa.table({
+            "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
+            "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
+            "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
+            "embed": pa.FixedSizeListArray.from_arrays(
+                pa.array(emb_arr.ravel().tolist(), pa.float32()), 128),
+        }, schema=EMBED_SCHEMA)
+        self._writer.write_table(tbl)
+        self.total += len(rows)
+
+    def close(self) -> None:
+        self._writer.close()
+        size = self.path.stat().st_size / 1e6 if self.path.exists() else 0
+        log(f"embeds.parquet  -> {self.path}  ({self.total} rows, {size:.1f} MB)")
+
+
+class KpsWriter:
+    def __init__(self, path: Path):
+        self.path    = path
+        self._writer = pq.ParquetWriter(str(path), KPS_SCHEMA, compression="snappy")
+        self.total   = 0
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        kps_arr   = np.stack([r["kps"]       for r in rows])
+        kconf_arr = np.stack([r["kps_kconf"] for r in rows])
+        tbl = pa.table({
+            "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
+            "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
+            "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
+            "kps": pa.FixedSizeListArray.from_arrays(
+                pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
+            "kps_kconf": pa.FixedSizeListArray.from_arrays(
+                pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
+        }, schema=KPS_SCHEMA)
+        self._writer.write_table(tbl)
+        self.total += len(rows)
+
+    def close(self) -> None:
+        self._writer.close()
+        size = self.path.stat().st_size / 1e6 if self.path.exists() else 0
+        log(f"kps.parquet     -> {self.path}  ({self.total} rows, {size:.1f} MB)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -254,6 +296,9 @@ def main():
     db_batch:   list = []
     embed_rows: list = []
     kps_rows:   list = []
+
+    embed_writer = EmbedWriter(embed_pq_path)
+    kps_writer   = KpsWriter(kps_pq_path)
     crop_occurrence       = defaultdict(int)
     warned_kp_mismatch    = False
     embed_row_counter     = 0
@@ -281,6 +326,8 @@ def main():
                 conn.executemany(INSERT_SQL, db_batch)
                 db_batch.clear()
             conn.commit()
+            embed_writer.flush(embed_rows); embed_rows.clear()
+            kps_writer.flush(kps_rows);     kps_rows.clear()
             pbar.set_postfix(frames=frame_idx,
                              fps=f"{frame_idx/max(time()-t_start,1e-6):.1f}")
             last_commit_frame = frame_idx
@@ -434,8 +481,10 @@ def main():
     conn.close()
     cap.release()
 
-    write_embed_parquet(embed_pq_path, embed_rows)
-    write_kps_parquet(kps_pq_path, kps_rows)
+    embed_writer.flush(embed_rows); embed_rows.clear()
+    kps_writer.flush(kps_rows);     kps_rows.clear()
+    embed_writer.close()
+    kps_writer.close()
 
     t_total = time() - t_start
     log(f"Done. {frame_idx} frames in {t_total:.1f}s "
