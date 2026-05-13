@@ -181,3 +181,65 @@ gallery_embed_new = α × mean(session_embeds) + (1 − α) × gallery_embed_old
 - Thesis Document: October 30, 2026
 
 ---
+
+## Storage Architecture
+
+### Decision: SQLite + Parquet + University OneDrive (50GB)
+
+**Database engine:** SQLite for all 7 structured tables. Zero infrastructure, full SQL, pandas-native.  
+**Array storage:** Parquet files (pyarrow/pandas) for embed[128], kps[19×3], kps_kconf[19]. SQLite stores a session index or file path as pointer — never raw blobs.  
+**Cloud backup:** University OneDrive (50GB) via `rclone` mount in WSL.  
+**Raw video:** Local disk only — not synced to OneDrive. Re-processable from source.
+
+### Why not Firebase / MongoDB
+- Firebase: document store with 1GB cap, no SQL, per-read billing, wrong tool entirely
+- MongoDB Atlas: 512MB cap, no native numpy, network latency on every query
+- Both solve distribution problems you don't have
+
+### Storage budget (per hour of video processed)
+| Artifact | Size/hour |
+|---|---|
+| Parquet embeds (embed[128] float32 compressed) | ~180MB |
+| Parquet keypoints (kps[19×3] + kps_kconf compressed) | ~80MB |
+| resolved_cow_timeline (scalar features) | ~20MB |
+| SQLite DB (all structured tables) | negligible |
+| reid_gallery .npy (total, not per hour) | ~1MB |
+| **Total processed output per hour** | **~280MB** |
+
+50GB OneDrive → comfortably holds ~175 hours of processed output.  
+Raw video (1–3GB/hour) stays on local disk only.
+
+### Directory layout
+```
+~/thesis_workspace/                     # local WSL
+  raw_data/
+    videos/                             # raw MP4s — LOCAL ONLY, never synced
+    collar_data/                        # collar CSVs — small, sync these
+
+~/onedrive_mount/thesis_data/           # rclone mount → university OneDrive
+  calving_project.db                    # SQLite — all 7 structured tables
+  models/
+    cow_detector/best.pt
+    cow_pose/best.pt
+  embeddings/
+    session_001_embeds.parquet          # embed[128] per session
+    session_002_embeds.parquet
+  keypoints/
+    session_001_kps.parquet             # kps[19×3] + kps_kconf per session
+    session_002_kps.parquet
+  reid_gallery/
+    gallery_day.npy                     # gallery_embed_day[128] per cow
+    gallery_night.npy                   # gallery_embed_night[128] per cow
+  collar_data/                          # collar CSVs backed up here
+```
+
+### rclone setup (WSL)
+```bash
+sudo apt install rclone
+rclone config                           # interactive wizard — choose OneDrive, sign in
+rclone mount "university_onedrive:thesis_data" ~/onedrive_mount \
+  --vfs-cache-mode writes &
+```
+Scripts write directly to `~/onedrive_mount/` — syncs automatically, no manual upload.
+
+---
