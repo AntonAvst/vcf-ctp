@@ -162,6 +162,3 @@
 - Thesis Document: October 30, 2026
 
 ---
-
-## Next Open Question (interrupted)
-**Training window construction** — how to build labeled multi-hour input sequences per calving event from resolved_cow_timeline. Key challenges: temporal alignment to calving_dt, handling variable cow visibility in video, sensor resolution mismatch, class imbalance for rare outcomes (Twin, Vet).
