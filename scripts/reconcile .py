@@ -1,0 +1,1087 @@
+#!/usr/bin/env python3
+"""
+reconcile.py — Post-processing pipeline for identity resolution and feature extraction.
+
+Runs after track_and_dump.py. Reads raw_tracks + collar_signals from SQLite, resolves
+real_id for every temp_id in a session, and writes to resolved_cow_timeline.
+
+Steps (in order):
+  A. Kinetic matcher    — bbox centroid speed ↔ ΔKineticsCountR (Pearson r)
+  B. Gallery builder    — group embeds by confirmed AnimalId → EMA mean → day/night galleries
+  C. Cosine resolver    — heal temp_id switches, cross-video continuity
+  D. Sensor sequencer   — forward-fill behavior/kinetics to video time grid
+  E. Write output       — resolved_cow_timeline rows
+
+Usage:
+    python3 reconcile.py \\
+        --db        calving_project.db \\
+        --session   session_001 \\
+        --kinetics  kinetic_data_6366_7507_7513.csv \\
+        --tracks    tracks.csv \\
+        [--gallery_dir   ./reid_gallery] \\
+        [--embed_parquet session_001_embeds.parquet] \\
+        [--corr_threshold 0.7] \\
+        [--min_active_bins 3] \\
+        [--cosine_threshold 0.75] \\
+        [--ema_alpha 0.15] \\
+        [--dry_run]
+
+Requirements: pip install pandas numpy scipy pyarrow
+"""
+
+import argparse
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr
+from itertools import product
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    print(f"[reconcile] {msg}", flush=True)
+
+
+def section(title: str) -> None:
+    print(f"\n{'─'*60}", flush=True)
+    print(f"  {title}", flush=True)
+    print(f"{'─'*60}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Post-processing: kinetic match → gallery update → cosine resolve → timeline write"
+    )
+
+    # --- required ---
+    ap.add_argument("--db",       required=True, help="Path to calving_project.db (SQLite)")
+    ap.add_argument("--session",  required=True, help="session_id to process (from video_sessions)")
+    ap.add_argument("--kinetics", required=True, help="kinetic_data_*.csv for this session's animals")
+    ap.add_argument("--tracks",   required=True, help="tracks.csv produced by track_and_dump.py")
+
+    # --- optional paths ---
+    ap.add_argument("--gallery_dir",   default="./reid_gallery",
+                    help="Directory containing gallery_day.npy / gallery_night.npy (default: ./reid_gallery)")
+    ap.add_argument("--embed_parquet", default="",
+                    help="Parquet file with embed[128] columns keyed by (session_id, frame_index, temp_id). "
+                         "If omitted, embeds are read from tracks.csv 'embed' column.")
+
+    # --- step A: kinetic matching ---
+    ap.add_argument("--corr_threshold",   type=float, default=0.7,
+                    help="Min Pearson r for kinetic match (default: 0.7)")
+    ap.add_argument("--min_active_bins",  type=int,   default=3,
+                    help="Min active kinetics bins required (default: 3)")
+    ap.add_argument("--min_temp_id_frames", type=float, default=0.10,
+                    help="Min fraction of frames a temp_id must appear in (default: 0.10)")
+    ap.add_argument("--activity_pct",     type=float, default=0.25,
+                    help="Percentile threshold for 'active' kinetics bins (default: 0.25)")
+    ap.add_argument("--bin_minutes",      type=int,   default=15,
+                    help="Kinetics bin width in minutes (default: 15)")
+
+    # --- step B: gallery builder ---
+    ap.add_argument("--ema_alpha",       type=float, default=0.15,
+                    help="EMA decay for gallery update — α for kinetic-confirmed, α/2 for cosine-only (default: 0.15)")
+    ap.add_argument("--min_embeds_gallery", type=int, default=10,
+                    help="Min embed rows per temp_id to contribute to gallery (default: 10)")
+
+    # --- step C: cosine resolver ---
+    ap.add_argument("--cosine_threshold",    type=float, default=0.75,
+                    help="Min cosine similarity for cross-video / switch-healing match (default: 0.75)")
+    ap.add_argument("--cosine_min_embeds",   type=int,   default=5,
+                    help="Min embed rows for a temp_id to be queried via cosine (default: 5)")
+
+    # --- misc ---
+    ap.add_argument("--dry_run", action="store_true",
+                    help="Run all steps but do not write to the database")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print extra diagnostic output")
+
+    return ap.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Database helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS video_sessions (
+    session_id      TEXT PRIMARY KEY,
+    video_path      TEXT,
+    camera_id       TEXT,
+    start_dt        TEXT,
+    end_dt          TEXT,
+    collar_csv_path TEXT,
+    is_night        INTEGER DEFAULT 0   -- 0=day, 1=night (auto-detected)
+);
+
+CREATE TABLE IF NOT EXISTS cow_registry (
+    real_id          INTEGER PRIMARY KEY,
+    breed            TEXT,
+    parity           INTEGER,
+    pen_id           TEXT,
+    collar_id        TEXT,
+    baseline_window  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS collar_signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    animal_id   INTEGER,
+    datetime    TEXT,
+    signal_type TEXT,   -- 'behavior' | 'kinetic'
+    f_1_2       REAL,
+    f_2_3       REAL,
+    v           REAL,
+    kin_x       REAL,
+    kin_y       REAL,
+    kin_z       REAL,
+    kin_r       REAL
+);
+
+CREATE TABLE IF NOT EXISTS raw_tracks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     TEXT,
+    frame_index    INTEGER,
+    frame_datetime TEXT,
+    temp_id        INTEGER,
+    det_conf       REAL,
+    x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+    cx REAL, cy REAL,
+    embed          TEXT,   -- JSON list[128] or NULL
+    kps            TEXT,   -- JSON flat list[57] or NULL
+    kps_norm       TEXT,
+    kps_conf       REAL,
+    kps_kconf      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reid_registry (
+    real_id               INTEGER PRIMARY KEY,
+    gallery_embed_day     TEXT,   -- JSON list[128] or NULL
+    gallery_embed_night   TEXT,
+    gallery_n_day         INTEGER DEFAULT 0,
+    gallery_n_night       INTEGER DEFAULT 0,
+    gallery_conf_day      REAL    DEFAULT 0.0,
+    gallery_conf_night    REAL    DEFAULT 0.0,
+    last_updated_day_dt   TEXT,
+    last_updated_night_dt TEXT,
+    known_temp_ids        TEXT,   -- JSON list of {session_id, temp_id} objects
+    first_seen_dt         TEXT,
+    match_method          TEXT    -- 'kinetic' | 'cosine_day' | 'cosine_night'
+);
+
+CREATE TABLE IF NOT EXISTS resolved_cow_timeline (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    real_id         INTEGER,
+    session_id      TEXT,
+    window_start_dt TEXT,
+    modality_mask   INTEGER DEFAULT 0,  -- bitmask: 1=sensor_ok, 2=vision_ok, 4=reid_ok
+    -- sensor features (forward-filled)
+    d_f12   REAL, d_f23   REAL, d_v    REAL,
+    d_kin_x REAL, d_kin_y REAL, d_kin_z REAL, d_kin_r REAL,
+    -- vision features (from pose)
+    spine_angle     REAL,
+    pelvic_tilt     REAL,
+    tail_elevation  REAL,
+    limb_symmetry   REAL,
+    head_drop       REAL,
+    lying_flag      INTEGER,
+    restlessness    REAL,
+    kps_coverage    REAL,
+    embed_mean      TEXT    -- JSON list[128] mean-pooled over window
+);
+
+CREATE TABLE IF NOT EXISTS calving_ledger (
+    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    real_id     INTEGER,
+    calving_dt  TEXT,
+    outcome     TEXT    -- 'Unassisted'|'Assisted'|'Twin'|'Veterinarian-assisted'
+);
+"""
+
+
+def init_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA_SQL)
+    conn.commit()
+    log(f"Database ready: {db_path}")
+    return conn
+
+
+def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM video_sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_session(conn: sqlite3.Connection, session_id: str,
+                   tracks_path: str, is_night: bool) -> None:
+    """Register session if it doesn't exist yet (minimal fields)."""
+    conn.execute("""
+        INSERT OR IGNORE INTO video_sessions (session_id, video_path, is_night)
+        VALUES (?, ?, ?)
+    """, (session_id, tracks_path, int(is_night)))
+    conn.commit()
+
+
+def get_reid_row(conn: sqlite3.Connection, real_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM reid_registry WHERE real_id = ?", (real_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_reid(conn: sqlite3.Connection, real_id: int, updates: dict) -> None:
+    existing = get_reid_row(conn, real_id)
+    if existing is None:
+        cols = ["real_id"] + list(updates.keys())
+        vals = [real_id] + list(updates.values())
+        ph = ", ".join("?" * len(vals))
+        conn.execute(
+            f"INSERT INTO reid_registry ({', '.join(cols)}) VALUES ({ph})", vals
+        )
+    else:
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE reid_registry SET {sets} WHERE real_id = ?",
+            list(updates.values()) + [real_id]
+        )
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detect is_night from tracks.csv (no video needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
+    """
+    Heuristic: night/IR footage has near-zero variance between colour channels.
+    Since we don't have pixel data here, fall back to time-of-day from frame_datetime.
+    Night = any session where >50% of frames fall between 20:00 and 06:00 local.
+    (Proper version uses per-channel variance on sampled frames — see architecture doc.)
+    """
+    if "frame_datetime" not in tracks_df.columns:
+        return False
+    dt_col = pd.to_datetime(tracks_df["frame_datetime"], errors="coerce").dropna()
+    if dt_col.empty:
+        return False
+    hours = dt_col.dt.hour
+    night_mask = (hours >= 20) | (hours < 6)
+    return bool(night_mask.mean() > 0.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step A — Kinetic Matcher (wraps match_identity.py logic inline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _camera_displacement_per_bin(tracks: pd.DataFrame,
+                                  bins: pd.DatetimeIndex) -> pd.DataFrame:
+    df = tracks.sort_values(["temp_id", "frame_datetime"])
+    df["bin"] = pd.cut(df["frame_datetime"], bins=bins, right=False, labels=bins[:-1])
+    df = df.dropna(subset=["bin"])
+    rows = []
+    for (tid, b), grp in df.groupby(["temp_id", "bin"], observed=True):
+        grp = grp.sort_values("frame_datetime")
+        dx = grp["cx"].diff().abs()
+        dy = grp["cy"].diff().abs()
+        disp = np.sqrt(dx**2 + dy**2).sum()
+        rows.append({"bin": b, "temp_id": tid, "displacement": disp})
+    return pd.DataFrame(rows)
+
+
+def _kinetics_delta_per_bin(kinetics: pd.DataFrame,
+                             bins: pd.DatetimeIndex) -> pd.DataFrame:
+    rows = []
+    for aid, grp in kinetics.groupby("AnimalId"):
+        grp = grp.sort_values("datetime")
+        for i in range(len(bins) - 1):
+            t0, t1 = bins[i], bins[i + 1]
+            before = grp[grp["datetime"] < t0]["KineticsCountR"]
+            after  = grp[grp["datetime"] < t1]["KineticsCountR"]
+            if before.empty or after.empty:
+                continue
+            delta = after.iloc[-1] - before.iloc[-1]
+            if delta < 0:
+                delta = 0
+            rows.append({"bin": t0, "AnimalId": aid, "delta": delta})
+    return pd.DataFrame(rows)
+
+
+def _compute_scores(cam_disp: pd.DataFrame, kin_delta: pd.DataFrame,
+                    activity_pct: float, min_active_bins: int) -> pd.DataFrame:
+    results = []
+    for tid, aid in product(cam_disp["temp_id"].unique(), kin_delta["AnimalId"].unique()):
+        cam = cam_disp[cam_disp["temp_id"] == tid][["bin", "displacement"]]
+        kin = kin_delta[kin_delta["AnimalId"] == aid][["bin", "delta"]]
+        merged = cam.merge(kin, on="bin", how="inner")
+        if merged.empty:
+            continue
+        thresh = merged["delta"].quantile(activity_pct)
+        active = merged[merged["delta"] >= thresh]
+        n = len(active)
+        if n < min_active_bins:
+            results.append({"temp_id": tid, "AnimalId": aid,
+                             "correlation": np.nan, "n_bins": n,
+                             "p_value": np.nan, "note": f"only {n} active bins"})
+            continue
+        if active["displacement"].std() == 0 or active["delta"].std() == 0:
+            results.append({"temp_id": tid, "AnimalId": aid,
+                             "correlation": np.nan, "n_bins": n,
+                             "p_value": np.nan, "note": "zero variance"})
+            continue
+        r, p = pearsonr(active["displacement"], active["delta"])
+        results.append({"temp_id": tid, "AnimalId": aid,
+                         "correlation": round(r, 4), "n_bins": n,
+                         "p_value": round(p, 4), "note": "ok"})
+    return pd.DataFrame(results)
+
+
+def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
+    assignment = {}
+    used_animals, used_tids = set(), set()
+    valid = scores[scores["correlation"] >= corr_threshold].sort_values(
+        "correlation", ascending=False)
+    for _, row in valid.iterrows():
+        tid, aid = row["temp_id"], row["AnimalId"]
+        if tid in used_tids or aid in used_animals:
+            continue
+        assignment[tid] = aid
+        used_tids.add(tid)
+        used_animals.add(aid)
+    return assignment
+
+
+def step_a_kinetic_match(tracks_df: pd.DataFrame,
+                          kinetics_df: pd.DataFrame,
+                          args: argparse.Namespace) -> dict:
+    """
+    Returns assignment dict: {temp_id (int) -> AnimalId (int)}
+    """
+    section("Step A — Kinetic Matcher")
+
+    total_frames = tracks_df["frame_index"].nunique()
+    tid_counts = tracks_df.groupby("temp_id")["frame_index"].nunique()
+    stable_tids = tid_counts[
+        tid_counts / total_frames >= args.min_temp_id_frames
+    ].index.tolist()
+    log(f"Stable temp_ids (≥{args.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
+
+    tracks_filt = tracks_df[tracks_df["temp_id"].isin(stable_tids)].copy()
+
+    t_start = tracks_filt["frame_datetime"].min().floor(f"{args.bin_minutes}min")
+    t_end   = tracks_filt["frame_datetime"].max().ceil(f"{args.bin_minutes}min")
+    bins    = pd.date_range(start=t_start, end=t_end, freq=f"{args.bin_minutes}min")
+    log(f"Time bins: {len(bins)-1} × {args.bin_minutes}-min from {t_start} to {t_end}")
+
+    if len(bins) < 3:
+        log("WARNING: fewer than 2 complete bins — correlation will be unreliable.")
+
+    cam_disp  = _camera_displacement_per_bin(tracks_filt, bins)
+    kin_delta = _kinetics_delta_per_bin(kinetics_df, bins)
+
+    if cam_disp.empty or kin_delta.empty:
+        log("WARNING: empty displacement or kinetics signal — no matches possible.")
+        return {}
+
+    scores = _compute_scores(cam_disp, kin_delta, args.activity_pct, args.min_active_bins)
+
+    # print correlation matrix
+    if not scores.empty:
+        pivot = scores.pivot_table(index="temp_id", columns="AnimalId",
+                                   values="correlation", aggfunc="first")
+        print("\nCorrelation matrix (temp_id × AnimalId):")
+        print(pivot.to_string())
+        print()
+
+    assignment = _greedy_assign(scores, args.corr_threshold)
+
+    if assignment:
+        for tid, aid in sorted(assignment.items()):
+            row = scores[(scores["temp_id"] == tid) & (scores["AnimalId"] == aid)].iloc[0]
+            log(f"  temp_id {tid:>3}  →  AnimalId {aid}  "
+                f"(r={row['correlation']:.3f}, n_bins={int(row['n_bins'])})")
+    else:
+        log("  No confident kinetic matches. "
+            "Try lowering --corr_threshold or using a longer video.")
+
+    unmatched = set(stable_tids) - set(assignment.keys())
+    if unmatched:
+        log(f"  Unmatched temp_ids after kinetics: {sorted(unmatched)}")
+
+    return assignment
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embed helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_embeds_for_session(tracks_df: pd.DataFrame,
+                             embed_parquet: str,
+                             session_id: str) -> pd.DataFrame:
+    """
+    Returns DataFrame with columns [temp_id, embed_array (np.ndarray shape 128)].
+    Tries parquet first, falls back to 'embed' column in tracks_df.
+    """
+    if embed_parquet and Path(embed_parquet).exists():
+        log(f"Loading embeddings from parquet: {embed_parquet}")
+        df = pd.read_parquet(embed_parquet)
+        if "session_id" in df.columns:
+            df = df[df["session_id"] == session_id]
+        if "embed" in df.columns and isinstance(df["embed"].iloc[0], np.ndarray):
+            return df[["temp_id", "embed"]].copy()
+        elif "embed" in df.columns:
+            df["embed"] = df["embed"].apply(
+                lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
+            )
+            return df[["temp_id", "embed"]].copy()
+
+    # fall back to 'embed' column in tracks CSV
+    if "embed" not in tracks_df.columns:
+        log("WARNING: no 'embed' column in tracks and no parquet — gallery step will be skipped.")
+        return pd.DataFrame(columns=["temp_id", "embed"])
+
+    rows = []
+    for _, row in tracks_df[tracks_df["embed"].notna()].iterrows():
+        raw = row["embed"]
+        if not raw or raw == "[]":
+            continue
+        try:
+            arr = np.array(json.loads(raw), dtype=np.float32)
+            if arr.shape == (128,):
+                rows.append({"temp_id": row["temp_id"], "embed": arr})
+        except Exception:
+            pass
+
+    if not rows:
+        log("WARNING: no valid embeds found in tracks CSV — gallery step will be skipped.")
+        return pd.DataFrame(columns=["temp_id", "embed"])
+
+    log(f"Loaded {len(rows)} embed rows from tracks CSV.")
+    return pd.DataFrame(rows)
+
+
+def compute_mean_embed(embed_rows: pd.DataFrame) -> np.ndarray:
+    """Stack and mean-pool all embed arrays, return L2-normalised 128D vector."""
+    stack = np.stack(embed_rows["embed"].values)     # (N, 128)
+    mean  = stack.mean(axis=0)
+    norm  = np.linalg.norm(mean)
+    return (mean / norm) if norm > 1e-8 else mean
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gallery I/O
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_gallery(gallery_dir: str, modality: str) -> dict:
+    """
+    Load gallery_{modality}.npy → dict {real_id (int): np.ndarray shape (128,)}.
+    modality: 'day' | 'night'
+    Returns empty dict if file doesn't exist.
+    """
+    path = Path(gallery_dir) / f"gallery_{modality}.npy"
+    if not path.exists():
+        return {}
+    data = np.load(str(path), allow_pickle=True).item()
+    return {int(k): v.astype(np.float32) for k, v in data.items()}
+
+
+def save_gallery(gallery_dir: str, modality: str, gallery: dict) -> None:
+    """Save gallery dict to gallery_{modality}.npy. Creates directory if needed."""
+    Path(gallery_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(gallery_dir) / f"gallery_{modality}.npy"
+    np.save(str(path), gallery)
+    log(f"Gallery saved: {path}  ({len(gallery)} entries)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step B — Gallery Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def step_b_gallery_builder(
+    tracks_df: pd.DataFrame,
+    embed_df: pd.DataFrame,
+    kinetic_assignment: dict,       # {temp_id -> AnimalId}
+    is_night: bool,
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    gallery_dir: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    For each kinetically-confirmed (temp_id → AnimalId) pair:
+      1. Pool all embeds for that temp_id into a session mean vector
+      2. EMA-blend with existing gallery entry (α = ema_alpha)
+      3. Write updated gallery to .npy and to reid_registry in SQLite
+
+    Returns updated gallery dict {real_id: np.ndarray}.
+    """
+    section("Step B — Gallery Builder")
+
+    modality = "night" if is_night else "day"
+    gallery = load_gallery(gallery_dir, modality)
+    log(f"Loaded {modality} gallery: {len(gallery)} existing entries")
+
+    if embed_df.empty:
+        log("No embeds available — skipping gallery update.")
+        return gallery
+
+    updates = 0
+    alpha = args.ema_alpha
+
+    for tid, aid in kinetic_assignment.items():
+        tid_embeds = embed_df[embed_df["temp_id"] == tid]
+        if len(tid_embeds) < args.min_embeds_gallery:
+            log(f"  temp_id {tid}: only {len(tid_embeds)} embeds (< {args.min_embeds_gallery}) — skip")
+            continue
+
+        session_mean = compute_mean_embed(tid_embeds)
+
+        if aid in gallery:
+            old_vec     = gallery[aid]
+            updated_vec = alpha * session_mean + (1 - alpha) * old_vec
+            norm        = np.linalg.norm(updated_vec)
+            gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
+            log(f"  AnimalId {aid} (t{tid}): EMA update  α={alpha}  "
+                f"cosine(old,new)={float(np.dot(old_vec, session_mean)):.3f}")
+        else:
+            gallery[aid] = session_mean
+            log(f"  AnimalId {aid} (t{tid}): new gallery entry from {len(tid_embeds)} embeds")
+
+        updates += 1
+
+        # update reid_registry in SQLite
+        if not dry_run:
+            col_emb   = f"gallery_embed_{modality}"
+            col_n     = f"gallery_n_{modality}"
+            col_upd   = f"last_updated_{modality}_dt"
+            ts        = pd.Timestamp.now().isoformat()
+            emb_json  = json.dumps(gallery[aid].tolist())
+
+            existing  = get_reid_row(conn, aid)
+            old_n     = (existing or {}).get(col_n, 0) or 0
+
+            upsert_reid(conn, aid, {
+                col_emb: emb_json,
+                col_n:   old_n + 1,
+                col_upd: ts,
+                "match_method": "kinetic",
+            })
+
+    log(f"Gallery updated: {updates} entries  modality={modality}")
+
+    if not dry_run and updates > 0:
+        save_gallery(gallery_dir, modality, gallery)
+
+    return gallery
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step C — Cosine Resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-8 or nb < 1e-8:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def step_c_cosine_resolver(
+    tracks_df: pd.DataFrame,
+    embed_df: pd.DataFrame,
+    kinetic_assignment: dict,       # {temp_id -> AnimalId} — already confirmed
+    gallery: dict,                  # {real_id: np.ndarray} updated by step B
+    is_night: bool,
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    gallery_dir: str,
+    session_id: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    For temp_ids NOT resolved by kinetics, query the gallery via cosine similarity.
+    Returns merged assignment dict {temp_id -> AnimalId} (kinetic + cosine).
+    Also heals within-session temp_id switches: if two temp_ids map to the same
+    AnimalId via cosine, the one with lower confidence is flagged.
+    """
+    section("Step C — Cosine Resolver")
+
+    modality = "night" if is_night else "day"
+
+    if not gallery:
+        log(f"No {modality} gallery entries — cosine resolver skipped.")
+        return dict(kinetic_assignment)
+
+    already_resolved = set(kinetic_assignment.keys())
+    all_tids = set(tracks_df["temp_id"].unique())
+    unresolved_tids = all_tids - already_resolved
+
+    # filter to temp_ids with enough embeds
+    if embed_df.empty:
+        log("No embeds available — cosine resolver skipped.")
+        return dict(kinetic_assignment)
+
+    embed_counts = embed_df.groupby("temp_id").size()
+    queryable_tids = [
+        tid for tid in unresolved_tids
+        if embed_counts.get(tid, 0) >= args.cosine_min_embeds
+    ]
+    log(f"Unresolved temp_ids: {sorted(unresolved_tids)}")
+    log(f"Queryable (≥{args.cosine_min_embeds} embeds): {sorted(queryable_tids)}")
+
+    cosine_assignment = {}
+    cosine_scores     = {}   # {tid: (aid, sim)}
+
+    # sort gallery real_ids not already assigned to someone in this session
+    assigned_aids = set(kinetic_assignment.values())
+
+    for tid in queryable_tids:
+        tid_embeds = embed_df[embed_df["temp_id"] == tid]
+        query_vec  = compute_mean_embed(tid_embeds)
+
+        best_aid, best_sim = None, -1.0
+        for aid, gallery_vec in gallery.items():
+            if aid in assigned_aids:
+                continue    # already kinetically matched to another temp_id this session
+            sim = cosine_sim(query_vec, gallery_vec)
+            if sim > best_sim:
+                best_sim = sim
+                best_aid = aid
+
+        if best_aid is not None and best_sim >= args.cosine_threshold:
+            cosine_assignment[tid] = best_aid
+            cosine_scores[tid]     = (best_aid, best_sim)
+            assigned_aids.add(best_aid)
+            log(f"  temp_id {tid}  →  AnimalId {best_aid}  "
+                f"(cosine={best_sim:.3f}, {modality})")
+        else:
+            log(f"  temp_id {tid}: best cosine {best_sim:.3f} below threshold "
+                f"{args.cosine_threshold} — unresolved")
+
+    if not cosine_assignment:
+        log("  No cosine matches found.")
+
+    # soft gallery update for cosine-confirmed (α/2 — conservative, self-referential)
+    if not dry_run and cosine_assignment:
+        alpha_half = args.ema_alpha / 2
+        for tid, aid in cosine_assignment.items():
+            tid_embeds = embed_df[embed_df["temp_id"] == tid]
+            if len(tid_embeds) < args.min_embeds_gallery:
+                continue
+            session_mean = compute_mean_embed(tid_embeds)
+            if aid in gallery:
+                old_vec      = gallery[aid]
+                updated_vec  = alpha_half * session_mean + (1 - alpha_half) * old_vec
+                norm         = np.linalg.norm(updated_vec)
+                gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
+            else:
+                gallery[aid] = session_mean
+
+            # persist
+            ts       = pd.Timestamp.now().isoformat()
+            col_emb  = f"gallery_embed_{modality}"
+            col_n    = f"gallery_n_{modality}"
+            existing = get_reid_row(conn, aid)
+            old_n    = (existing or {}).get(col_n, 0) or 0
+            upsert_reid(conn, aid, {
+                col_emb: json.dumps(gallery[aid].tolist()),
+                col_n:   old_n + 1,
+                f"last_updated_{modality}_dt": ts,
+                "match_method": f"cosine_{modality}",
+            })
+
+        save_gallery(gallery_dir, modality, gallery)
+
+    # --- switch healing: detect if two temp_ids in session both → same animal ---
+    all_assignments = {**kinetic_assignment, **cosine_assignment}
+    aid_to_tids: dict[int, list] = {}
+    for tid, aid in all_assignments.items():
+        aid_to_tids.setdefault(aid, []).append(tid)
+
+    for aid, tids in aid_to_tids.items():
+        if len(tids) > 1:
+            log(f"  [switch detected] AnimalId {aid} ← temp_ids {tids}  "
+                f"— likely tracker switch. Keeping highest-confidence assignment.")
+            # Keep the one with more frames; mark the other as a switch event.
+            frame_counts = {tid: (tracks_df["temp_id"] == tid).sum() for tid in tids}
+            keep_tid  = max(frame_counts, key=frame_counts.get)
+            drop_tids = [t for t in tids if t != keep_tid]
+            for d in drop_tids:
+                if d in cosine_assignment:
+                    del cosine_assignment[d]
+                elif d in all_assignments:
+                    # kinetically assigned — flag but don't remove (manual review)
+                    log(f"    WARNING: kinetically-assigned temp_id {d} also maps to "
+                        f"AnimalId {aid} — manual review recommended.")
+
+    merged = {**kinetic_assignment, **cosine_assignment}
+    log(f"Final assignment: {len(merged)} temp_ids resolved  "
+        f"({len(kinetic_assignment)} kinetic, {len(cosine_assignment)} cosine)")
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step D — Sensor Sequencer (forward-fill to video time grid)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def step_d_sensor_sequencer(
+    tracks_df: pd.DataFrame,
+    kinetics_df: pd.DataFrame,
+    behavior_df: pd.DataFrame | None,
+    assignment: dict,
+    bin_minutes: int = 15,
+) -> pd.DataFrame:
+    """
+    Forward-fill behavior (~90s) and kinetics (~15min) signals onto the video time grid.
+
+    For each resolved (temp_id → AnimalId) pair:
+      - Build a time grid from the video bins
+      - Join and forward-fill kinetics deltas and behavior features
+      - Return one row per (real_id, window_start_dt) suitable for resolved_cow_timeline
+
+    Returns DataFrame with columns aligned to resolved_cow_timeline schema.
+    """
+    section("Step D — Sensor Sequencer")
+
+    if assignment is None or len(assignment) == 0:
+        log("No assignments — sensor sequencer skipped.")
+        return pd.DataFrame()
+
+    rows = []
+
+    for tid, aid in assignment.items():
+        tid_tracks = tracks_df[tracks_df["temp_id"] == tid].copy()
+        if tid_tracks.empty:
+            continue
+
+        t_start = tid_tracks["frame_datetime"].min().floor(f"{bin_minutes}min")
+        t_end   = tid_tracks["frame_datetime"].max().ceil(f"{bin_minutes}min")
+        bins    = pd.date_range(start=t_start, end=t_end, freq=f"{bin_minutes}min")
+
+        # ---- kinetics deltas ----
+        kin_animal = kinetics_df[kinetics_df["AnimalId"] == aid].sort_values("datetime")
+
+        kin_bins = []
+        for i in range(len(bins) - 1):
+            t0, t1 = bins[i], bins[i + 1]
+            before = kin_animal[kin_animal["datetime"] < t0]
+            after  = kin_animal[kin_animal["datetime"] < t1]
+            if before.empty or after.empty:
+                kin_bins.append({
+                    "window_start_dt": t0,
+                    "d_kin_x": np.nan, "d_kin_y": np.nan,
+                    "d_kin_z": np.nan, "d_kin_r": np.nan,
+                })
+                continue
+            deltas = {
+                "window_start_dt": t0,
+                "d_kin_x": max(0, after.iloc[-1]["KineticsCountX"] - before.iloc[-1]["KineticsCountX"]),
+                "d_kin_y": max(0, after.iloc[-1]["KineticsCountY"] - before.iloc[-1]["KineticsCountY"]),
+                "d_kin_z": max(0, after.iloc[-1]["KineticsCountZ"] - before.iloc[-1]["KineticsCountZ"]),
+                "d_kin_r": max(0, after.iloc[-1]["KineticsCountR"] - before.iloc[-1]["KineticsCountR"]),
+            }
+            kin_bins.append(deltas)
+
+        kin_grid = pd.DataFrame(kin_bins).set_index("window_start_dt")
+        # forward-fill any NaN gaps (sensor dropouts)
+        kin_grid = kin_grid.ffill()
+
+        # ---- behavior features (forward-fill from ~90s intervals) ----
+        beh_cols = ["d_f12", "d_f23", "d_v"]
+        beh_grid = pd.DataFrame(index=bins[:-1], columns=beh_cols, dtype=float)
+        beh_grid.index.name = "window_start_dt"
+
+        if behavior_df is not None and not behavior_df.empty:
+            beh_animal = behavior_df[behavior_df["AnimalId"] == aid].sort_values("datetime")
+            if not beh_animal.empty:
+                # assign each behavior row to nearest bin, then mean-aggregate
+                beh_animal = beh_animal.copy()
+                beh_animal["bin"] = pd.cut(
+                    beh_animal["datetime"], bins=bins, right=False, labels=bins[:-1]
+                )
+                beh_animal = beh_animal.dropna(subset=["bin"])
+                for b, grp in beh_animal.groupby("bin", observed=True):
+                    # compute deltas of each feature over this bin
+                    beh_grid.loc[b, "d_f12"] = grp["f_1_2"].diff().abs().sum() if len(grp) > 1 else grp["f_1_2"].iloc[0]
+                    beh_grid.loc[b, "d_f23"] = grp["f_2_3"].diff().abs().sum() if len(grp) > 1 else grp["f_2_3"].iloc[0]
+                    beh_grid.loc[b, "d_v"]   = grp["v"].diff().abs().sum()      if len(grp) > 1 else grp["v"].iloc[0]
+                beh_grid = beh_grid.ffill()
+
+        # ---- merge into one row per bin ----
+        for t0 in bins[:-1]:
+            krow = kin_grid.loc[t0] if t0 in kin_grid.index else pd.Series(dtype=float)
+            brow = beh_grid.loc[t0] if t0 in beh_grid.index else pd.Series(dtype=float)
+
+            sensor_ok = not (krow.isna().all() and brow.isna().all())
+            modality_mask = 1 if sensor_ok else 0  # bit 0 = sensor_ok
+
+            rows.append({
+                "real_id":         int(aid),
+                "window_start_dt": t0.isoformat(),
+                "modality_mask":   modality_mask,
+                "d_f12":   float(brow.get("d_f12",   np.nan)),
+                "d_f23":   float(brow.get("d_f23",   np.nan)),
+                "d_v":     float(brow.get("d_v",     np.nan)),
+                "d_kin_x": float(krow.get("d_kin_x", np.nan)),
+                "d_kin_y": float(krow.get("d_kin_y", np.nan)),
+                "d_kin_z": float(krow.get("d_kin_z", np.nan)),
+                "d_kin_r": float(krow.get("d_kin_r", np.nan)),
+                # vision features filled by future pose extractor (step E)
+                "spine_angle": None, "pelvic_tilt": None, "tail_elevation": None,
+                "limb_symmetry": None, "head_drop": None, "lying_flag": None,
+                "restlessness": None, "kps_coverage": None, "embed_mean": None,
+            })
+
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        log(f"Sensor grid: {len(result)} rows for {result['real_id'].nunique()} animals")
+    else:
+        log("Sensor grid empty.")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step E — Write resolved_cow_timeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def step_e_write_timeline(
+    timeline_df: pd.DataFrame,
+    session_id: str,
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+) -> None:
+    section("Step E — Write resolved_cow_timeline")
+
+    if timeline_df.empty:
+        log("Nothing to write.")
+        return
+
+    timeline_df = timeline_df.copy()
+    timeline_df["session_id"] = session_id
+
+    # Convert NaN embed_mean to None so SQLite stores NULL
+    if "embed_mean" in timeline_df.columns:
+        timeline_df["embed_mean"] = timeline_df["embed_mean"].where(
+            timeline_df["embed_mean"].notna(), None
+        )
+
+    if dry_run:
+        log(f"[dry_run] Would insert {len(timeline_df)} rows into resolved_cow_timeline")
+        print(timeline_df.head(5).to_string())
+        return
+
+    cols = [
+        "real_id", "session_id", "window_start_dt", "modality_mask",
+        "d_f12", "d_f23", "d_v",
+        "d_kin_x", "d_kin_y", "d_kin_z", "d_kin_r",
+        "spine_angle", "pelvic_tilt", "tail_elevation",
+        "limb_symmetry", "head_drop", "lying_flag",
+        "restlessness", "kps_coverage", "embed_mean",
+    ]
+    # only include columns that exist in the df
+    cols = [c for c in cols if c in timeline_df.columns]
+
+    ph  = ", ".join("?" * len(cols))
+    sql = f"INSERT INTO resolved_cow_timeline ({', '.join(cols)}) VALUES ({ph})"
+
+    inserted = 0
+    for _, row in timeline_df.iterrows():
+        vals = [
+            (None if (isinstance(v, float) and np.isnan(v)) else v)
+            for v in [row.get(c) for c in cols]
+        ]
+        conn.execute(sql, vals)
+        inserted += 1
+
+    conn.commit()
+    log(f"Inserted {inserted} rows into resolved_cow_timeline for session '{session_id}'")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Update known_temp_ids in reid_registry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_known_temp_ids(conn: sqlite3.Connection,
+                           assignment: dict,
+                           session_id: str,
+                           dry_run: bool = False) -> None:
+    """Append {session_id, temp_id} entries to reid_registry.known_temp_ids."""
+    if dry_run:
+        return
+    for tid, aid in assignment.items():
+        existing = get_reid_row(conn, aid)
+        if existing is None:
+            continue
+        raw = existing.get("known_temp_ids") or "[]"
+        try:
+            known = json.loads(raw)
+        except Exception:
+            known = []
+        entry = {"session_id": session_id, "temp_id": int(tid)}
+        if entry not in known:
+            known.append(entry)
+        upsert_reid(conn, aid, {"known_temp_ids": json.dumps(known)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = parse_args()
+
+    section("reconcile.py — ReID pipeline")
+    log(f"session_id  : {args.session}")
+    log(f"tracks      : {args.tracks}")
+    log(f"kinetics    : {args.kinetics}")
+    log(f"db          : {args.db}")
+    log(f"gallery_dir : {args.gallery_dir}")
+    log(f"dry_run     : {args.dry_run}")
+
+    # ── database ──────────────────────────────────────────────────────────────
+    conn = init_db(args.db)
+
+    # ── load data ────────────────────────────────────────────────────────────
+    log("Loading tracks CSV...")
+    tracks_df = pd.read_csv(args.tracks, parse_dates=["frame_datetime"])
+    log(f"  {len(tracks_df)} rows, {tracks_df['temp_id'].nunique()} temp_ids, "
+        f"frames {tracks_df['frame_index'].min()}–{tracks_df['frame_index'].max()}")
+
+    log("Loading kinetics CSV...")
+    kinetics_df = pd.read_csv(args.kinetics, parse_dates=["datetime"])
+    log(f"  {len(kinetics_df)} rows, animals: {sorted(kinetics_df['AnimalId'].unique())}")
+
+    # optional behavior CSV (same directory as kinetics, same animal suffix)
+    behavior_df = None
+    beh_candidate = Path(args.kinetics).parent / Path(args.kinetics).name.replace(
+        "kinetic_data", "behavior_data"
+    )
+    if beh_candidate.exists():
+        log(f"Loading behavior CSV: {beh_candidate}")
+        behavior_df = pd.read_csv(str(beh_candidate), parse_dates=["datetime"])
+        log(f"  {len(behavior_df)} rows")
+    else:
+        log(f"No behavior CSV found alongside kinetics (looked for {beh_candidate.name}) — sensor d_f12/f23/v will be NaN")
+
+    # detect day/night
+    is_night = detect_is_night_from_tracks(tracks_df)
+    log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
+
+    # register session if new
+    upsert_session(conn, args.session, args.tracks, is_night)
+
+    # ── Step A — kinetic matching ─────────────────────────────────────────────
+    kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
+
+    # ── load embeds ───────────────────────────────────────────────────────────
+    embed_df = load_embeds_for_session(tracks_df, args.embed_parquet, args.session)
+
+    # ── Step B — gallery builder ───────────────────────────────────────────────
+    gallery = step_b_gallery_builder(
+        tracks_df       = tracks_df,
+        embed_df        = embed_df,
+        kinetic_assignment = kinetic_assignment,
+        is_night        = is_night,
+        conn            = conn,
+        args            = args,
+        gallery_dir     = args.gallery_dir,
+        dry_run         = args.dry_run,
+    )
+
+    # ── Step C — cosine resolver ───────────────────────────────────────────────
+    full_assignment = step_c_cosine_resolver(
+        tracks_df           = tracks_df,
+        embed_df            = embed_df,
+        kinetic_assignment  = kinetic_assignment,
+        gallery             = gallery,
+        is_night            = is_night,
+        conn                = conn,
+        args                = args,
+        gallery_dir         = args.gallery_dir,
+        session_id          = args.session,
+        dry_run             = args.dry_run,
+    )
+
+    # ── update known_temp_ids ─────────────────────────────────────────────────
+    update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
+
+    # ── Step D — sensor sequencer ─────────────────────────────────────────────
+    timeline_df = step_d_sensor_sequencer(
+        tracks_df    = tracks_df,
+        kinetics_df  = kinetics_df,
+        behavior_df  = behavior_df,
+        assignment   = full_assignment,
+        bin_minutes  = args.bin_minutes,
+    )
+    if not timeline_df.empty:
+        timeline_df["session_id"] = args.session
+
+    # ── Step E — write to DB ───────────────────────────────────────────────────
+    step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    section("Summary")
+    log(f"Kinetic matches : {len(kinetic_assignment)}")
+    log(f"Cosine matches  : {len(full_assignment) - len(kinetic_assignment)}")
+    log(f"Total resolved  : {len(full_assignment)} temp_ids → AnimalId")
+    unresolved = set(tracks_df["temp_id"].unique()) - set(full_assignment.keys())
+    if unresolved:
+        log(f"Unresolved      : {sorted(unresolved)}")
+    log(f"Timeline rows   : {len(timeline_df)}")
+    if args.dry_run:
+        log("dry_run=True — no data written to DB or gallery files")
+
+    conn.close()
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Example usage
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# python3 reconcile.py \
+#   --db        calving_project.db \
+#   --session   session_001 \
+#   --kinetics  raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#   --tracks    outputs/tracks/session_001/tracks.csv \
+#   --gallery_dir ./reid_gallery \
+#   --corr_threshold 0.7 \
+#   --min_active_bins 3 \
+#   --cosine_threshold 0.75 \
+#   --ema_alpha 0.15
+#
+# With embeddings in parquet:
+#   --embed_parquet outputs/embeddings/session_001_embeds.parquet
+#
+# Dry run (no DB writes):
+#   --dry_run
+#
+# After running, validate visually:
+#   python3 display_tracks.py \
+#     --video  raw_data/videos/session_001.mp4 \
+#     --tracks outputs/tracks/session_001/tracks.csv \
+#     --kinetics raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#     --draw_pose --show_fps --sink ffplay
+#
+# Pipeline notes:
+#   - Run once per session after track_and_dump.py completes
+#   - Gallery files accumulate across sessions — more sessions = better cosine matching
+#   - Kinetic matching requires ≥3 active 15-min bins (45+ minutes of video)
+#   - Cosine resolver is a no-op on first run (empty gallery) — by design
+#   - Vision features (spine_angle etc.) will be NULL until pose extractor is added

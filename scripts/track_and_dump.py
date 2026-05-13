@@ -19,6 +19,8 @@ from time import time
 
 import cv2
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 from ultralytics import YOLO
 
@@ -79,7 +81,6 @@ def parse_args():
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--iou", type=float, default=0.45)
     ap.add_argument("--save_crops", action="store_true")
-    ap.add_argument("--save_embed", action="store_true")
 
     # control crop saving cadence per ID
     ap.add_argument(
@@ -176,8 +177,9 @@ def main():
     crops_dir = ensure_dir(outdir / "crops") if args.save_crops else None
 
     # open outputs
-    csv_path = outdir / "tracks.csv"
-    jsonl_path = outdir / "tracks.jsonl"
+    csv_path    = outdir / "tracks.csv"
+    jsonl_path  = outdir / "tracks.jsonl"
+    parquet_path = outdir / "embeds.parquet"
     kp_jsonl_path = outdir / "keypoints.jsonl" if args.write_kp_jsonl else None
 
     log(f"Starting tracking")
@@ -185,7 +187,7 @@ def main():
     log(f"  source    : {args.source}")
     log(f"  outdir    : {outdir}")
     log(f"  tracker   : {args.tracker}")
-    log(f"  save_crops: {args.save_crops}, save_embed: {args.save_embed}")
+    log(f"  save_crops: {args.save_crops}")
     if args.pose_model:
         log(f"  pose_model: {args.pose_model}")
 
@@ -207,8 +209,6 @@ def main():
         "w",
         "h",
     ]
-    if args.save_embed:
-        header.append("embed")  # JSON list of 128 floats
     # pose fields
     if args.pose_model:
         # kps/kps_norm are flat [x,y,v,...]
@@ -226,10 +226,8 @@ def main():
     det_model = YOLO(args.model)
     det_model.fuse()
 
-    # Embedding model
-    embedder = None
-    if args.save_embed:
-        embedder = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
+    # Embedding model (always active)
+    embedder = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
 
     # Pose model
     pose_model = None
@@ -261,6 +259,9 @@ def main():
     # per-ID crop occurrence counter
     crop_occurrence = defaultdict(int)
     warned_kp_mismatch = False
+
+    # accumulates embed rows for end-of-run parquet write
+    embed_rows: list[dict] = []
 
     # for periodic flushing and simple ETA-ish info
     last_flush_frame = 0
@@ -341,9 +342,9 @@ def main():
         # crops (for embedding and pose)
         crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
 
-        # ------- embeddings (optional) -------
+        # ------- embeddings (always) -------
         embeds_json = [None] * len(crops)
-        if args.save_embed and len(crops):
+        if len(crops):
             batch = [to_tensor_bchw(c, size=224) for c in crops]
             X = torch.from_numpy(np.stack(batch)).to(device)
             with torch.no_grad():
@@ -444,8 +445,6 @@ def main():
                 float(w),
                 float(h),
             ]
-            if args.save_embed:
-                row.append(embeds_json[j] if embeds_json[j] is not None else "[]")
             if pose_model:
                 row.append(kps_list[j] if kps_list[j] is not None else "[]")
                 row.append(kpsn_list[j] if kpsn_list[j] is not None else "[]")
@@ -470,8 +469,15 @@ def main():
                 "w": float(w),
                 "h": float(h),
             }
-            if args.save_embed and embeds_json[j] is not None:
-                obj["embed"] = json.loads(embeds_json[j])
+            if embeds_json[j] is not None:
+                embed_vec = json.loads(embeds_json[j])
+                obj["embed"] = embed_vec
+                embed_rows.append({
+                    "session_id":  args.camera_id,
+                    "frame_index": frame_idx,
+                    "temp_id":     int(tid),
+                    "embed":       np.array(embed_vec, dtype=np.float32),
+                })
             if pose_model and kps_list[j] is not None:
                 obj["kps"] = json.loads(kps_list[j])
                 obj["kps_norm"] = json.loads(kpsn_list[j])
@@ -519,6 +525,28 @@ def main():
     log(f"Done. Processed {frame_idx} frames in {t_total:.1f}s ({frame_idx / max(t_total,1e-6):.1f} FPS).")
     log(f"tracks.csv : {csv_path}")
     log(f"tracks.jsonl: {jsonl_path}")
+
+    # ---- write embeds.parquet ----
+    if embed_rows:
+        import pandas as pd
+        emb_df = pd.DataFrame({
+            "session_id":  [r["session_id"]  for r in embed_rows],
+            "frame_index": [r["frame_index"] for r in embed_rows],
+            "temp_id":     [r["temp_id"]     for r in embed_rows],
+        })
+        # store embed as fixed-size list column (128 float32 values per row)
+        embed_array = np.stack([r["embed"] for r in embed_rows])   # (N, 128)
+        table = pa.Table.from_pandas(emb_df)
+        embed_col = pa.FixedSizeListArray.from_arrays(
+            pa.array(embed_array.ravel().tolist(), type=pa.float32()), 128
+        )
+        table = table.append_column(
+            pa.field("embed", pa.list_(pa.float32(), 128)), embed_col
+        )
+        pq.write_table(table, str(parquet_path), compression="snappy")
+        size_mb = parquet_path.stat().st_size / 1e6
+        log(f"embeds.parquet: {parquet_path}  ({len(embed_rows)} rows, {size_mb:.1f} MB)")
+
     if crops_dir is not None:
         log(f"crops saved to: {crops_dir}")
     if kp_jsonl_path:
@@ -546,7 +574,7 @@ if __name__ == "__main__":
 #   --tracker "/home/anton/thesis_workspace/vcf-ctp/configs/botsort.yaml" \
 #   --camera_id "refet_33" \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
-#   --save_crops --save_embed \
+#   --save_crops \
 #   --pose_model "$POSE" --pose_imgsz 384 --pose_conf 0.25 --pose_batch 32 \
 #   --crop_every 100 \
 #   --min_crop_wh 100 100
