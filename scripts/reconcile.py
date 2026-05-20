@@ -1068,10 +1068,11 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # python3 reconcile.py \
-#   --db        calving_project.db \
-#   --session   session_001 \
-#   --kinetics  raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
-#   --gallery_dir ./reid_gallery \
+#   --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
+#   --session    refet33_20241221 \
+#   --kinetics   ~/thesis_workspace/raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet \
+#   --gallery_dir ~/thesis_workspace/reid_gallery \
 #   --corr_threshold 0.7 \
 #   --min_active_bins 3 \
 #   --cosine_threshold 0.75 \
