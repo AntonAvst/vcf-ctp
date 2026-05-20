@@ -204,6 +204,17 @@ CREATE TABLE IF NOT EXISTS calving_ledger (
     calving_dt  TEXT,
     outcome     TEXT    -- 'Unassisted'|'Assisted'|'Twin'|'Veterinarian-assisted'
 );
+
+CREATE TABLE IF NOT EXISTS manual_assignments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    temp_id     INTEGER NOT NULL,
+    real_id     INTEGER NOT NULL,
+    assigned_by TEXT    DEFAULT 'manual',
+    assigned_dt TEXT,
+    note        TEXT,
+    UNIQUE(session_id, temp_id)
+);
 """
 
 
@@ -288,6 +299,8 @@ def _camera_displacement_per_bin(tracks: pd.DataFrame,
     df = tracks.sort_values(["temp_id", "frame_datetime"])
     df["bin"] = pd.cut(df["frame_datetime"], bins=bins, right=False, labels=bins[:-1])
     df = df.dropna(subset=["bin"])
+    # cast Categorical bin labels → Timestamp so merge with kin_delta works
+    df["bin"] = df["bin"].astype("datetime64[ns]")
     rows = []
     for (tid, b), grp in df.groupby(["temp_id", "bin"], observed=True):
         grp = grp.sort_values("frame_datetime")
@@ -328,7 +341,7 @@ def _compute_scores(cam_disp: pd.DataFrame, kin_delta: pd.DataFrame,
         thresh = merged["delta"].quantile(activity_pct)
         active = merged[merged["delta"] >= thresh]
         n = len(active)
-        if n < min_active_bins:
+        if n < max(min_active_bins, 2):
             results.append({"temp_id": tid, "AnimalId": aid,
                              "correlation": np.nan, "n_bins": n,
                              "p_value": np.nan, "note": f"only {n} active bins"})
@@ -934,6 +947,27 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step A.5 — Manual assignment loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_manual_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
+    """
+    Load manual identity assignments for a session from manual_assignments table.
+    Returns {temp_id (int) -> real_id (int)}.
+    """
+    rows = conn.execute(
+        "SELECT temp_id, real_id FROM manual_assignments WHERE session_id = ?",
+        (session_id,)
+    ).fetchall()
+    if not rows:
+        return {}
+    result = {int(r[0]): int(r[1]) for r in rows}
+    log(f"Manual assignments loaded: {len(result)} "
+        f"({', '.join(f't{t}→{a}' for t,a in sorted(result.items()))})")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -993,6 +1027,14 @@ def run(args) -> None:
     # ── Step A — kinetic matching ─────────────────────────────────────────────
     kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
 
+    # ── Step A.5 — merge manual assignments ──────────────────────────────────
+    manual_assignment = load_manual_assignments(conn, args.session)
+    if manual_assignment:
+        conflicts = set(kinetic_assignment) & set(manual_assignment)
+        if conflicts:
+            log(f"  Note: manual overrides kinetic for temp_ids: {sorted(conflicts)}")
+        kinetic_assignment.update(manual_assignment)
+
     # ── load embeds from parquet ──────────────────────────────────────────────
     embed_df = load_embeds_for_session(tracks_df, args.embed_parquet, args.session)
 
@@ -1041,7 +1083,10 @@ def run(args) -> None:
 
     # ── summary ───────────────────────────────────────────────────────────────
     section("Summary")
-    log(f"Kinetic matches : {len(kinetic_assignment)}")
+    n_manual  = len(manual_assignment)
+    n_kinetic = len(kinetic_assignment) - n_manual
+    log(f"Kinetic matches : {n_kinetic}")
+    log(f"Manual matches  : {n_manual}")
     log(f"Cosine matches  : {len(full_assignment) - len(kinetic_assignment)}")
     log(f"Total resolved  : {len(full_assignment)} temp_ids → AnimalId")
     unresolved = set(tracks_df["temp_id"].unique()) - set(full_assignment.keys())
@@ -1070,26 +1115,23 @@ if __name__ == "__main__":
 # python3 reconcile.py \
 #   --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
 #   --session    refet33_20241221 \
-#   --kinetics   ~/thesis_workspace/raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#   --kinetics   "$KIN" \
 #   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet \
-#   --gallery_dir ~/thesis_workspace/reid_gallery \
-#   --corr_threshold 0.7 \
-#   --min_active_bins 3 \
+#   --gallery_dir ./reid_gallery \
+#   --corr_threshold 0.1 \
+#   --min_active_bins 1 \
 #   --cosine_threshold 0.75 \
 #   --ema_alpha 0.15
-#
-# With embeddings in parquet:
-#   --embed_parquet outputs/embeddings/session_001_embeds.parquet
 #
 # Dry run (no DB writes):
 #   --dry_run
 #
 # After running, validate visually:
 #   python3 display_tracks.py \
-#     --video      raw_data/videos/session_001.mp4 \
-#     --db         outputs/tracks/session_001/calving_project.db \
-#     --session_id session_001 \
-#     --kinetics   raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+#     --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.mp4 \
+#     --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
+#     --session_id refet33_20241221 \
+#     --kinetics   "$KIN" \
 #     --draw_pose --show_fps --sink ffplay
 #
 # Pipeline notes:
