@@ -10,15 +10,6 @@ sys.path.insert(0, str(_Path(__file__).resolve().parent))
 import cv2
 import numpy as np
 
-try:
-    import match_identity as mi
-    _MI_AVAILABLE = True
-    print(f"[DEBUG] match_identity import ok", flush=True)
-except Exception as e:
-    _MI_AVAILABLE = False
-    print(f"[DEBUG] match_identity import FAILED!!!! :( exception - {e}) ", flush=True)
-
-
 def log(msg):
     print(f"[viewer] {msg}", flush=True)
 
@@ -333,17 +324,7 @@ def parse_args():
                     help="Path to calving_project.db (SQLite)")
     ap.add_argument("--session_id", required=True,
                     help="session_id to display (must exist in video_sessions table)")
-    ap.add_argument("--kinetics", default="",
-        help="Path to kinetic_data_*.csv. If provided, identity matching runs "
-             "before playback and labels are shown as AnimalId instead of temp_id.")
-    ap.add_argument("--corr_threshold", type=float, default=0.7,
-        help="Min Pearson r to accept a temp_id->AnimalId match (default: 0.7)")
-    ap.add_argument("--min_active_bins", type=int, default=1,
-        help="Min active kinetics bins required for a match (default: 1 for live mode)")
-    ap.add_argument("--bin_minutes", type=int, default=15,
-        help="Kinetics bin width in minutes (default: 15)")
-    ap.add_argument("--min_temp_id_frames", type=float, default=0.10,
-        help="Min fraction of frames a temp_id must appear to be considered real (default: 0.10)")
+
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--max_fps", type=float, default=0.0)
     ap.add_argument("--show_fps", action="store_true")
@@ -587,35 +568,46 @@ def main():
     # derive kps parquet path (same folder as the db)
     kps_pq_path = str(db.parent / "kps.parquet")
 
-    # ---- live identity matching state ----
-    assignment    = {}
-    scores_df     = None
-    _last_bin     = None
-    _tracks_df    = None
-    _kinetics_df  = None
+    # ---- identity assignment (loaded from DB) ----
+    assignment = {}
+    scores_df  = None
 
-    _live_matching = False
-    if args.kinetics:
-        if not _MI_AVAILABLE:
-            log("WARNING: match_identity.py not on PYTHONPATH — skipping identity matching.")
-        else:
-            kin_path = Path(args.kinetics)
-            if not kin_path.exists():
-                log(f"WARNING: kinetics file not found: {kin_path} — skipping.")
-            else:
-                import pandas as _pd
-                log(f"Loading tracks from DB and kinetics for live matching...")
-                _tracks_df = _pd.read_sql(
-                    "SELECT frame_index, frame_datetime, temp_id, cx, cy "
-                    "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
-                    sqlite3.connect(str(db)),
-                    params=(args.session_id,),
-                    parse_dates=["frame_datetime"],
-                )
-                _kinetics_df = _pd.read_csv(str(kin_path), parse_dates=["datetime"])
-                _live_matching = True
-                log(f"Live matching ready. Scores update every {args.bin_minutes}-min interval.")
-                log(f"  corr_threshold={args.corr_threshold}  min_active_bins={args.min_active_bins}")
+    # ---- pre-load resolved assignments from DB ----
+    # Pulls from manual_assignments + reid_registry so labels show animal IDs
+    # immediately without waiting for live kinetic matching to fire.
+    try:
+        _conn = sqlite3.connect(str(db))
+
+        # manual assignments for this session
+        _manual = _conn.execute(
+            "SELECT temp_id, real_id FROM manual_assignments WHERE session_id = ?",
+            (args.session_id,)
+        ).fetchall()
+        for tid, aid in _manual:
+            assignment[int(tid)] = int(aid)
+
+        # kinetic/cosine assignments stored in reid_registry.known_temp_ids
+        _reid = _conn.execute(
+            "SELECT real_id, known_temp_ids FROM reid_registry "
+            "WHERE known_temp_ids IS NOT NULL"
+        ).fetchall()
+        for real_id, known_json in _reid:
+            try:
+                known = json.loads(known_json)
+                for entry in known:
+                    if entry.get("session_id") == args.session_id:
+                        tid = int(entry["temp_id"])
+                        if tid not in assignment:   # manual takes priority
+                            assignment[tid] = int(real_id)
+            except Exception:
+                pass
+
+        _conn.close()
+        if assignment:
+            pairs = ', '.join('t%d->%d' % (t, a) for t, a in sorted(assignment.items()))
+            log(f"Pre-loaded {len(assignment)} assignment(s) from DB: {pairs}")
+    except Exception as e:
+        log(f"WARNING: could not pre-load assignments from DB: {e}")
 
     log(f"Opening video: {vid}")
     cap = cv2.VideoCapture(str(vid))
@@ -780,38 +772,6 @@ def main():
                         index_offset=args.kp_index_offset,
                     )
 
-            # ---- live matching: recompute on each new kinetics interval ----
-            if _live_matching and next_fi is not None:
-                # get the frame_datetime for this frame from the tracks df
-                _frame_rows = _tracks_df[_tracks_df["frame_index"] == frame_idx]
-                if not _frame_rows.empty:
-                    import pandas as _pd
-                    _now_dt = _frame_rows["frame_datetime"].iloc[0]
-                    # compute which kinetics bin we are currently in
-                    _cur_bin = _now_dt.floor(f"{args.bin_minutes}min")
-                    if _cur_bin != _last_bin:
-                        # crossed a new interval boundary — recompute
-                        try:
-                            assignment, scores_df = mi.score_up_to(
-                                tracks_df=_tracks_df,
-                                kinetics_df=_kinetics_df,
-                                up_to_datetime=_now_dt,
-                                bin_minutes=args.bin_minutes,
-                                activity_pct=0.25,
-                                min_active_bins=args.min_active_bins,
-                                min_temp_id_frames=args.min_temp_id_frames,
-                            )
-                            _last_bin = _cur_bin
-                            # print update to terminal
-                            n_bins_done = int((_now_dt - _tracks_df["frame_datetime"].min())
-                                              .total_seconds() / 60 / args.bin_minutes)
-                            log(f"[{_now_dt.strftime('%H:%M:%S')}] "
-                                f"Interval {n_bins_done} — "
-                                + (", ".join(f"t{t}->{a}" for t,a in sorted(assignment.items()))
-                                   if assignment else "no confident matches yet"))
-                        except Exception as _exc:
-                            log(f"Live match error: {_exc}")
-
             # identity match score table overlay
             if show_table and scores_df is not None:
                 draw_score_table(frame, scores_df, assignment)
@@ -894,9 +854,10 @@ if __name__ == "__main__":
 
 # Example usage:
 # python3 display_tracks.py \
-#   --video      "/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4" \
-#   --db         "/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db" \
-#   --session_id "refet33_20241221" \
-#   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35 \
-#   --kinetics   /home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv \
-#   --corr_threshold 0.7 --min_active_bins 3
+#   --video      "$VID" \
+#   --db         "$DB" \
+#   --session_id refet33_20241221 \
+#   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35
+#
+# Identity labels (cow XXXX) are loaded automatically from the DB.
+# Run reconcile.py or assign_identity.py first to populate assignments.

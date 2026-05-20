@@ -566,8 +566,9 @@ if __name__ == "__main__":
 # DET=/home/anton/thesis_workspace/vcf-ctp/models/cow_detector/best.pt
 # POSE=/home/anton/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
 # VID=/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4
-# OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21#
+# OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21
 # KIN=/home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv
+# DB=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db
 #
 # python3 track_and_dump.py \
 #   --model      "$DET" \
