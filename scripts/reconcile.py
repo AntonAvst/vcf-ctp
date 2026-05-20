@@ -215,6 +215,18 @@ CREATE TABLE IF NOT EXISTS manual_assignments (
     note        TEXT,
     UNIQUE(session_id, temp_id)
 );
+
+CREATE TABLE IF NOT EXISTS temp_id_merges (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT    NOT NULL,
+    winner_tid    INTEGER NOT NULL,   -- temp_id that survives
+    loser_tid     INTEGER NOT NULL,   -- temp_id that was remapped to winner
+    real_id       INTEGER NOT NULL,   -- the shared AnimalId
+    winner_reason TEXT,               -- 'manual' | 'more_frames' | 'kinetic'
+    loser_reason  TEXT,               -- why the loser was assigned this animal
+    merged_dt     TEXT,
+    UNIQUE(session_id, loser_tid)     -- a loser can only be merged once per session
+);
 """
 
 
@@ -649,8 +661,8 @@ def step_c_cosine_resolver(
         tid for tid in unresolved_tids
         if embed_counts.get(tid, 0) >= args.cosine_min_embeds
     ]
-    log(f"Unresolved temp_ids: {sorted(unresolved_tids)}")
-    log(f"Queryable (≥{args.cosine_min_embeds} embeds): {sorted(queryable_tids)}")
+    log(f"Unresolved temp_ids: {sorted(int(t) for t in unresolved_tids)}")
+    log(f"Queryable (≥{args.cosine_min_embeds} embeds): {sorted(int(t) for t in queryable_tids)}")
 
     cosine_assignment = {}
     cosine_scores     = {}   # {tid: (aid, sim)}
@@ -947,6 +959,111 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step A.6 — Duplicate assignment resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_duplicate_assignments(
+    assignment: dict,               # {temp_id -> real_id}  — may contain duplicates
+    manual_tids: set,               # temp_ids that came from manual assignments
+    kinetic_tids: set,              # temp_ids that came from kinetic matching
+    tracks_df: pd.DataFrame,        # for frame-count lookup
+    conn: sqlite3.Connection,
+    session_id: str,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Detect AnimalIds assigned to multiple temp_ids and resolve by merging.
+
+    Winner hierarchy (highest priority first):
+      1. Manual assignment
+      2. More frames in raw_tracks
+      3. Kinetic assignment (lower temp_id breaks ties)
+
+    The loser temp_id is remapped to the winner temp_id in the returned dict.
+    A record is written to temp_id_merges for traceability.
+
+    Returns a cleaned assignment dict where every real_id appears exactly once,
+    plus a merge_map {loser_tid -> winner_tid} for downstream steps to use
+    when pooling embed/track rows.
+    """
+    # group by real_id → find duplicates
+    from collections import defaultdict
+    aid_to_tids = defaultdict(list)
+    for tid, aid in assignment.items():
+        aid_to_tids[aid].append(tid)
+
+    duplicates = {aid: tids for aid, tids in aid_to_tids.items() if len(tids) > 1}
+    if not duplicates:
+        return assignment, {}
+
+    section("Step A.6 — Duplicate Assignment Resolver")
+
+    # frame counts for all temp_ids in this session
+    frame_counts = (
+        tracks_df.groupby("temp_id")["frame_index"]
+        .nunique()
+        .to_dict()
+    )
+
+    def priority(tid, aid):
+        """Lower number = higher priority (wins).
+        Hierarchy: manual(0) > cosine(1) > kinetic(2)
+        Tiebreak within same tier: more frames wins, then lower temp_id.
+        """
+        if tid in manual_tids:
+            return (0, -frame_counts.get(tid, 0), tid)   # manual — highest
+        if tid not in kinetic_tids:
+            return (1, -frame_counts.get(tid, 0), tid)   # cosine — second
+        return (2, -frame_counts.get(tid, 0), tid)       # kinetic — lowest
+
+    def reason(tid):
+        if tid in manual_tids:   return "manual"
+        if tid in kinetic_tids:  return "kinetic"
+        return "cosine"
+
+    merge_map = {}   # {loser_tid -> winner_tid}
+    clean = dict(assignment)
+    ts = pd.Timestamp.now().isoformat()
+
+    for aid, tids in sorted(duplicates.items()):
+        ranked = sorted(tids, key=lambda t: priority(t, aid))
+        winner = ranked[0]
+        losers = ranked[1:]
+
+        log(f"  AnimalId {aid} → duplicate temp_ids {sorted(tids)}")
+        log(f"    winner: temp_id {winner} ({reason(winner)}, "
+            f"{frame_counts.get(winner,0)} frames)")
+
+        for loser in losers:
+            log(f"    merge:  temp_id {loser} ({reason(loser)}, "
+                f"{frame_counts.get(loser,0)} frames) → remapped to temp_id {winner}")
+            merge_map[loser] = winner
+            del clean[loser]
+
+            if not dry_run:
+                conn.execute("""
+                    INSERT INTO temp_id_merges
+                        (session_id, winner_tid, loser_tid, real_id,
+                         winner_reason, loser_reason, merged_dt)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(session_id, loser_tid) DO UPDATE SET
+                        winner_tid    = excluded.winner_tid,
+                        real_id       = excluded.real_id,
+                        winner_reason = excluded.winner_reason,
+                        loser_reason  = excluded.loser_reason,
+                        merged_dt     = excluded.merged_dt
+                """, (session_id, winner, loser, aid,
+                      reason(winner), reason(loser), ts))
+
+    if not dry_run and merge_map:
+        conn.commit()
+
+    log(f"  Resolved {len(merge_map)} duplicate(s) → "
+        f"{len(clean)} unique assignments")
+    return clean, merge_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step A.5 — Manual assignment loader
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1051,6 +1168,7 @@ def run(args) -> None:
     )
 
     # ── Step C — cosine resolver ──────────────────────────────────────────────
+    merge_map = {}   # populated by Step A.6 below
     full_assignment = step_c_cosine_resolver(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
@@ -1063,6 +1181,36 @@ def run(args) -> None:
         session_id         = args.session,
         dry_run            = args.dry_run,
     )
+
+    # ── Step A.6 — resolve duplicates across all assignments (kinetic+manual+cosine)
+    full_assignment, merge_map = resolve_duplicate_assignments(
+        assignment   = full_assignment,
+        manual_tids  = set(manual_assignment.keys()),
+        kinetic_tids = set(
+            tid for tid, aid in kinetic_assignment.items()
+            if tid not in manual_assignment
+        ),
+        tracks_df    = tracks_df,
+        conn         = conn,
+        session_id   = args.session,
+        dry_run      = args.dry_run,
+    )
+
+    # remap loser embed rows → winner so gallery update pools all sightings
+    if merge_map and not embed_df.empty:
+        embed_df_remapped = embed_df.copy()
+        embed_df_remapped["temp_id"] = embed_df_remapped["temp_id"].replace(merge_map)
+        # rebuild gallery with remapped embeds for any merged pairs
+        gallery = step_b_gallery_builder(
+            tracks_df          = tracks_df,
+            embed_df           = embed_df_remapped,
+            kinetic_assignment = full_assignment,
+            is_night           = is_night,
+            conn               = conn,
+            args               = args,
+            gallery_dir        = args.gallery_dir,
+            dry_run            = args.dry_run,
+        )
 
     # ── update known_temp_ids ─────────────────────────────────────────────────
     update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
@@ -1085,13 +1233,16 @@ def run(args) -> None:
     section("Summary")
     n_manual  = len(manual_assignment)
     n_kinetic = len(kinetic_assignment) - n_manual
+    if merge_map:
+        log(f"Merged switches : {len(merge_map)} "
+            f"({', '.join(f't{l}→t{w}' for l,w in sorted(merge_map.items()))})")
     log(f"Kinetic matches : {n_kinetic}")
     log(f"Manual matches  : {n_manual}")
     log(f"Cosine matches  : {len(full_assignment) - len(kinetic_assignment)}")
     log(f"Total resolved  : {len(full_assignment)} temp_ids → AnimalId")
     unresolved = set(tracks_df["temp_id"].unique()) - set(full_assignment.keys())
     if unresolved:
-        log(f"Unresolved      : {sorted(unresolved)}")
+        log(f"Unresolved      : {sorted(int(t) for t in unresolved)}")
     log(f"Timeline rows   : {len(timeline_df)}")
     if args.dry_run:
         log("dry_run=True — no data written to DB or gallery files")
@@ -1116,12 +1267,14 @@ if __name__ == "__main__":
 #   --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
 #   --session    refet33_20241221 \
 #   --kinetics   "$KIN" \
-#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet \
 #   --gallery_dir ./reid_gallery \
-#   --corr_threshold 0.1 \
-#   --min_active_bins 1 \
+#   --corr_threshold 0.7 \
+#   --min_active_bins 3 \
 #   --cosine_threshold 0.75 \
 #   --ema_alpha 0.15
+#
+# With embeddings in parquet:
+#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet
 #
 # Dry run (no DB writes):
 #   --dry_run
