@@ -300,21 +300,6 @@ python3 reconcile.py \
 
 ---
 
-## Milestone Schedule
-| Milestone | Target | Status |
-|---|---|---|
-| Pose Estimation | March 29, 2026 | ✓ Done |
-| Sensor Pipeline | April 12, 2026 | ✓ Done |
-| Re-Identification Module | May 3, 2026 | ✓ Done |
-| Vision Feature Extraction | May 24, 2026 | In progress |
-| System Integration | June 14, 2026 | — |
-| Temporal Prediction Model | July 26, 2026 | — |
-| Empirical Evaluation | August 30, 2026 | — |
-| Research Paper | September 30, 2026 | — |
-| Thesis Document | October 30, 2026 | — |
-
----
-
 ## Storage Architecture
 
 ### Decision: SQLite + Parquet + University OneDrive (50GB)
@@ -366,3 +351,22 @@ rclone mount "university_onedrive:thesis_data" ~/onedrive_mount \
     --vfs-cache-mode writes &
 ```
 Scripts write directly to `~/onedrive_mount/` — syncs automatically.
+
+
+---
+
+## Milestone Schedule
+| Milestone | Target | Status |
+|---|---|---|
+| Pose Estimation | March 29, 2026 | ✓ Done |
+| Sensor Pipeline | April 12, 2026 | ✓ Done |
+| Re-Identification Module | May 3, 2026 | ✓ Done |
+| Vision Feature Extraction | May 24, 2026 | In progress |
+| Database pipline + cloud storage | June 1, 2026 | — |
+| Working Pipeline | June 14, 2026 | — |
+| Temporal Prediction Model | July 26, 2026 | — |
+| Empirical Evaluation | August 30, 2026 | — |
+| Research Paper | September 30, 2026 | — |
+| Thesis Document | October 30, 2026 | — |
+
+---
