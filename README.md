@@ -365,8 +365,9 @@ Scripts write directly to `~/onedrive_mount/` — syncs automatically.
 | Database pipline + cloud storage | June 1, 2026 | — |
 | Working Pipeline | June 14, 2026 | — |
 | Temporal Prediction Model | July 26, 2026 | — |
-| Empirical Evaluation | August 30, 2026 | — |
-| Research Paper | September 30, 2026 | — |
-| Thesis Document | October 30, 2026 | — |
+| Model's Retraining and fine tunning | August 30, 2026 | — |
+| Empirical Evaluation | September 30, 2026 | — |
+| Research Paper | October 30, 2026 | — |
+| Thesis Document | November 30, 2026 | — |
 
 ---
