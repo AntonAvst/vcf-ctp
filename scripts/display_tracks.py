@@ -138,6 +138,360 @@ class TkControls:
                 pass
 
 
+# -------- Sensor / Behaviour Visualisation Window ----------
+class SensorWindow:
+    """
+    A separate Tkinter window that shows kinetic + behaviour sensor data
+    for the matched animals, driven live by the video playhead.
+
+    Layout
+    ------
+    Top bar  : one button per matched AnimalId — clicking selects that animal.
+               A clock label shows the current video wall-clock time.
+    Bottom   : matplotlib canvas with 7 subplots sharing a time axis.
+               Signals: f_1_2, f_2_3, v, ΔKinX, ΔKinY, ΔKinZ, ΔKinR.
+               The plot shows a rolling window of LOOKBACK_HOURS ending at
+               the current playhead. A vertical red cursor marks "now".
+               As the video plays, the window scrolls forward automatically.
+
+    Thread safety
+    -------------
+    The main video loop calls push_time(dt) which atomically stores a
+    datetime object. The Tk thread polls it every POLL_MS milliseconds via
+    root.after() and redraws only when the time has moved by at least
+    REDRAW_THRESH_S seconds.  No matplotlib calls are ever made from the
+    main thread.
+    """
+
+    # Catppuccin-inspired dark palette
+    _BG       = "#1e1e2e"
+    _SURFACE  = "#313244"
+    _OVERLAY  = "#45475a"
+    _FG       = "#cdd6f4"
+    _ACC      = "#89b4fa"   # blue  — idle button
+    _ACC_ON   = "#a6e3a1"   # green — selected / active button
+    _WARN     = "#f38ba8"
+    _MUTED    = "#6c7086"
+    _PLOT_BG  = "#181825"
+    _CURSOR   = "#f38ba8"   # red vertical "now" line
+
+    # live-update knobs
+    POLL_MS         = 200    # how often Tk polls for a new timestamp (ms)
+    REDRAW_THRESH_S = 15     # only redraw if playhead moved ≥ this many seconds
+    LOOKBACK_HOURS  = 2.0    # rolling window width shown behind the cursor
+
+    # colours for the 7 subplots
+    _LINE_COLORS = ["#89b4fa", "#cba6f7", "#a6e3a1",
+                    "#fab387", "#f9e2af", "#89dceb", "#f38ba8"]
+
+    _SIGNAL_META = [
+        # (column_in_merged_df,  y-axis label,  panel title)
+        ("f_1_2",  "f₁₂",   "Behaviour · f₁₂"),
+        ("f_2_3",  "f₂₃",   "Behaviour · f₂₃"),
+        ("v",      "v",     "Behaviour · v"),
+        ("dKinX",  "ΔKinX", "Kinetics · ΔX (interval)"),
+        ("dKinY",  "ΔKinY", "Kinetics · ΔY (interval)"),
+        ("dKinZ",  "ΔKinZ", "Kinetics · ΔZ (interval)"),
+        ("dKinR",  "ΔKinR", "Kinetics · ΔR (interval)"),
+    ]
+
+    def __init__(self, kinetic_csv: str, behavior_csv: str, animal_ids: list):
+        import threading
+
+        self._animal_ids    = sorted(int(a) for a in animal_ids)
+        self._selected_id   = None
+        self._btn_widgets   = {}      # AnimalId → tk.Button
+        self._root          = None
+        self._canvas_widget = None
+        self._fig           = None
+        self._axes          = None
+
+        # shared playhead state — written by main thread, read by Tk thread
+        self._current_dt    = None    # datetime | None
+        self._last_drawn_dt = None    # datetime of last completed redraw
+        self._lock          = threading.Lock()
+
+        # ---- load & pre-process data once ----
+        self._merged = self._load_data(kinetic_csv, behavior_csv)
+
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+        import time as _t
+        _t.sleep(0.6)   # give Tk a moment to appear
+
+    # ------------------------------------------------------------------
+    # Public API — called from the main video loop (any thread)
+    # ------------------------------------------------------------------
+    def push_time(self, dt):
+        """Update the playhead to datetime dt.  GIL-safe single assignment."""
+        with self._lock:
+            self._current_dt = dt
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_data(kin_path: str, beh_path: str):
+        """
+        Read kinetic + behaviour CSVs, compute delta columns for kinetics,
+        return {AnimalId: DataFrame indexed by datetime, sorted ascending}.
+        """
+        import pandas as pd
+
+        frames = {}
+
+        # --- kinetics ---
+        if kin_path and Path(kin_path).exists():
+            kdf = pd.read_csv(kin_path, parse_dates=["datetime"])
+            kdf = kdf.sort_values(["AnimalId", "datetime"]).reset_index(drop=True)
+            for col in ["KineticsCountX", "KineticsCountY",
+                        "KineticsCountZ", "KineticsCountR"]:
+                short = col.replace("KineticsCount", "Kin")
+                kdf[f"d{short}"] = kdf.groupby("AnimalId")[col].diff()
+            for aid, grp in kdf.groupby("AnimalId"):
+                frames[int(aid)] = grp.set_index("datetime").sort_index()
+
+        # --- behaviour ---
+        if beh_path and Path(beh_path).exists():
+            bdf = pd.read_csv(beh_path, parse_dates=["datetime"])
+            bdf = bdf.sort_values(["AnimalId", "datetime"]).reset_index(drop=True)
+            for aid, grp in bdf.groupby("AnimalId"):
+                aid = int(aid)
+                sub = grp.set_index("datetime")[["f_1_2", "f_2_3", "v"]].sort_index()
+                if aid in frames:
+                    frames[aid] = frames[aid].join(sub, how="outer").sort_index()
+                else:
+                    frames[aid] = sub
+
+        return frames
+
+    # ------------------------------------------------------------------
+    # Tkinter + matplotlib UI  (runs in its own thread)
+    # ------------------------------------------------------------------
+    def _run(self):
+        import tkinter as tk
+
+        # Use the TkAgg backend but construct the Figure directly — never call
+        # plt.subplots() from a non-main thread, which triggers the UserWarning
+        # and can crash on some platforms.
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        import matplotlib.dates as mdates
+
+        root = tk.Tk()
+        self._root = root
+        root.title("Sensor & Behaviour — Live")
+        root.configure(bg=self._BG)
+        root.geometry("1280x820")
+
+        # ── Top bar ────────────────────────────────────────────────────
+        bar = tk.Frame(root, bg=self._BG, pady=6)
+        bar.pack(side="top", fill="x", padx=10)
+
+        tk.Label(bar, text="Animal ID:", bg=self._BG, fg=self._MUTED,
+                 font=("Helvetica", 11)).pack(side="left", padx=(4, 10))
+
+        for aid in self._animal_ids:
+            btn = tk.Button(
+                bar,
+                text=str(aid),
+                bg=self._ACC,
+                fg=self._BG,
+                activebackground=self._ACC_ON,
+                activeforeground=self._BG,
+                font=("Helvetica", 12, "bold"),
+                relief="flat", bd=0, padx=16, pady=6,
+                cursor="hand2",
+                command=lambda a=aid: self._select_animal(a),
+            )
+            btn.pack(side="left", padx=5)
+            self._btn_widgets[aid] = btn
+
+        # status / clock
+        self._status_var = tk.StringVar(value="← click an animal")
+        tk.Label(bar, textvariable=self._status_var,
+                 bg=self._BG, fg=self._MUTED,
+                 font=("Helvetica", 10, "italic")).pack(side="left", padx=14)
+
+        self._clock_var = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self._clock_var,
+                 bg=self._BG, fg=self._ACC,
+                 font=("Helvetica", 11, "bold")).pack(side="right", padx=14)
+
+        # ── Matplotlib figure — built with Figure(), not plt.subplots() ─
+        n   = len(self._SIGNAL_META)
+        fig = Figure(figsize=(13, 9.5), facecolor=self._PLOT_BG)
+        fig.subplots_adjust(hspace=0.06, top=0.97, bottom=0.06,
+                            left=0.07, right=0.97)
+
+        axes = []
+        shared_ax = None
+        for i in range(n):
+            if shared_ax is None:
+                ax = fig.add_subplot(n, 1, i + 1)
+                shared_ax = ax
+            else:
+                ax = fig.add_subplot(n, 1, i + 1, sharex=shared_ax)
+            axes.append(ax)
+        axes = axes  # plain list
+
+        self._fig  = fig
+        self._axes = axes
+
+        for ax, (_, ylabel, title) in zip(axes, self._SIGNAL_META):
+            ax.set_facecolor(self._PLOT_BG)
+            ax.tick_params(colors=self._MUTED, labelsize=7)
+            ax.spines[:].set_color(self._OVERLAY)
+            ax.set_ylabel(ylabel, fontsize=8, color=self._MUTED)
+            ax.set_title(title, fontsize=8, color=self._MUTED, loc="left", pad=2)
+            ax.yaxis.grid(True, color=self._OVERLAY, linewidth=0.5, linestyle="--")
+            ax.set_axisbelow(True)
+            # hide x-tick labels on all but the bottom panel
+            if ax is not axes[-1]:
+                ax.tick_params(labelbottom=False)
+
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d\n%H:%M"))
+        axes[-1].tick_params(axis="x", labelsize=7, colors=self._MUTED)
+
+        canvas = FigureCanvasTkAgg(fig, master=root)
+        canvas.draw()
+        cw = canvas.get_tk_widget()
+        cw.configure(bg=self._PLOT_BG)
+        cw.pack(side="bottom", fill="both", expand=True, padx=6, pady=(0, 6))
+        self._canvas_widget = canvas
+
+        # store mdates for use in _live_redraw
+        self._mdates = mdates
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.after(self.POLL_MS, self._poll)
+        root.mainloop()
+
+    # ------------------------------------------------------------------
+    # Polling — called from Tk's event loop every POLL_MS ms
+    # ------------------------------------------------------------------
+    def _poll(self):
+        """Check if playhead has moved enough to warrant a redraw."""
+        if self._root is None:
+            return
+
+        with self._lock:
+            current = self._current_dt
+
+        # update clock label regardless
+        if current is not None:
+            self._clock_var.set(current.strftime("▶  %Y-%m-%d  %H:%M:%S"))
+        else:
+            self._clock_var.set("")
+
+        # decide whether to redraw
+        if current is not None and self._selected_id is not None:
+            if self._last_drawn_dt is None:
+                self._live_redraw(current)
+            else:
+                delta = abs((current - self._last_drawn_dt).total_seconds())
+                if delta >= self.REDRAW_THRESH_S:
+                    self._live_redraw(current)
+
+        try:
+            self._root.after(self.POLL_MS, self._poll)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Live redraw — always called from Tk thread via _poll
+    # ------------------------------------------------------------------
+    def _live_redraw(self, now_dt):
+        """
+        Redraw all 7 panels for self._selected_id clipped to
+        [now_dt - LOOKBACK, now_dt].  Vertical dashed cursor marks now_dt.
+        Uses ax.cla() for clearing — compatible with all matplotlib versions.
+        """
+        from datetime import timedelta
+
+        aid = self._selected_id
+        df  = self._merged.get(aid)
+
+        lookback  = timedelta(hours=self.LOOKBACK_HOURS)
+        win_start = now_dt - lookback
+        win_end   = now_dt
+        right_pad = lookback * 0.04
+
+        for i, (ax, color, (col, ylabel, title)) in enumerate(
+                zip(self._axes, self._LINE_COLORS, self._SIGNAL_META)):
+
+            ax.cla()
+
+            # ── restore axis cosmetics lost by cla() ──────────────────
+            ax.set_facecolor(self._PLOT_BG)
+            ax.tick_params(colors=self._MUTED, labelsize=7)
+            ax.spines[:].set_color(self._OVERLAY)
+            ax.set_ylabel(ylabel, fontsize=8, color=self._MUTED)
+            ax.set_title(title, fontsize=8, color=self._MUTED, loc="left", pad=2)
+            ax.yaxis.grid(True, color=self._OVERLAY, linewidth=0.5, linestyle="--")
+            ax.set_axisbelow(True)
+            # hide x-tick labels on all but the bottom panel
+            if i < len(self._axes) - 1:
+                ax.tick_params(labelbottom=False)
+
+            # ── plot data up to now_dt ─────────────────────────────────
+            if df is not None and col in df.columns:
+                series = df[col].loc[:win_end].dropna()
+                if not series.empty:
+                    ax.plot(series.index, series.values,
+                            color=color, linewidth=1.1, alpha=0.92)
+                    ax.fill_between(series.index, series.values,
+                                    alpha=0.10, color=color)
+
+            # ── cursor line ────────────────────────────────────────────
+            ax.axvline(x=now_dt, color=self._CURSOR,
+                       linewidth=1.4, linestyle="--", alpha=0.85, zorder=10)
+
+            # ── x window ──────────────────────────────────────────────
+            ax.set_xlim(win_start, win_end + right_pad)
+
+            # ── y auto-scale to the visible window only ────────────────
+            if df is not None and col in df.columns:
+                vis = df[col].loc[win_start:win_end].dropna()
+                if not vis.empty:
+                    lo, hi = vis.min(), vis.max()
+                    margin = max((hi - lo) * 0.12, abs(hi) * 0.05, 1e-6)
+                    ax.set_ylim(lo - margin, hi + margin)
+
+        # ── x-axis formatting on bottom panel (restored after cla) ────
+        self._axes[-1].xaxis.set_major_formatter(
+            self._mdates.DateFormatter("%m-%d\n%H:%M"))
+        self._axes[-1].tick_params(axis="x", labelsize=7, colors=self._MUTED)
+
+        self._fig.canvas.draw_idle()
+        self._last_drawn_dt = now_dt
+
+    # ------------------------------------------------------------------
+    def _select_animal(self, aid: int):
+        self._selected_id   = aid
+        self._last_drawn_dt = None   # force immediate redraw on next poll
+        self._status_var.set(f"Showing Animal ID: {aid}")
+
+        for a, btn in self._btn_widgets.items():
+            if a == aid:
+                btn.config(bg=self._ACC_ON, fg=self._BG, relief="sunken")
+            else:
+                btn.config(bg=self._ACC,    fg=self._BG, relief="flat")
+
+    def _on_close(self):
+        try:
+            if self._root:
+                self._root.destroy()
+        except Exception:
+            pass
+
+    def destroy(self):
+        self._on_close()
+
+
 # -------- Colors / drawing ----------
 def id_color(tid: int) -> tuple:
     rng = np.random.default_rng(tid * 123457)
@@ -157,41 +511,18 @@ def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None):
     y0 = max(0, y1 - th - 6)
     cv2.rectangle(img, (x1, y0), (x1 + tw + 6, y0 + th + 6), color, -1)
     cv2.putText(
-        img,
-        label,
-        (x1 + 3, y0 + th + 2),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 0, 0),
-        2,
-        cv2.LINE_AA,
+        img, label, (x1 + 3, y0 + th + 2),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA,
     )
 
 
 # -------- Pose skeleton (19 KP layout) ----------
 # Indices:
-# 0 nose
-# 1 forehead
-# 2 withers
-# 3 spine_mid
-# 4 sacrum
-# 5 tail_base
-# 6 tail_tip
-# 7 shoulder_L
-# 8 elbow_L
-# 9 fetlock_fore_L
-# 10 shoulder_R
-# 11 elbow_R
-# 12 fetlock_fore_R
-# 13 hock_R
-# 14 hock_L
-# 15 fetlock_hind_L
-# 16 fetlock_hind_R
-# 17 udder_center
-# 18 neck
-#
-# (If your YAML uses a slightly different order, circles will still be drawn
-# from the coordinates; these edges just define how the skeleton is connected.)
+# 0 nose          1 forehead      2 withers       3 spine_mid
+# 4 sacrum        5 tail_base     6 tail_tip       7 shoulder_L
+# 8 elbow_L       9 fetlock_fore_L  10 shoulder_R  11 elbow_R
+# 12 fetlock_fore_R  13 hock_R    14 hock_L        15 fetlock_hind_L
+# 16 fetlock_hind_R  17 udder_center  18 neck
 BASE_EDGES = [
     (0, 1),
     (1, 18),  # forehead -> neck
@@ -201,29 +532,17 @@ BASE_EDGES = [
     (4, 5),
     (5, 6),  # head → spine → tail
     # fore limbs
-    (2, 7),
-    (7, 8),
-    (8, 9),   # left fore chain
-    (2, 10),
-    (10, 11),
-    (11, 12), # right fore chain
-    # hind limbs (note the R/L order in this dataset)
-    (4, 14),
-    (14, 15),  # left hind chain
-    (4, 13),
-    (13, 16),  # right hind chain
-    (4, 17),   # sacrum → udder_center
-]
-
-# Extra custom edges you wanted to emphasize
-CUSTOM_EDGES = [
-    (2, 10),
-    (10, 12),  # withers-ish to right fore chain emphasis
+    (2, 7), (7, 8), (8, 9),
+    (2, 10), (10, 11), (11, 12),
+    # hind limbs
+    (4, 14), (14, 15),
+    (4, 13), (13, 16),
     (4, 17),
-    (14, 15),
-    (13, 16),
 ]
-
+CUSTOM_EDGES = [
+    (2, 10), (10, 12),
+    (4, 17), (14, 15), (13, 16),
+]
 EDGE_SET = set(tuple(sorted(e)) for e in BASE_EDGES)
 for e in CUSTOM_EDGES:
     EDGE_SET.add(tuple(sorted(e)))
@@ -231,89 +550,45 @@ EDGES = [(a, b) for (a, b) in EDGE_SET]
 
 
 def draw_pose(
-    img,
-    kps_xyv,
-    color,
-    kps_conf=None,
-    kp_radius=3,
-    sk_thickness=2,
-    kp_thresh=0.0,
-    kp_conf_thresh=0.30,
-    hide_lowconf=False,
-    show_index=False,
-    index_scale=0.45,
-    index_thickness=1,
-    index_offset=6,
+    img, kps_xyv, color, kps_conf=None,
+    kp_radius=3, sk_thickness=2, kp_thresh=0.0, kp_conf_thresh=0.30,
+    hide_lowconf=False, show_index=False,
+    index_scale=0.45, index_thickness=1, index_offset=6,
 ):
-    """
-    kps_xyv: list/array of shape (K,3) with (x,y,v), where v in {0,1,2}
-             (0=not labeled/ignored, 1/2=labeled; typically 2=visible, 1=occluded)
-    Draw circles for v > kp_thresh and lines only if both endpoints v > kp_thresh.
-    Optionally draw a numeric index next to each visible keypoint.
-    """
     K = len(kps_xyv)
-
-    # Decide which points to draw
     draw_mask = [False] * K
     for i in range(K):
         x, y, v = kps_xyv[i]
-        if v is None:
-            continue
-        if float(v) <= kp_thresh:
-            continue
+        if v is None: continue
+        if float(v) <= kp_thresh: continue
         if hide_lowconf and kps_conf is not None and i < len(kps_conf):
             try:
-                if float(kps_conf[i]) < float(kp_conf_thresh):
-                    continue
-            except Exception:
-                pass
+                if float(kps_conf[i]) < float(kp_conf_thresh): continue
+            except Exception: pass
         draw_mask[i] = True
 
-    # draw keypoints
     for i in range(K):
-        if not draw_mask[i]:
-            continue
+        if not draw_mask[i]: continue
         x, y, _v = kps_xyv[i]
         xi, yi = int(round(x)), int(round(y))
         cv2.circle(img, (xi, yi), kp_radius, color, -1, lineType=cv2.LINE_AA)
-
         if show_index:
             idx_txt = str(i)
-            # outline for readability
-            cv2.putText(
-                img,
-                idx_txt,
-                (xi + index_offset, yi - index_offset),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                index_scale,
-                (0, 0, 0),
-                index_thickness + 2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                img,
-                idx_txt,
-                (xi + index_offset, yi - index_offset),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                index_scale,
-                (255, 255, 255),
-                index_thickness,
-                cv2.LINE_AA,
-            )
+            cv2.putText(img, idx_txt, (xi + index_offset, yi - index_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, index_scale, (0, 0, 0),
+                        index_thickness + 2, cv2.LINE_AA)
+            cv2.putText(img, idx_txt, (xi + index_offset, yi - index_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, index_scale, (255, 255, 255),
+                        index_thickness, cv2.LINE_AA)
 
-    # draw bones
     for (i, j) in EDGES:
         if i < K and j < K and draw_mask[i] and draw_mask[j]:
             xi, yi, _vi = kps_xyv[i]
             xj, yj, _vj = kps_xyv[j]
-            cv2.line(
-                img,
-                (int(round(xi)), int(round(yi))),
-                (int(round(xj)), int(round(yj))),
-                color,
-                sk_thickness,
-                lineType=cv2.LINE_AA,
-            )
+            cv2.line(img,
+                     (int(round(xi)), int(round(yi))),
+                     (int(round(xj)), int(round(yj))),
+                     color, sk_thickness, lineType=cv2.LINE_AA)
 
 
 # -------- CLI ----------
@@ -327,84 +602,35 @@ def parse_args():
 
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--max_fps", type=float, default=0.0)
-    ap.add_argument("--show_fps", action="store_true")
     ap.add_argument(
-        "--sink",
-        choices=["ffplay", "cv2", "mp4"],
-        default="cv2",
+        "--sink", choices=["ffplay", "cv2", "mp4"], default="cv2",
         help="ffplay (no GUI deps), cv2 (needs Qt/X11), or mp4 (save to file)",
     )
-    ap.add_argument(
-        "--outmp4",
-        default="annotated.mp4",
-        help="Output MP4 path if --sink mp4",
-    )
-    ap.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Optional max frames to run",
-    )
+    ap.add_argument("--outmp4", default="annotated.mp4",
+                    help="Output MP4 path if --sink mp4")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="Optional max frames to run")
 
     # pose drawing
-    ap.add_argument(
-        "--draw_pose",
-        action="store_true",
-        help="Draw keypoints/skeleton if present in tracks",
-    )
+    ap.add_argument("--draw_pose", action="store_true")
     ap.add_argument("--kp_radius", type=int, default=3)
     ap.add_argument("--sk_thickness", type=int, default=2)
-    ap.add_argument(
-        "--kp_thresh",
-        type=float,
-        default=0.0,
-        help="Base threshold on v (0/1/2); draw keypoints with v > kp_thresh",
-    )
+    ap.add_argument("--kp_thresh", type=float, default=0.0)
+    ap.add_argument("--hide_occluded", action="store_true")
+    ap.add_argument("--kp_conf_thresh", type=float, default=0.30)
+    ap.add_argument("--show_lowconf", action="store_true")
+    ap.add_argument("--kp_index", action="store_true")
+    ap.add_argument("--kp_index_scale", type=float, default=0.45)
+    ap.add_argument("--kp_index_thickness", type=int, default=1)
+    ap.add_argument("--kp_index_offset", type=int, default=6)
 
-    # new: hide occluded / low visibility joints (v == 1)
-    ap.add_argument(
-        "--hide_occluded",
-        action="store_true",
-        help="If set, draw only joints with v >= 2 (visible only).",
-    )
-
-    # new: optionally hide low-confidence keypoints (uses per-keypoint conf if available)
-    ap.add_argument(
-        "--kp_conf_thresh",
-        type=float,
-        default=0.30,
-        help="If per-keypoint confidences are available, hide keypoints with conf < this threshold (unless --show_lowconf).",
-    )
-    ap.add_argument(
-        "--show_lowconf",
-        action="store_true",
-        help="If set, draw low-confidence keypoints too (conf < --kp_conf_thresh).",
-    )
-
-    # keypoint index overlay
-    ap.add_argument(
-        "--kp_index",
-        action="store_true",
-        help="Overlay keypoint indices (0..K-1) next to points",
-    )
-    ap.add_argument(
-        "--kp_index_scale",
-        type=float,
-        default=0.45,
-        help="Font scale for keypoint indices",
-    )
-    ap.add_argument(
-        "--kp_index_thickness",
-        type=int,
-        default=1,
-        help="Font thickness for keypoint indices",
-    )
-    ap.add_argument(
-        "--kp_index_offset",
-        type=int,
-        default=6,
-        help="Pixel offset of index text from the keypoint",
-    )
+    # sensor window
+    ap.add_argument("--kinetic_csv", default="",
+                    help="Path to kinetic_data CSV. Enables the live sensor window.")
+    ap.add_argument("--behavior_csv", default="",
+                    help="Path to behavior_data CSV. Merged with kinetics in sensor window.")
+    ap.add_argument("--sensor_lookback", type=float, default=2.0,
+                    help="Hours of data shown behind the playhead cursor (default 2.0)")
 
     return ap.parse_args()
 
@@ -415,79 +641,99 @@ def stream_sqlite(db_path: str, session_id: str,
                   want_pose: bool = False,
                   kps_parquet_path: str = ""):
     """
-    Generator that yields (frame_index, [detections]) in frame_index order,
-    matching the contract of the old stream_csv / stream_jsonl.
-    Optionally joins kps.parquet for pose data when want_pose=True.
+    Generator that yields (frame_index, frame_datetime, [detections]).
+    frame_datetime is a Python datetime if stored in raw_tracks, else None.
     """
     import pandas as _pd
+    from datetime import datetime as _dt
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    # load kps parquet once if needed
     kps_df = None
     if want_pose and kps_parquet_path and Path(kps_parquet_path).exists():
         kps_df = _pd.read_parquet(kps_parquet_path)
         kps_df = kps_df[kps_df["session_id"] == session_id].set_index(
             ["frame_index", "temp_id"])
 
-    rows = conn.execute("""
-        SELECT frame_index, temp_id, det_conf,
-               x1, y1, x2, y2,
-               kps_conf, kps_parquet_row
-        FROM   raw_tracks
-        WHERE  session_id = ?
-          AND  frame_index >= ?
-        ORDER  BY frame_index, temp_id
-    """, (session_id, start_frame)).fetchall()
+    # try to fetch frame_datetime if the column exists
+    try:
+        rows = conn.execute("""
+            SELECT frame_index, frame_datetime, temp_id, det_conf,
+                   x1, y1, x2, y2, kps_conf, kps_parquet_row
+            FROM   raw_tracks
+            WHERE  session_id = ?
+              AND  frame_index >= ?
+            ORDER  BY frame_index, temp_id
+        """, (session_id, start_frame)).fetchall()
+        has_dt_col = True
+    except sqlite3.OperationalError:
+        rows = conn.execute("""
+            SELECT frame_index, temp_id, det_conf,
+                   x1, y1, x2, y2, kps_conf, kps_parquet_row
+            FROM   raw_tracks
+            WHERE  session_id = ?
+              AND  frame_index >= ?
+            ORDER  BY frame_index, temp_id
+        """, (session_id, start_frame)).fetchall()
+        has_dt_col = False
     conn.close()
 
     cur_fi  = None
+    cur_fdt = None
     bucket  = []
 
     for row in rows:
         fi = row["frame_index"]
+        fdt = None
+        if has_dt_col:
+            raw_fdt = row["frame_datetime"]
+            if raw_fdt:
+                try:
+                    # stored as ISO string or unix timestamp
+                    if isinstance(raw_fdt, (int, float)):
+                        fdt = _dt.utcfromtimestamp(raw_fdt)
+                    else:
+                        fdt = _dt.fromisoformat(str(raw_fdt))
+                except Exception:
+                    fdt = None
+
         if cur_fi is None:
-            cur_fi = fi
+            cur_fi  = fi
+            cur_fdt = fdt
         if fi != cur_fi:
-            yield cur_fi, bucket
+            yield cur_fi, cur_fdt, bucket
             bucket  = []
             cur_fi  = fi
+            cur_fdt = fdt
 
         d = {
             "temp_id": row["temp_id"] if row["temp_id"] is not None else -1,
             "conf":    row["det_conf"] or 0.0,
-            "x1":      row["x1"], "y1": row["y1"],
-            "x2":      row["x2"], "y2": row["y2"],
+            "x1": row["x1"], "y1": row["y1"],
+            "x2": row["x2"], "y2": row["y2"],
         }
 
         if want_pose and kps_df is not None:
             try:
                 krow = kps_df.loc[(fi, row["temp_id"])]
-                flat = list(krow["kps"])            # 57 floats [x,y,v, ...]
+                flat = list(krow["kps"])
                 if len(flat) % 3 == 0:
                     kps_xyv = [(flat[i], flat[i+1], flat[i+2])
                                for i in range(0, len(flat), 3)]
                     d["kps"]      = kps_xyv
-                    d["kps_conf"] = list(krow["kps_kconf"])  # 19 floats
+                    d["kps_conf"] = list(krow["kps_kconf"])
             except (KeyError, TypeError):
                 pass
 
         bucket.append(d)
 
     if bucket:
-        yield cur_fi, bucket
-
+        yield cur_fi, cur_fdt, bucket
 
 
 # -------- Match score table overlay ----------
 def draw_score_table(img, scores_df, assignment, margin=10):
-    """
-    Draw a semi-transparent score table (temp_id x AnimalId) in the
-    bottom-left corner of the frame.
-    Green cell = confirmed assignment, yellow = high score but unassigned,
-    gray = low/no score.
-    """
     if scores_df is None or scores_df.empty:
         return
 
@@ -496,10 +742,10 @@ def draw_score_table(img, scores_df, assignment, margin=10):
         index="temp_id", columns="AnimalId", values="correlation", aggfunc="first"
     )
 
-    tids     = list(pivot.index)
-    aids     = list(pivot.columns)
-    n_rows   = len(tids) + 1   # +1 header
-    n_cols   = len(aids) + 1   # +1 row header
+    tids   = list(pivot.index)
+    aids   = list(pivot.columns)
+    n_rows = len(tids) + 1
+    n_cols = len(aids) + 1
 
     cell_w, cell_h = 90, 22
     table_w = n_cols * cell_w
@@ -509,7 +755,6 @@ def draw_score_table(img, scores_df, assignment, margin=10):
     x0 = margin
     y0 = H - table_h - margin
 
-    # semi-transparent background
     overlay = img.copy()
     cv2.rectangle(overlay, (x0 - 4, y0 - 4),
                   (x0 + table_w + 4, y0 + table_h + 4), (0, 0, 0), -1)
@@ -529,27 +774,24 @@ def draw_score_table(img, scores_df, assignment, margin=10):
         ty = cy + (cell_h + th) // 2 - 1
         cv2.putText(img, text, (tx, ty), font, font_scale, fg, thickness, cv2.LINE_AA)
 
-    # header row
-    draw_cell(0, 0, "tid\aid", (40, 40, 40))
+    draw_cell(0, 0, "tid\\aid", (40, 40, 40))
     for ci, aid in enumerate(aids):
         draw_cell(0, ci + 1, str(aid), (40, 40, 40))
 
-    # data rows
     for ri, tid in enumerate(tids):
         draw_cell(ri + 1, 0, f"t{tid}", (40, 40, 40))
         for ci, aid in enumerate(aids):
             val = pivot.loc[tid, aid] if (tid in pivot.index and aid in pivot.columns) else float("nan")
             assigned = assignment.get(tid) == aid
             if assigned:
-                bg = (0, 120, 0)      # green — confirmed match
+                bg = (0, 120, 0)
             elif not pd.isna(val) and val >= 0.5:
-                bg = (0, 100, 150)    # blue — strong but unassigned
+                bg = (0, 100, 150)
             else:
-                bg = (60, 60, 60)     # gray — weak / no data
+                bg = (60, 60, 60)
             txt = f"{val:.2f}" if not pd.isna(val) else "—"
             draw_cell(ri + 1, ci + 1, txt, bg)
 
-    # legend line
     ly = y0 - 8
     cv2.putText(img, "green=matched  blue=strong  gray=weak",
                 (x0, ly), font, 0.32, (180, 180, 180), 1, cv2.LINE_AA)
@@ -565,20 +807,16 @@ def main():
     if not db.exists():
         raise FileNotFoundError(f"DB not found: {db}")
 
-    # derive kps parquet path (same folder as the db)
     kps_pq_path = str(db.parent / "kps.parquet")
 
     # ---- identity assignment (loaded from DB) ----
-    assignment = {}
-    scores_df  = None
+    assignment  = {}
+    scores_df   = None
+    sensor_win  = None
 
-    # ---- pre-load resolved assignments from DB ----
-    # Pulls from manual_assignments + reid_registry so labels show animal IDs
-    # immediately without waiting for live kinetic matching to fire.
     try:
         _conn = sqlite3.connect(str(db))
 
-        # manual assignments for this session
         _manual = _conn.execute(
             "SELECT temp_id, real_id FROM manual_assignments WHERE session_id = ?",
             (args.session_id,)
@@ -586,7 +824,6 @@ def main():
         for tid, aid in _manual:
             assignment[int(tid)] = int(aid)
 
-        # kinetic/cosine assignments stored in reid_registry.known_temp_ids
         _reid = _conn.execute(
             "SELECT real_id, known_temp_ids FROM reid_registry "
             "WHERE known_temp_ids IS NOT NULL"
@@ -597,7 +834,7 @@ def main():
                 for entry in known:
                     if entry.get("session_id") == args.session_id:
                         tid = int(entry["temp_id"])
-                        if tid not in assignment:   # manual takes priority
+                        if tid not in assignment:
                             assignment[tid] = int(real_id)
             except Exception:
                 pass
@@ -608,6 +845,58 @@ def main():
             log(f"Pre-loaded {len(assignment)} assignment(s) from DB: {pairs}")
     except Exception as e:
         log(f"WARNING: could not pre-load assignments from DB: {e}")
+
+    # ---- sensor window (optional) ----
+    if args.kinetic_csv or args.behavior_csv:
+        matched_aids = sorted(set(assignment.values())) if assignment else []
+        if not matched_aids:
+            try:
+                import pandas as _pd2
+                _src = args.kinetic_csv or args.behavior_csv
+                matched_aids = sorted(
+                    _pd2.read_csv(_src, usecols=["AnimalId"])["AnimalId"].unique().tolist()
+                )
+            except Exception as _e:
+                log(f"WARNING: could not read AnimalIds from sensor CSV: {_e}")
+        if matched_aids:
+            log(f"Opening sensor window for AnimalIds: {matched_aids}")
+            sensor_win = SensorWindow(
+                kinetic_csv=args.kinetic_csv,
+                behavior_csv=args.behavior_csv,
+                animal_ids=matched_aids,
+            )
+            sensor_win.LOOKBACK_HOURS = args.sensor_lookback
+        else:
+            log("No matched AnimalIds found — sensor window not opened.")
+
+    # ---- session start time (for frame_datetime fallback) ----
+    # Try to load start_dt from video_sessions; also parse from filename token.
+    session_start_dt = None
+    try:
+        import re as _re
+        from datetime import datetime as _dt2
+        _conn2 = sqlite3.connect(str(db))
+        _row = _conn2.execute(
+            "SELECT start_dt FROM video_sessions WHERE session_id = ?",
+            (args.session_id,)
+        ).fetchone()
+        _conn2.close()
+        if _row and _row[0]:
+            session_start_dt = _dt2.fromisoformat(str(_row[0]))
+            log(f"Session start_dt from DB: {session_start_dt}")
+    except Exception:
+        pass
+    if session_start_dt is None:
+        # fall back: parse _S<YYYYMMDDHHmmss> token from filename
+        import re as _re2
+        from datetime import datetime as _dt3
+        m = _re2.search(r'_S(\d{14})', vid.name)
+        if m:
+            try:
+                session_start_dt = _dt3.strptime(m.group(1), "%Y%m%d%H%M%S")
+                log(f"Session start_dt from filename: {session_start_dt}")
+            except ValueError:
+                pass
 
     log(f"Opening video: {vid}")
     cap = cv2.VideoCapture(str(vid))
@@ -626,15 +915,14 @@ def main():
         kps_parquet_path=kps_pq_path,
     )
 
-    # prime stream
+    # prime stream  (now yields 3-tuple)
     try:
-        next_fi, next_rows = next(row_stream)
+        next_fi, next_fdt, next_rows = next(row_stream)
         log(f"First tracks frame_index: {next_fi}  rows: {len(next_rows)}")
     except StopIteration:
         log("Tracks contain no rows >= start frame. Exiting.")
         return
 
-    # start position in video
     if args.start > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, args.start)
     frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -649,20 +937,9 @@ def main():
     elif args.sink == "ffplay":
         disp_fps = fps if args.max_fps <= 0 else min(fps, args.max_fps)
         cmd = [
-            "ffplay",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "bgr24",
-            "-video_size",
-            f"{W}x{H}",
-            "-framerate",
-            f"{disp_fps}",
-            "-",
+            "ffplay", "-loglevel", "error", "-fflags", "nobuffer",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{W}x{H}", "-framerate", f"{disp_fps}", "-",
         ]
         try:
             ffplay_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -673,15 +950,16 @@ def main():
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(args.outmp4, fourcc, fps, (W, H))
 
-    prev_t = time()
     n_frames = 0
+    stream_done = False   # set True once row_stream is exhausted
     log("Use the Tkinter control panel to pause, fast-forward, toggle score table, or quit.")
 
-    # decide effective kp threshold (v is 0/1/2)
     kp_thresh_effective = args.kp_thresh
     if args.hide_occluded:
-        # draw only v >= 2
         kp_thresh_effective = max(kp_thresh_effective, 0.5)
+
+    # current_fdt tracks the wall-clock datetime of the frame being rendered
+    current_fdt = None
 
     with TkControls() as ctrl:
         while True:
@@ -706,59 +984,74 @@ def main():
 
             # fast-forward: skip (ff_speed - 1) frames between rendered frames
             if ff_speed > 1:
-                skip = ff_speed - 1
-                for _ in range(skip):
-                    ok_skip = cap.grab()  # grab without decode — much faster
+                for _ in range(ff_speed - 1):
+                    ok_skip = cap.grab()
                     if not ok_skip:
                         break
                     frame_idx += 1
-                    n_frames += 1
+                    n_frames  += 1
                     # advance track stream past skipped frames
-                    while next_fi < frame_idx:
-                        try:
-                            next_fi, next_rows = next(row_stream)
-                        except StopIteration:
-                            next_rows = []
-                            next_fi = frame_idx
-                            break
+                    if not stream_done:
+                        while next_fi < frame_idx:
+                            try:
+                                next_fi, next_fdt, next_rows = next(row_stream)
+                            except StopIteration:
+                                stream_done = True
+                                next_rows = []
+                                next_fi   = frame_idx
+                                break
                     if args.limit > 0 and n_frames >= args.limit:
                         break
 
             # advance track stream to current frame
-            while next_fi < frame_idx:
-                try:
-                    next_fi, next_rows = next(row_stream)
-                except StopIteration:
-                    next_rows = []
-                    next_fi = frame_idx
-                    break
+            if not stream_done:
+                while next_fi < frame_idx:
+                    try:
+                        next_fi, next_fdt, next_rows = next(row_stream)
+                    except StopIteration:
+                        stream_done = True
+                        next_rows = []
+                        next_fi   = frame_idx
+                        break
 
             if next_fi == frame_idx:
                 dets = next_rows
-                try:
-                    next_fi, next_rows = next(row_stream)
-                except StopIteration:
-                    next_rows = []
-                    next_fi = 10**12
+                # capture the datetime from this frame's track rows
+                if next_fdt is not None:
+                    current_fdt = next_fdt
+                if not stream_done:
+                    try:
+                        next_fi, next_fdt, next_rows = next(row_stream)
+                    except StopIteration:
+                        stream_done = True
+                        next_rows = []
+                        next_fi   = 10**12
             else:
                 dets = []
+
+            # ---- compute wall-clock datetime for this frame ----
+            if current_fdt is None and session_start_dt is not None:
+                from datetime import timedelta as _td
+                current_fdt = session_start_dt + _td(seconds=frame_idx / fps)
+            elif session_start_dt is not None:
+                # always recompute from frame position so FF scrubs correctly
+                from datetime import timedelta as _td
+                current_fdt = session_start_dt + _td(seconds=frame_idx / fps)
+
+            # push to sensor window (thread-safe)
+            if sensor_win is not None and current_fdt is not None:
+                sensor_win.push_time(current_fdt)
 
             # draw detections + pose
             for d in dets:
                 draw_box(
-                    frame,
-                    d["x1"],
-                    d["y1"],
-                    d["x2"],
-                    d["y2"],
-                    d["temp_id"],
-                    d["conf"],
+                    frame, d["x1"], d["y1"], d["x2"], d["y2"],
+                    d["temp_id"], d["conf"],
                     animal_id=assignment.get(int(d["temp_id"])),
                 )
                 if args.draw_pose and ("kps" in d) and d["kps"]:
                     draw_pose(
-                        frame,
-                        d["kps"],
+                        frame, d["kps"],
                         color=id_color(int(d["temp_id"])),
                         kps_conf=d.get("kps_conf"),
                         kp_radius=args.kp_radius,
@@ -772,37 +1065,9 @@ def main():
                         index_offset=args.kp_index_offset,
                     )
 
-            # identity match score table overlay
             if show_table and scores_df is not None:
                 draw_score_table(frame, scores_df, assignment)
 
-            # FPS overlay
-            if args.show_fps:
-                now = time()
-                fps_now = 1.0 / max(1e-6, now - prev_t)
-                prev_t = now
-                cv2.putText(
-                    frame,
-                    f"{fps_now:5.1f} FPS",
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 0, 0),
-                    3,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    f"{fps_now:5.1f} FPS",
-                    (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            # fast-forward speed overlay
             if ff_speed > 1:
                 spd_label = f">> {ff_speed}x"
                 (sw, sh), _ = cv2.getTextSize(spd_label, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
@@ -813,7 +1078,6 @@ def main():
                 cv2.putText(frame, spd_label, (sx, sy),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 220, 255), 2, cv2.LINE_AA)
 
-            # sink
             if args.sink == "ffplay":
                 try:
                     ffplay_proc.stdin.write(frame.tobytes())
@@ -829,7 +1093,7 @@ def main():
                 writer.write(frame)
 
             frame_idx += 1
-            n_frames += 1
+            n_frames  += 1
             if args.limit > 0 and n_frames >= args.limit:
                 log("Limit reached.")
                 break
@@ -845,6 +1109,8 @@ def main():
     else:
         if writer:
             writer.release()
+    if sensor_win is not None:
+        sensor_win.destroy()
     log("Done.")
 
 
@@ -857,7 +1123,6 @@ if __name__ == "__main__":
 #   --video      "$VID" \
 #   --db         "$DB" \
 #   --session_id refet33_20241221 \
-#   --draw_pose --kp_index --show_fps --sink ffplay --hide_occluded --kp_conf_thresh 0.35
-#
-# Identity labels (cow XXXX) are loaded automatically from the DB.
-# Run reconcile.py or assign_identity.py first to populate assignments.
+#   --draw_pose --kp_index --sink ffplay --hide_occluded --kp_conf_thresh 0.35 \
+#   --kinetic_csv  "$KIN" \
+#   --behavior_csv "$BIH"
