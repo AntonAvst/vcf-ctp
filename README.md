@@ -361,8 +361,8 @@ Scripts write directly to `~/onedrive_mount/` — syncs automatically.
 | Pose Estimation | March 29, 2026 | ✓ Done |
 | Sensor Pipeline | April 12, 2026 | ✓ Done |
 | Re-Identification Module | May 3, 2026 | ✓ Done |
-| Vision Feature Extraction | May 24, 2026 | In progress |
-| Database pipline + cloud storage | June 1, 2026 | — |
+| Vision Feature Extraction | May 29, 2026 | In progress |
+| Database pipline + cloud storage | June 5, 2026 | — |
 | Working Pipeline | June 14, 2026 | — |
 | Temporal Prediction Model | July 26, 2026 | — |
 | Model's Retraining and fine tunning | August 30, 2026 | — |
