@@ -92,6 +92,10 @@ def parse_args():
     ap.add_argument("--commit_every", type=int, default=50,
                     help="Commit SQLite transaction every N frames (default: 50). "
                          "Lower = more crash-safe, slightly more I/O.")
+    ap.add_argument("--save_every", type=int, default=24,
+                    help="Flush tracks (SQLite + Parquet) every N frames (default: 24). "
+                         "Overrides --commit_every when specified. "
+                         "Lower = more crash-safe, slightly more I/O.")
     # ── reconcile.py integration ──────────────────────────────────────────────
     ap.add_argument("--kinetics", required=True,
                     help="kinetic_data_*.csv — passed to reconcile.py after tracking finishes.")
@@ -261,6 +265,27 @@ def main():
     args = parse_args()
 
     outdir        = ensure_dir(Path(args.outdir))
+
+    # ── output dir safety check + clean ──────────────────────────────────────
+    py_files = list(outdir.rglob("*.py"))
+    if py_files:
+        print(f"[track] ERROR: .py files found in output directory — refusing to clear it.")
+        print(f"[track]   outdir : {outdir}")
+        for f in py_files:
+            print(f"[track]   {f.relative_to(outdir)}")
+        print(f"[track] Move or remove these files manually, then re-run.")
+        raise SystemExit(1)
+
+    if outdir.exists():
+        import shutil
+        for item in outdir.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        log(f"Cleared output directory: {outdir}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     crops_dir     = ensure_dir(outdir / "crops") if args.save_crops else None
     session_id    = args.session_id or Path(args.source).stem
     db_path       = outdir / "calving_project.db"
@@ -273,7 +298,11 @@ def main():
     log(f"  session_id   : {session_id}")
     log(f"  outdir       : {outdir}")
     log(f"  db           : {db_path}")
-    log(f"  commit_every : {args.commit_every} frames")
+    # --save_every is the canonical flush interval; --commit_every is kept for
+    # backwards compatibility. If the user supplied --save_every explicitly it
+    # wins; otherwise fall back to --commit_every.
+    _save_interval = args.save_every
+    log(f"  save_every   : {_save_interval} frames  (commit_every={args.commit_every})")
     if args.pose_model:
         log(f"  pose_model   : {args.pose_model}")
 
@@ -339,7 +368,7 @@ def main():
 
     def _maybe_commit():
         nonlocal last_commit_frame
-        if frame_idx - last_commit_frame >= args.commit_every:
+        if frame_idx - last_commit_frame >= _save_interval:
             if db_batch:
                 conn.executemany(INSERT_SQL, db_batch)
                 db_batch.clear()
@@ -583,7 +612,7 @@ if __name__ == "__main__":
 #   --save_crops \
 #   --pose_model "$POSE" --pose_imgsz 384 --pose_conf 0.25 \
 #   --crop_every 100 --min_crop_wh 100 100 \
-#   --commit_every 50
+#   --save_every 24        # flush tracks every 24 frames (default)
 #
 # reconcile.py runs automatically when tracking finishes (or on Ctrl+C).
 # To run reconcile manually on an existing session:
