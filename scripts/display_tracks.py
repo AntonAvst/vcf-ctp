@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, sqlite3, sys, subprocess
+import argparse, json, os, signal as _sig, sqlite3, sys, subprocess
 from pathlib import Path
 from time import time
 
@@ -93,6 +93,8 @@ class TkControls:
         root.grid_columnconfigure(0, weight=1)
         root.grid_columnconfigure(1, weight=1)
 
+        # FIX: force an initial render pass so the window isn't blank in WSL/WSLg
+        root.update()
         root.mainloop()
 
     def _toggle_pause(self):
@@ -209,7 +211,7 @@ class SensorWindow:
         # shared playhead state — written by main thread, read by Tk thread
         self._current_dt    = None    # datetime | None
         self._last_drawn_dt = None    # datetime of last completed redraw
-        self._lock          = threading.Lock()
+        self._lock          = __import__("threading").Lock()
 
         # ---- load & pre-process data once ----
         self._merged = self._load_data(kinetic_csv, behavior_csv)
@@ -367,6 +369,9 @@ class SensorWindow:
         self._mdates = mdates
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # FIX: force an initial render pass so the window isn't blank in WSL/WSLg
+        root.update()
         root.after(self.POLL_MS, self._poll)
         root.mainloop()
 
@@ -937,9 +942,11 @@ def main():
     elif args.sink == "ffplay":
         disp_fps = fps if args.max_fps <= 0 else min(fps, args.max_fps)
         cmd = [
-            "ffplay", "-loglevel", "error", "-fflags", "nobuffer",
+            "ffplay", "-loglevel", "error",
+            "-an",
+            "-fflags", "nobuffer",
             "-f", "rawvideo", "-pixel_format", "bgr24",
-            "-video_size", f"{W}x{H}", "-framerate", f"{disp_fps}", "-",
+            "-video_size", f"{W}x{H}", "-framerate", f"{disp_fps:.2f}", "-",
         ]
         try:
             ffplay_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -950,9 +957,22 @@ def main():
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(args.outmp4, fourcc, fps, (W, H))
 
+    # FIX: SIGINT handler — sets a flag instead of relying on KeyboardInterrupt
+    # delivered to a thread that may be blocked on a pipe write.
+    _interrupted = [False]
+
+    def _handle_sigint(signum, frame):
+        _interrupted[0] = True
+        log("Interrupted — stopping.")
+        import os as _os
+        _os._exit(0)
+
+    _sig.signal(_sig.SIGINT, _handle_sigint)
+
     n_frames = 0
     stream_done = False   # set True once row_stream is exhausted
     log("Use the Tkinter control panel to pause, fast-forward, toggle score table, or quit.")
+    log("Press Ctrl+C in this terminal to stop at any time.")
 
     kp_thresh_effective = args.kp_thresh
     if args.hide_occluded:
@@ -963,7 +983,8 @@ def main():
 
     with TkControls() as ctrl:
         while True:
-            if ctrl.quit:
+            # FIX: check both the Tk quit button and the SIGINT flag
+            if ctrl.quit or _interrupted[0]:
                 break
 
             paused    = ctrl.paused
@@ -1078,10 +1099,13 @@ def main():
                 cv2.putText(frame, spd_label, (sx, sy),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 220, 255), 2, cv2.LINE_AA)
 
+            # FIX: wrap ffplay write in broader except and add flush;
+            # BrokenPipeError alone wasn't catching all WSL pipe errors.
             if args.sink == "ffplay":
                 try:
                     ffplay_proc.stdin.write(frame.tobytes())
-                except (BrokenPipeError, AttributeError):
+                    ffplay_proc.stdin.flush()
+                except (BrokenPipeError, AttributeError, OSError):
                     log("ffplay closed. Stopping.")
                     break
             elif args.sink == "cv2":
@@ -1103,7 +1127,10 @@ def main():
         cv2.destroyAllWindows()
     elif args.sink == "ffplay":
         if ffplay_proc and ffplay_proc.stdin:
-            ffplay_proc.stdin.close()
+            try:
+                ffplay_proc.stdin.close()
+            except OSError:
+                pass
         if ffplay_proc:
             ffplay_proc.terminate()
     else:
