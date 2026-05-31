@@ -1,31 +1,46 @@
 """
 vision_features/gallery/pose_conditioned.py
 ─────────────────────────────────────────────
-Pose-conditioned ReID gallery: 8 slots per cow per modality.
+Two pose-conditioned ReID galleries:
 
-Slots = {standing, lying} × {left, right, toward, away}
-Gallery files:
-    gallery_pose_day.npy   → dict { real_id (int) : np.ndarray (8, 128) }
-    gallery_pose_night.npy → same
+  PoseGallery      — keyed by real_id (int, positive)
+                     Confirmed identities. Persists across sessions.
+                     Files: gallery_pose_{day|night}.npy
 
-A slot is "populated" if gallery_n[slot] > 0.
-An unpopulated slot returns None on query; callers must handle the fallback chain.
+  TempPoseGallery  — keyed by (camera_id, session_id, temp_id)
+                     Unresolved identities. Cross-session within a camera.
+                     Files: temp_gallery_pose_{day|night}.npy
+                     Entries are deleted when the temp_id gets resolved.
 
-The flat (non-slot) galleries in reconcile.py (gallery_day.npy / gallery_night.npy)
-are untouched — this module adds the 8-slot galleries alongside them. reconcile.py
-step B still updates the flat gallery; step C (cosine resolver) can optionally use
-the slot galleries for finer discrimination once they are populated.
+Both use 8 slots = {standing, lying} × {left, right, toward, away}.
 
-Fallback query chain (slot-aware cosine resolver):
-    1. Exact slot (posture + facing match)
-    2. Same posture, any facing  (4 slots aggregated by mean)
-    3. Any populated slot        (all 8, mean — equivalent to flat gallery)
-    4. None                      (caller falls back to kinetics-only)
+Synthetic IDs
+─────────────
+When two unresolved temp_id entries match above threshold but neither has
+a real_id, a synthetic id is minted (negative integer, globally unique).
+Written to reid_registry like any real_id, but with match_method='synthetic'.
+
+Counter file: reid_gallery/synthetic_id_counter.npy  (single int, global)
+This file is shared across all cameras / databases so ids are never reused.
+
+When a synthetic id is later confirmed (kinetic, manual, or cosine against
+a real_id gallery entry), backpropagate_resolution() replaces every
+occurrence of the synthetic id with the confirmed real_id across the DB,
+folds the gallery vectors, then deletes the synthetic entry.
+
+Fallback query chain (same for both galleries):
+    1. Exact slot         (posture + facing match)
+    2. Same posture       (any facing, 4 slots)
+    3. All populated slots (8 slots)
+    4. None
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from typing import NamedTuple
+
 import numpy as np
 
 from ..schema import (
@@ -34,37 +49,140 @@ from ..schema import (
     slot_index, slot_name,
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Gallery data container
+# Temp gallery key
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TempKey(NamedTuple):
+    camera_id:  str
+    session_id: str
+    temp_id:    int
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Synthetic ID counter  (global .npy file)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def mint_synthetic_id(gallery_dir: str) -> int:
+    """
+    Atomically decrement and return the next synthetic id (negative integer).
+    Counter stored in reid_gallery/synthetic_id_counter.npy.
+    Thread-safe within a single process; safe across processes because
+    reconcile.py runs serially (one session at a time).
+
+    Returns: e.g. -1, -2, -3, ...
+    """
+    path = Path(gallery_dir) / "synthetic_id_counter.npy"
+    if path.exists():
+        current = int(np.load(str(path)))
+    else:
+        current = 0   # first mint will return -1
+    new_val = current - 1
+    np.save(str(path), np.array(new_val, dtype=np.int64))
+    return new_val
+
+
+def peek_synthetic_counter(gallery_dir: str) -> int:
+    """Return the current counter value without decrementing."""
+    path = Path(gallery_dir) / "synthetic_id_counter.npy"
+    if not path.exists():
+        return 0
+    return int(np.load(str(path)))
+
+
+def is_synthetic(real_id: int) -> bool:
+    return real_id < 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared slot logic (used by both gallery classes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _best_from_slots(
+    embeds_dict: dict,          # { key -> np.ndarray (8, 128) }
+    slots: list[int],
+    query_embed: np.ndarray,
+) -> tuple[object, float, int | None]:
+    """Score all entries on the given slot indices, return (key, cosine, slot)."""
+    best_key, best_cos, best_slot = None, -1.0, None
+    for key, embeds_mat in embeds_dict.items():
+        for s in slots:
+            vec = embeds_mat[s]
+            if np.all(np.isnan(vec)):
+                continue
+            cos = float(np.dot(query_embed, vec))
+            if cos > best_cos:
+                best_cos, best_key, best_slot = cos, key, s
+    return best_key, best_cos, best_slot
+
+
+def _slot_query(
+    embeds_dict: dict,
+    query_embed: np.ndarray,
+    posture: Posture | None,
+    facing:  Facing  | None,
+    threshold: float,
+) -> tuple[object, float, int | None]:
+    """
+    Shared fallback query logic for both PoseGallery and TempPoseGallery.
+    Returns (key, cosine, slot_idx) or (None, best_cos, None).
+    """
+    if not embeds_dict:
+        return None, 0.0, None
+
+    exact_slot = None
+    if (posture is not None and facing is not None
+            and posture != Posture.UNCERTAIN and facing != Facing.UNCERTAIN):
+        exact_slot = slot_index(posture, facing)
+
+    posture_slots = None
+    if posture is not None and posture != Posture.UNCERTAIN:
+        posture_slots = [i for i, (p, _) in enumerate(GALLERY_SLOTS) if p == posture]
+
+    best_cos = -1.0
+
+    # Level 1: exact slot
+    if exact_slot is not None:
+        key, cos, s = _best_from_slots(embeds_dict, [exact_slot], query_embed)
+        best_cos = max(best_cos, cos)
+        if key is not None and cos >= threshold:
+            return key, cos, s
+
+    # Level 2: same posture, any facing
+    if posture_slots is not None:
+        key, cos, s = _best_from_slots(embeds_dict, posture_slots, query_embed)
+        best_cos = max(best_cos, cos)
+        if key is not None and cos >= threshold:
+            return key, cos, s
+
+    # Level 3: all populated slots
+    key, cos, s = _best_from_slots(embeds_dict, list(range(N_SLOTS)), query_embed)
+    best_cos = max(best_cos, cos)
+    if key is not None and cos >= threshold:
+        return key, cos, s
+
+    return None, max(0.0, best_cos), None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PoseGallery  (real_id keyed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PoseGallery:
     """
-    In-memory representation of the 8-slot pose-conditioned gallery.
-
-    Attributes
-    ----------
-    embeds : dict { real_id -> np.ndarray (8, 128) }
-             NaN rows indicate empty slots.
-    counts : dict { real_id -> np.ndarray (8,) int }
-             Number of sessions that have contributed to each slot.
+    8-slot pose-conditioned gallery keyed by real_id (positive int).
+    Includes synthetic ids (negative int) until they are confirmed.
     """
 
     def __init__(self) -> None:
         self.embeds: dict[int, np.ndarray] = {}   # (8, 128) per cow
         self.counts: dict[int, np.ndarray] = {}   # (8,)     per cow
 
-    # ── I/O ──────────────────────────────────────────────────────────────────
-
     @classmethod
     def load(cls, gallery_dir: str, modality: str) -> "PoseGallery":
-        """
-        Load from gallery_pose_{modality}.npy.
-        Returns an empty gallery if the file doesn't exist.
-        modality: 'day' | 'night'
-        """
         path = Path(gallery_dir) / f"gallery_pose_{modality}.npy"
-        g    = cls()
+        g = cls()
         if not path.exists():
             return g
         data = np.load(str(path), allow_pickle=True).item()
@@ -73,38 +191,18 @@ class PoseGallery:
         return g
 
     def save(self, gallery_dir: str, modality: str) -> None:
-        """Save to gallery_pose_{modality}.npy. Creates directory if needed."""
         Path(gallery_dir).mkdir(parents=True, exist_ok=True)
         path = Path(gallery_dir) / f"gallery_pose_{modality}.npy"
-        data = {
-            k: {"embeds": self.embeds[k], "counts": self.counts[k]}
-            for k in self.embeds
-        }
+        data = {k: {"embeds": self.embeds[k], "counts": self.counts[k]}
+                for k in self.embeds}
         np.save(str(path), data)
-
-    # ── Update (EMA per slot) ─────────────────────────────────────────────────
 
     def update(
         self,
         real_id: int,
-        slot_embeds: dict[int, np.ndarray],  # {slot_idx -> mean_embed (128,)}
+        slot_embeds: dict[int, np.ndarray],
         alpha: float = 0.15,
     ) -> dict[int, float]:
-        """
-        EMA-update each populated slot for a single cow.
-
-        Parameters
-        ----------
-        real_id     : cow identity
-        slot_embeds : {slot_idx -> session mean embed (128,)} for confirmed frames.
-                      Only slots with entries are updated; empty slots untouched.
-        alpha       : EMA learning rate (full α for kinetic-confirmed,
-                      α/2 for cosine-only — callers divide before passing in).
-
-        Returns
-        -------
-        dict {slot_idx -> cosine(old, new)} for updated slots (for logging).
-        """
         if real_id not in self.embeds:
             self.embeds[real_id] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
             self.counts[real_id] = np.zeros(N_SLOTS, dtype=np.int32)
@@ -112,149 +210,287 @@ class PoseGallery:
         cosines = {}
         for slot_idx, new_vec in slot_embeds.items():
             old_vec = self.embeds[real_id][slot_idx]
-
             if np.all(np.isnan(old_vec)):
-                # First time this slot is populated
                 updated = _l2_norm(new_vec)
                 cosines[slot_idx] = float("nan")
             else:
-                updated  = _l2_norm(alpha * new_vec + (1 - alpha) * old_vec)
+                updated = _l2_norm(alpha * new_vec + (1 - alpha) * old_vec)
                 cosines[slot_idx] = float(np.dot(old_vec, new_vec))
-
             self.embeds[real_id][slot_idx] = updated
             self.counts[real_id][slot_idx] += 1
 
         return cosines
 
-    # ── Query (slot-aware cosine similarity) ─────────────────────────────────
+    def merge_and_delete(self, src_id: int, dst_id: int, alpha: float = 0.5) -> None:
+        """
+        Fold src_id gallery slots into dst_id (used when a synthetic id is
+        confirmed as dst_id), then remove src_id.
+        alpha controls how much weight the src history gets.
+        """
+        if src_id not in self.embeds:
+            return
+        if dst_id not in self.embeds:
+            self.embeds[dst_id] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
+            self.counts[dst_id] = np.zeros(N_SLOTS, dtype=np.int32)
+
+        for s in range(N_SLOTS):
+            src_vec = self.embeds[src_id][s]
+            dst_vec = self.embeds[dst_id][s]
+            if np.all(np.isnan(src_vec)):
+                continue
+            if np.all(np.isnan(dst_vec)):
+                self.embeds[dst_id][s] = src_vec.copy()
+            else:
+                merged = _l2_norm(alpha * src_vec + (1 - alpha) * dst_vec)
+                self.embeds[dst_id][s] = merged
+            self.counts[dst_id][s] += self.counts[src_id][s]
+
+        del self.embeds[src_id]
+        del self.counts[src_id]
 
     def query(
         self,
-        query_embed: np.ndarray,      # (128,) L2-normalised
+        query_embed: np.ndarray,
         posture: Posture | None,
         facing:  Facing  | None,
         threshold: float = 0.75,
     ) -> tuple[int | None, float, int | None]:
-        """
-        Find the best-matching cow using the fallback chain.
-
-        Fallback:
-          1. Exact slot                (posture + facing)
-          2. Same posture, any facing  (4 slots)
-          3. All populated slots       (8 slots)
-          4. None
-
-        Parameters
-        ----------
-        query_embed : (128,) L2-normalised embedding to match.
-        posture     : Posture of the query frame (or None if uncertain).
-        facing      : Facing  of the query frame (or None if uncertain).
-        threshold   : minimum cosine similarity to accept a match.
-
-        Returns
-        -------
-        (real_id or None, cosine_similarity, slot_idx_used or None)
-        """
-        if not self.embeds:
-            return None, 0.0, None
-
-        # ── determine which slots to use (fallback cascade) ──────────────────
-        exact_slot = None
-        if (posture is not None and facing is not None
-                and posture != Posture.UNCERTAIN and facing != Facing.UNCERTAIN):
-            exact_slot = slot_index(posture, facing)
-
-        # slots grouped by posture for fallback level 2
-        posture_slots: list[int] | None = None
-        if posture is not None and posture != Posture.UNCERTAIN:
-            posture_slots = [
-                idx for idx, (p, _) in enumerate(GALLERY_SLOTS) if p == posture
-            ]
-
-        def _best_from_slots(slots: list[int]) -> tuple[int | None, float, int | None]:
-            """Score all cows on the given slot indices, return best match."""
-            best_id, best_cos, best_slot = None, -1.0, None
-            for real_id, embeds_mat in self.embeds.items():
-                for s in slots:
-                    vec = embeds_mat[s]
-                    if np.all(np.isnan(vec)):
-                        continue
-                    cos = float(np.dot(query_embed, vec))
-                    if cos > best_cos:
-                        best_cos, best_id, best_slot = cos, real_id, s
-            return best_id, best_cos, best_slot
-
-        # Level 1: exact slot
-        if exact_slot is not None:
-            rid, cos, s = _best_from_slots([exact_slot])
-            if rid is not None and cos >= threshold:
-                return rid, cos, s
-
-        # Level 2: same posture, any facing
-        if posture_slots is not None:
-            rid, cos, s = _best_from_slots(posture_slots)
-            if rid is not None and cos >= threshold:
-                return rid, cos, s
-
-        # Level 3: all populated slots
-        all_slots = list(range(N_SLOTS))
-        rid, cos, s = _best_from_slots(all_slots)
-        if rid is not None and cos >= threshold:
-            return rid, cos, s
-
-        return None, max(0.0, cos if 'cos' in dir() else 0.0), None
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        key, cos, s = _slot_query(self.embeds, query_embed, posture, facing, threshold)
+        return key, cos, s
 
     def populated_slots(self, real_id: int) -> list[str]:
-        """Return human-readable slot names that have at least one observation."""
         if real_id not in self.counts:
             return []
         return [SLOT_NAMES[i] for i, n in enumerate(self.counts[real_id]) if n > 0]
 
     def summary(self) -> str:
-        lines = [f"PoseGallery: {len(self.embeds)} cows"]
+        lines = [f"PoseGallery: {len(self.embeds)} entries"]
         for rid in sorted(self.embeds):
+            tag = " [SYNTHETIC]" if is_synthetic(rid) else ""
             slots = self.populated_slots(rid)
-            lines.append(f"  real_id {rid:>6}: {len(slots)}/8 slots  [{', '.join(slots)}]")
+            lines.append(f"  id {rid:>8}{tag}: {len(slots)}/8 slots  [{', '.join(slots)}]")
         return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Slot embedding builder
+# TempPoseGallery  (TempKey keyed, camera-scoped)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TempPoseGallery:
+    """
+    8-slot pose-conditioned gallery for unresolved temp_ids.
+
+    Keyed by TempKey(camera_id, session_id, temp_id).
+    Scoped by camera_id so cows are never matched across pens.
+    Persists cross-session; entries deleted when temp_id is resolved.
+
+    Files: temp_gallery_pose_{day|night}.npy
+    """
+
+    def __init__(self) -> None:
+        # embeds: { TempKey -> np.ndarray (8, 128) }
+        self.embeds: dict[TempKey, np.ndarray] = {}
+        self.counts: dict[TempKey, np.ndarray] = {}
+
+    @classmethod
+    def load(cls, gallery_dir: str, modality: str) -> "TempPoseGallery":
+        path = Path(gallery_dir) / f"temp_gallery_pose_{modality}.npy"
+        g = cls()
+        if not path.exists():
+            return g
+        data = np.load(str(path), allow_pickle=True).item()
+        for k, v in data.items():
+            key = TempKey(*k)
+            g.embeds[key] = v["embeds"].astype(np.float32)
+            g.counts[key] = v["counts"].astype(np.int32)
+        return g
+
+    def save(self, gallery_dir: str, modality: str) -> None:
+        Path(gallery_dir).mkdir(parents=True, exist_ok=True)
+        path = Path(gallery_dir) / f"temp_gallery_pose_{modality}.npy"
+        # Convert TempKey (NamedTuple) to plain tuple for numpy serialisation
+        data = {tuple(k): {"embeds": self.embeds[k], "counts": self.counts[k]}
+                for k in self.embeds}
+        np.save(str(path), data)
+
+    def update(
+        self,
+        key: TempKey,
+        slot_embeds: dict[int, np.ndarray],
+        alpha: float = 0.15,
+    ) -> dict[int, float]:
+        if key not in self.embeds:
+            self.embeds[key] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
+            self.counts[key] = np.zeros(N_SLOTS, dtype=np.int32)
+
+        cosines = {}
+        for slot_idx, new_vec in slot_embeds.items():
+            old_vec = self.embeds[key][slot_idx]
+            if np.all(np.isnan(old_vec)):
+                updated = _l2_norm(new_vec)
+                cosines[slot_idx] = float("nan")
+            else:
+                updated = _l2_norm(alpha * new_vec + (1 - alpha) * old_vec)
+                cosines[slot_idx] = float(np.dot(old_vec, new_vec))
+            self.embeds[key][slot_idx] = updated
+            self.counts[key][slot_idx] += 1
+
+        return cosines
+
+    def delete_resolved(
+        self,
+        session_id: str,
+        resolved_temp_ids: set[int],
+    ) -> list[TempKey]:
+        """
+        Remove all TempKey entries where session_id matches and temp_id is
+        in resolved_temp_ids. Returns list of deleted keys for logging.
+        """
+        to_delete = [
+            k for k in self.embeds
+            if k.session_id == session_id and k.temp_id in resolved_temp_ids
+        ]
+        for k in to_delete:
+            del self.embeds[k]
+            del self.counts[k]
+        return to_delete
+
+    def query_for_camera(
+        self,
+        camera_id: str,
+        query_embed: np.ndarray,
+        posture: Posture | None,
+        facing:  Facing  | None,
+        threshold: float = 0.75,
+        exclude_session: str | None = None,   # don't match against current session
+    ) -> tuple[TempKey | None, float, int | None]:
+        """
+        Query only entries belonging to camera_id.
+        Optionally exclude the current session (to avoid self-match).
+        Returns (TempKey or None, cosine, slot_idx).
+        """
+        scoped = {
+            k: v for k, v in self.embeds.items()
+            if k.camera_id == camera_id
+            and (exclude_session is None or k.session_id != exclude_session)
+        }
+        key, cos, s = _slot_query(scoped, query_embed, posture, facing, threshold)
+        return key, cos, s
+
+    def get_mean_embed(self, key: TempKey) -> np.ndarray | None:
+        """Return mean of all populated slots for a key (for flat cosine fallback)."""
+        if key not in self.embeds:
+            return None
+        vecs = [self.embeds[key][s] for s in range(N_SLOTS)
+                if not np.all(np.isnan(self.embeds[key][s]))]
+        if not vecs:
+            return None
+        mean = np.stack(vecs).mean(axis=0)
+        return _l2_norm(mean)
+
+    def entries_for_camera(self, camera_id: str) -> list[TempKey]:
+        return [k for k in self.embeds if k.camera_id == camera_id]
+
+    def summary(self, camera_id: str | None = None) -> str:
+        keys = self.entries_for_camera(camera_id) if camera_id else list(self.embeds)
+        lines = [f"TempPoseGallery: {len(keys)} entries"
+                 + (f" (camera={camera_id})" if camera_id else "")]
+        for k in sorted(keys):
+            populated = [SLOT_NAMES[i] for i, n in enumerate(self.counts[k]) if n > 0]
+            lines.append(f"  {k.camera_id}/{k.session_id}/t{k.temp_id}: "
+                         f"{len(populated)}/8 slots  [{', '.join(populated)}]")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backpropagation  (synthetic id → confirmed real_id)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def backpropagate_resolution(
+    synthetic_id: int,
+    real_id: int,
+    conn: sqlite3.Connection,
+    pose_gallery: PoseGallery,
+    gallery_dir: str,
+    modality: str,
+    dry_run: bool = False,
+) -> int:
+    """
+    Replace every occurrence of synthetic_id with real_id across the DB,
+    fold the gallery vectors, and delete the synthetic entry.
+
+    Tables updated:
+        resolved_cow_timeline   (real_id column)
+        reid_registry           (real_id PK — delete synthetic, upsert real)
+        temp_id_merges          (real_id column)
+        manual_assignments      (real_id column)
+
+    Returns number of timeline rows updated.
+    """
+    assert is_synthetic(synthetic_id), "synthetic_id must be negative"
+    assert real_id > 0, "real_id must be positive"
+
+    if dry_run:
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM resolved_cow_timeline WHERE real_id = ?",
+            (synthetic_id,)
+        ).fetchone()[0]
+        print(f"[backprop dry_run] Would update {rows} timeline rows "
+              f"{synthetic_id} → {real_id}")
+        return rows
+
+    # ── Update all tables ────────────────────────────────────────────────────
+    conn.execute(
+        "UPDATE resolved_cow_timeline SET real_id = ? WHERE real_id = ?",
+        (real_id, synthetic_id)
+    )
+    rows_updated = conn.execute(
+        "SELECT changes()"
+    ).fetchone()[0]
+
+    conn.execute(
+        "UPDATE temp_id_merges SET real_id = ? WHERE real_id = ?",
+        (real_id, synthetic_id)
+    )
+    conn.execute(
+        "UPDATE manual_assignments SET real_id = ? WHERE real_id = ?",
+        (real_id, synthetic_id)
+    )
+
+    # ── Delete synthetic reid_registry row ───────────────────────────────────
+    conn.execute(
+        "DELETE FROM reid_registry WHERE real_id = ?",
+        (synthetic_id,)
+    )
+    conn.commit()
+
+    # ── Fold gallery vectors ─────────────────────────────────────────────────
+    pose_gallery.merge_and_delete(synthetic_id, real_id, alpha=0.5)
+    pose_gallery.save(gallery_dir, modality)
+
+    return rows_updated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slot embedding builder  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_slot_embeds(
-    embed_df,             # pd.DataFrame with columns [temp_id, embed (np.ndarray 128)]
-    per_frame_labels,     # dict with "posture" (N,) int8 and "facing" (N,) int8 arrays
-    frame_temp_ids,       # np.ndarray (N,) int — temp_id per embed row (aligned with labels)
-    min_conf_posture,     # np.ndarray (N,) float32 — posture confidence
-    min_conf_facing,      # np.ndarray (N,) float32 — facing confidence
+    embed_df,
+    per_frame_labels,
+    frame_temp_ids,
+    min_conf_posture,
+    min_conf_facing,
     min_conf: float = 0.30,
 ) -> dict[int, dict[int, np.ndarray]]:
     """
     Group embed rows by slot, mean-pool each slot per temp_id.
 
-    Parameters
-    ----------
-    embed_df           : DataFrame of embed rows for this session.
-    per_frame_labels   : {"posture": (N,), "facing": (N,)} arrays aligned to embed_df rows.
-    frame_temp_ids     : (N,) temp_id per frame — must align with per_frame_labels arrays.
-    min_conf_posture   : (N,) confidence of posture label.
-    min_conf_facing    : (N,) confidence of facing label.
-    min_conf           : both posture_conf and facing_conf must exceed this to assign a slot.
-
-    Returns
-    -------
-    dict { temp_id -> { slot_idx -> mean_embed (128,) } }
-    For each temp_id, only slots with ≥1 qualifying frame are included.
+    Returns dict { temp_id -> { slot_idx -> mean_embed (128,) } }
     """
-    import pandas as pd
-
     posture_arr = per_frame_labels["posture"]
     facing_arr  = per_frame_labels["facing"]
 
-    # Filter to confident, labelled frames
     confident = (
         (min_conf_posture >= min_conf)
         & (min_conf_facing >= min_conf)
@@ -262,29 +498,25 @@ def build_slot_embeds(
         & (facing_arr  != int(Facing.UNCERTAIN))
     )
 
-    result: dict[int, dict[int, np.ndarray]] = {}
-    embeds_array = np.stack(embed_df["embed"].values)   # (N, 128)
+    result: dict[int, dict[int, list]] = {}
+    embeds_array = np.stack(embed_df["embed"].values)
 
     for i, is_good in enumerate(confident):
         if not is_good:
             continue
-        p   = Posture(posture_arr[i])
-        f   = Facing(facing_arr[i])
-        s   = slot_index(p, f)
+        p  = Posture(posture_arr[i])
+        f  = Facing(facing_arr[i])
+        s  = slot_index(p, f)
         if s is None:
             continue
         tid = int(frame_temp_ids[i])
-        vec = embeds_array[i]
+        result.setdefault(tid, {}).setdefault(s, []).append(embeds_array[i])
 
-        result.setdefault(tid, {}).setdefault(s, []).append(vec)
-
-    # Mean-pool and L2-normalise each slot
     pooled: dict[int, dict[int, np.ndarray]] = {}
     for tid, slots in result.items():
         pooled[tid] = {}
         for slot_idx, vecs in slots.items():
-            stack = np.stack(vecs)
-            mean  = stack.mean(axis=0)
+            mean = np.stack(vecs).mean(axis=0)
             pooled[tid][slot_idx] = _l2_norm(mean)
 
     return pooled

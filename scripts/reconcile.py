@@ -41,6 +41,10 @@ from scipy.stats import pearsonr
 from itertools import product
 
 from vision_features import run_vision_features, migrate_timeline_schema
+from vision_features.gallery import (
+    TempPoseGallery, TempKey, PoseGallery,
+    mint_synthetic_id, is_synthetic, backpropagate_resolution,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -627,97 +631,158 @@ def step_c_cosine_resolver(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
     kinetic_assignment: dict,       # {temp_id -> AnimalId} — already confirmed
-    gallery: dict,                  # {real_id: np.ndarray} updated by step B
+    gallery: dict,                  # {real_id: np.ndarray} flat gallery from step B
     is_night: bool,
     conn: sqlite3.Connection,
     args: argparse.Namespace,
     gallery_dir: str,
     session_id: str,
+    camera_id: str = "cam0",
     dry_run: bool = False,
 ) -> dict:
     """
-    For temp_ids NOT resolved by kinetics, query the gallery via cosine similarity.
-    Returns merged assignment dict {temp_id -> AnimalId} (kinetic + cosine).
-    Also heals within-session temp_id switches: if two temp_ids map to the same
-    AnimalId via cosine, the one with lower confidence is flagged.
+    Resolve unconfirmed temp_ids via cosine similarity.
+
+    Query order per unresolved temp_id:
+      1. Flat real_id gallery        — confirmed identities across all sessions
+      2. Pose-conditioned real_id gallery — slot-aware, higher discrimination
+      3. TempPoseGallery (same camera, other sessions) — cross-session temp matching
+
+    If a temp_id matches a real_id (steps 1/2) → assign that real_id.
+    If a temp_id matches another temp_id (step 3) that already has a synthetic id
+      → assign the same synthetic id.
+    If a temp_id matches another temp_id with no identity yet → mint a new
+      synthetic id and assign it to both.
+    If no match → leave unresolved.
+
+    Also runs backpropagation: if any confirmed real_id in this session was
+    previously a synthetic id, all timeline rows are updated.
     """
     section("Step C — Cosine Resolver")
 
     modality = "night" if is_night else "day"
 
-    if not gallery:
-        log(f"No {modality} gallery entries — cosine resolver skipped.")
-        return dict(kinetic_assignment)
-
     already_resolved = set(kinetic_assignment.keys())
     all_tids = set(tracks_df["temp_id"].unique())
     unresolved_tids = all_tids - already_resolved
 
-    # filter to temp_ids with enough embeds
     if embed_df.empty:
         log("No embeds available — cosine resolver skipped.")
         return dict(kinetic_assignment)
 
-    embed_counts = embed_df.groupby("temp_id").size()
+    embed_counts   = embed_df.groupby("temp_id").size()
     queryable_tids = [
         tid for tid in unresolved_tids
         if embed_counts.get(tid, 0) >= args.cosine_min_embeds
     ]
-    log(f"Unresolved temp_ids: {sorted(int(t) for t in unresolved_tids)}")
-    log(f"Queryable (≥{args.cosine_min_embeds} embeds): {sorted(int(t) for t in queryable_tids)}")
+    log(f"Unresolved temp_ids: {len(unresolved_tids)}  "
+        f"Queryable (≥{args.cosine_min_embeds} embeds): {len(queryable_tids)}")
+
+    # Load pose galleries
+    pose_gallery = PoseGallery.load(gallery_dir, modality)
+    temp_gallery = TempPoseGallery.load(gallery_dir, modality)
 
     cosine_assignment = {}
-    cosine_scores     = {}   # {tid: (aid, sim)}
-
-    # sort gallery real_ids not already assigned to someone in this session
-    assigned_aids = set(kinetic_assignment.values())
+    assigned_aids     = set(kinetic_assignment.values())
 
     for tid in queryable_tids:
         tid_embeds = embed_df[embed_df["temp_id"] == tid]
         query_vec  = compute_mean_embed(tid_embeds)
 
+        # ── Step 1: flat real_id gallery ─────────────────────────────────────
         best_aid, best_sim = None, -1.0
-        for aid, gallery_vec in gallery.items():
+        for aid, gvec in gallery.items():
             if aid in assigned_aids:
-                continue    # already kinetically matched to another temp_id this session
-            sim = cosine_sim(query_vec, gallery_vec)
+                continue
+            sim = cosine_sim(query_vec, gvec)
             if sim > best_sim:
-                best_sim = sim
-                best_aid = aid
+                best_sim, best_aid = sim, aid
 
         if best_aid is not None and best_sim >= args.cosine_threshold:
             cosine_assignment[tid] = best_aid
-            cosine_scores[tid]     = (best_aid, best_sim)
             assigned_aids.add(best_aid)
-            log(f"  temp_id {tid}  →  AnimalId {best_aid}  "
-                f"(cosine={best_sim:.3f}, {modality})")
+            log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
+            continue
+
+        # ── Step 2: pose-conditioned real_id gallery ─────────────────────────
+        p_id, p_cos, _ = pose_gallery.query(
+            query_vec, posture=None, facing=None, threshold=args.cosine_threshold
+        )
+        if p_id is not None and p_id not in assigned_aids:
+            cosine_assignment[tid] = p_id
+            assigned_aids.add(p_id)
+            log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
+            continue
+
+        # ── Step 3: TempPoseGallery — cross-session same camera ──────────────
+        match_key, t_cos, _ = temp_gallery.query_for_camera(
+            camera_id       = camera_id,
+            query_embed     = query_vec,
+            posture         = None,
+            facing          = None,
+            threshold       = args.cosine_threshold,
+            exclude_session = session_id,   # don't match against self
+        )
+
+        if match_key is not None:
+            # The matched temp_id may already have a synthetic id assigned
+            matched_sid = cosine_assignment.get(match_key.temp_id)
+            if matched_sid is None:
+                # check reid_registry for an existing assignment
+                existing_row = get_reid_row(conn, match_key.temp_id)
+                if existing_row:
+                    matched_sid = existing_row.get("real_id")
+
+            if matched_sid is not None and matched_sid not in assigned_aids:
+                # Inherit the same synthetic id
+                cosine_assignment[tid] = matched_sid
+                assigned_aids.add(matched_sid)
+                log(f"  t{tid} → synthetic_id {matched_sid}  "
+                    f"(temp cosine={t_cos:.3f}, matched {match_key})")
+            else:
+                # Mint a new synthetic id for this pair
+                new_synth = mint_synthetic_id(gallery_dir)
+                cosine_assignment[tid]              = new_synth
+                cosine_assignment[match_key.temp_id] = new_synth
+                assigned_aids.add(new_synth)
+                # Register synthetic id in reid_registry
+                if not dry_run:
+                    ts = pd.Timestamp.now().isoformat()
+                    upsert_reid(conn, new_synth, {
+                        "match_method":  "synthetic",
+                        "first_seen_dt": ts,
+                        "known_temp_ids": json.dumps([
+                            {"session_id": session_id,       "temp_id": int(tid)},
+                            {"session_id": match_key.session_id, "temp_id": match_key.temp_id},
+                        ]),
+                    })
+                log(f"  t{tid} + {match_key} → NEW synthetic_id {new_synth}  "
+                    f"(temp cosine={t_cos:.3f})")
         else:
-            log(f"  temp_id {tid}: best cosine {best_sim:.3f} below threshold "
-                f"{args.cosine_threshold} — unresolved")
+            log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved")
 
     if not cosine_assignment:
         log("  No cosine matches found.")
 
-    # soft gallery update for cosine-confirmed (α/2 — conservative, self-referential)
-    if not dry_run and cosine_assignment:
+    # ── Soft gallery update for real_id cosine matches (α/2) ─────────────────
+    if not dry_run:
         alpha_half = args.ema_alpha / 2
         for tid, aid in cosine_assignment.items():
+            if is_synthetic(aid):
+                continue   # don't update real_id gallery with unconfirmed embeddings
             tid_embeds = embed_df[embed_df["temp_id"] == tid]
             if len(tid_embeds) < args.min_embeds_gallery:
                 continue
             session_mean = compute_mean_embed(tid_embeds)
             if aid in gallery:
-                old_vec      = gallery[aid]
-                updated_vec  = alpha_half * session_mean + (1 - alpha_half) * old_vec
-                norm         = np.linalg.norm(updated_vec)
-                gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
+                updated = gallery[aid] * (1 - alpha_half) + session_mean * alpha_half
+                norm = np.linalg.norm(updated)
+                gallery[aid] = updated / norm if norm > 1e-8 else updated
             else:
                 gallery[aid] = session_mean
-
-            # persist
-            ts       = pd.Timestamp.now().isoformat()
-            col_emb  = f"gallery_embed_{modality}"
-            col_n    = f"gallery_n_{modality}"
+            ts      = pd.Timestamp.now().isoformat()
+            col_emb = f"gallery_embed_{modality}"
+            col_n   = f"gallery_n_{modality}"
             existing = get_reid_row(conn, aid)
             old_n    = (existing or {}).get(col_n, 0) or 0
             upsert_reid(conn, aid, {
@@ -726,34 +791,53 @@ def step_c_cosine_resolver(
                 f"last_updated_{modality}_dt": ts,
                 "match_method": f"cosine_{modality}",
             })
-
         save_gallery(gallery_dir, modality, gallery)
 
-    # --- switch healing: detect if two temp_ids in session both → same animal ---
+    # ── Backpropagate: if any confirmed real_id was previously synthetic ──────
     all_assignments = {**kinetic_assignment, **cosine_assignment}
+    for tid, aid in list(all_assignments.items()):
+        if not is_synthetic(aid):
+            continue
+        # This temp_id now has a confirmed real_id via kinetics or manual?
+        confirmed = kinetic_assignment.get(tid)
+        if confirmed and not is_synthetic(confirmed):
+            rows = backpropagate_resolution(
+                synthetic_id = aid,
+                real_id      = confirmed,
+                conn         = conn,
+                pose_gallery = pose_gallery,
+                gallery_dir  = gallery_dir,
+                modality     = modality,
+                dry_run      = dry_run,
+            )
+            log(f"  Backpropagated synthetic_id {aid} → real_id {confirmed} "
+                f"({rows} timeline rows updated)")
+            all_assignments[tid] = confirmed
+            pose_gallery.save(gallery_dir, modality)
+
+    # ── Switch healing ────────────────────────────────────────────────────────
     aid_to_tids: dict[int, list] = {}
     for tid, aid in all_assignments.items():
         aid_to_tids.setdefault(aid, []).append(tid)
 
     for aid, tids in aid_to_tids.items():
         if len(tids) > 1:
-            log(f"  [switch detected] AnimalId {aid} ← temp_ids {tids}  "
-                f"— likely tracker switch. Keeping highest-confidence assignment.")
-            # Keep the one with more frames; mark the other as a switch event.
+            log(f"  [switch] id {aid} ← temp_ids {tids} — keeping most frames")
             frame_counts = {tid: (tracks_df["temp_id"] == tid).sum() for tid in tids}
             keep_tid  = max(frame_counts, key=frame_counts.get)
             drop_tids = [t for t in tids if t != keep_tid]
             for d in drop_tids:
                 if d in cosine_assignment:
                     del cosine_assignment[d]
-                elif d in all_assignments:
-                    # kinetically assigned — flag but don't remove (manual review)
-                    log(f"    WARNING: kinetically-assigned temp_id {d} also maps to "
-                        f"AnimalId {aid} — manual review recommended.")
+                elif d in kinetic_assignment:
+                    log(f"    WARNING: kinetically-assigned t{d} conflicts — review")
 
     merged = {**kinetic_assignment, **cosine_assignment}
+    n_real    = sum(1 for v in merged.values() if not is_synthetic(v))
+    n_synth   = sum(1 for v in merged.values() if is_synthetic(v))
     log(f"Final assignment: {len(merged)} temp_ids resolved  "
-        f"({len(kinetic_assignment)} kinetic, {len(cosine_assignment)} cosine)")
+        f"({len(kinetic_assignment)} kinetic, {len(cosine_assignment)} cosine  "
+        f"[{n_real} real_id, {n_synth} synthetic])")
     return merged
 
 
@@ -914,6 +998,8 @@ def step_e_write_timeline(
         "spine_angle", "pelvic_tilt", "tail_elevation",
         "limb_symmetry", "head_drop", "lying_flag",
         "restlessness", "kps_coverage", "embed_mean",
+        # vision feature extractor columns (added by migrate_timeline_schema)
+        "lying_fraction", "posture_transitions", "facing_dominant", "facing_entropy",
     ]
     # only include columns that exist in the df
     cols = [c for c in cols if c in timeline_df.columns]
@@ -921,12 +1007,22 @@ def step_e_write_timeline(
     ph  = ", ".join("?" * len(cols))
     sql = f"INSERT INTO resolved_cow_timeline ({', '.join(cols)}) VALUES ({ph})"
 
+    def _to_sqlite(v):
+        """Coerce a value to a SQLite-safe type."""
+        import pandas as _pd
+        if v is None:
+            return None
+        if isinstance(v, float) and np.isnan(v):
+            return None
+        if isinstance(v, _pd.Timestamp):
+            return v.isoformat()
+        if hasattr(v, "item"):          # numpy scalar → python scalar
+            return v.item()
+        return v
+
     inserted = 0
     for _, row in timeline_df.iterrows():
-        vals = [
-            (None if (isinstance(v, float) and np.isnan(v)) else v)
-            for v in [row.get(c) for c in cols]
-        ]
+        vals = [_to_sqlite(row.get(c)) for c in cols]
         conn.execute(sql, vals)
         inserted += 1
 
@@ -1142,8 +1238,11 @@ def run(args) -> None:
     is_night = detect_is_night_from_tracks(tracks_df)
     log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
 
-    # update is_night on the session row
+    # update is_night on the session row and load camera_id
     upsert_session(conn, args.session, args.db, is_night)
+    session_row = get_session(conn, args.session)
+    camera_id   = (session_row.get("camera_id") or "cam0") if session_row else "cam0"
+    log(f"camera_id={camera_id}")
 
     # ── Step A — kinetic matching ─────────────────────────────────────────────
     kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
@@ -1183,6 +1282,7 @@ def run(args) -> None:
         args               = args,
         gallery_dir        = args.gallery_dir,
         session_id         = args.session,
+        camera_id          = camera_id,
         dry_run            = args.dry_run,
     )
 
@@ -1230,20 +1330,22 @@ def run(args) -> None:
     if not timeline_df.empty:
         timeline_df["session_id"] = args.session
 
-    # ── Step E — Vision feature extractor ─────────────────────────────────────────────
-    timeline_df = run_vision_features(
-        session_id    = args.session,
-        timeline_df   = timeline_df,
-        conn          = conn,
-        assignment    = full_assignment,
-        is_night      = is_night,
-        kps_parquet   = str(Path(args.embed_parquet).parent / "kps.parquet") if args.embed_parquet else None,
-        embed_parquet = args.embed_parquet or None,
-        gallery_dir   = args.gallery_dir,
-        ema_alpha     = args.ema_alpha,
-        dry_run       = args.dry_run,
-        bin_minutes   = args.bin_minutes,
-    )
+    # ── Step B (vision) — feature extraction ─────────────────────────────────
+    if not timeline_df.empty:
+        timeline_df = run_vision_features(
+            session_id    = args.session,
+            timeline_df   = timeline_df,
+            conn          = conn,
+            assignment    = full_assignment,
+            is_night      = is_night,
+            camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
+            kps_parquet   = str(Path(args.embed_parquet).parent / "kps.parquet") if args.embed_parquet else None,
+            embed_parquet = args.embed_parquet or None,
+            gallery_dir   = args.gallery_dir,
+            ema_alpha     = args.ema_alpha,
+            dry_run       = args.dry_run,
+            bin_minutes   = args.bin_minutes,
+        )
 
     # ── Step E — write to DB ──────────────────────────────────────────────────
     step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
@@ -1286,14 +1388,12 @@ if __name__ == "__main__":
 #   --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
 #   --session    refet33_20241221 \
 #   --kinetics   "$KIN" \
-#   --gallery_dir ./reid_gallery \
+#   --gallery_dir "$GAL" \
 #   --corr_threshold 0.7 \
 #   --min_active_bins 3 \
 #   --cosine_threshold 0.75 \
-#   --ema_alpha 0.15
-#
-# With embeddings in parquet:
-#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet
+#   --ema_alpha 0.15 \
+#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet 
 #
 # Dry run (no DB writes):
 #   --dry_run

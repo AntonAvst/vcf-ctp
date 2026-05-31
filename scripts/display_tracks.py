@@ -85,16 +85,51 @@ def id_color(tid):
     c = rng.integers(64, 255, size=3, dtype=np.uint8).tolist()
     return int(c[0]), int(c[1]), int(c[2])
 
-def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None):
+def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None):
+    """
+    Draw bounding box with a two-line label stack above it:
+        Line 1 (top)    — vision features: posture · facing  (only when available)
+        Line 2 (bottom) — identity: "cow 6366 (t2)"  or  "id 2"
+    conf is accepted for API compatibility but never displayed.
+
+    features: dict with optional keys:
+        "posture" : str  e.g. "standing" | "lying"
+        "facing"  : str  e.g. "left" | "right" | "toward" | "away"
+    """
     color = id_color(tid)
     x1,y1,x2,y2 = [int(round(float(v))) for v in (x1,y1,x2,y2)]
-    cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
-    label = (f"cow {animal_id} (t{int(tid)})" if animal_id is not None
-             else f"id {int(tid)}" + (f" {conf:.2f}" if conf else ""))
-    (tw,th),_ = cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,0.55,2)
-    y0 = max(0,y1-th-6)
-    cv2.rectangle(img,(x1,y0),(x1+tw+6,y0+th+6),color,-1)
-    cv2.putText(img,label,(x1+3,y0+th+2),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,0,0),2,cv2.LINE_AA)
+    cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
+
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    id_scale  = 0.55
+    ft_scale  = 0.48
+    pad       = 4
+
+    # ── identity label ────────────────────────────────────────────────────────
+    id_lbl = (f"cow {animal_id} (t{int(tid)})" if animal_id is not None
+              else f"id {int(tid)}")
+    (id_w, id_h), _ = cv2.getTextSize(id_lbl, font, id_scale, 2)
+    id_pill_h = id_h + pad * 2
+    id_y0     = max(0, y1 - id_pill_h)
+    cv2.rectangle(img, (x1, id_y0), (x1 + id_w + pad*2, id_y0 + id_pill_h), color, -1)
+    cv2.putText(img, id_lbl, (x1 + pad, id_y0 + id_h + pad - 1),
+                font, id_scale, (0,0,0), 2, cv2.LINE_AA)
+
+    # ── features label (posture · facing) ────────────────────────────────────
+    feat_parts = []
+    if features:
+        if features.get("posture"): feat_parts.append(features["posture"])
+        if features.get("facing"):  feat_parts.append(features["facing"])
+    if feat_parts:
+        ft_lbl = "  ·  ".join(feat_parts)
+        (ft_w, ft_h), _ = cv2.getTextSize(ft_lbl, font, ft_scale, 1)
+        ft_pill_h = ft_h + pad * 2
+        ft_y0     = max(0, id_y0 - ft_pill_h)
+        # slightly darker version of the track colour
+        dark = tuple(max(0, int(c * 0.60)) for c in color)
+        cv2.rectangle(img, (x1, ft_y0), (x1 + ft_w + pad*2, ft_y0 + ft_pill_h), dark, -1)
+        cv2.putText(img, ft_lbl, (x1 + pad, ft_y0 + ft_h + pad - 1),
+                    font, ft_scale, (255,255,255), 1, cv2.LINE_AA)
 
 BASE_EDGES = [(0,1),(1,18),(18,2),(2,3),(3,4),(4,5),(5,6),
               (2,7),(7,8),(8,9),(2,10),(10,11),(11,12),
@@ -185,6 +220,68 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
             except: pass
         bucket.append(d)
     if bucket: yield cur_fi,cur_fdt,bucket
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Vision features  (loaded once from resolved_cow_timeline)
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_vision_features(db_path: str, session_id: str) -> dict:
+    """
+    Load posture + facing features from resolved_cow_timeline for this session.
+
+    Returns nested dict:
+        { real_id (int) -> { window_start_dt (datetime) -> {"posture": str, "facing": str} } }
+
+    Returns empty dict if the vision columns don't exist yet (pre-migration DB).
+    """
+    from datetime import datetime as _dt
+    result = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute("""
+            SELECT real_id, window_start_dt, facing_dominant, lying_fraction
+            FROM   resolved_cow_timeline
+            WHERE  session_id = ?
+              AND  (facing_dominant IS NOT NULL OR lying_fraction IS NOT NULL)
+        """, (session_id,)).fetchall()
+        conn.close()
+        for real_id, win_dt_str, facing, lying_frac in rows:
+            if real_id is None:
+                continue
+            try:
+                win_dt = _dt.fromisoformat(str(win_dt_str))
+            except Exception:
+                continue
+            posture = None
+            if lying_frac is not None:
+                posture = "lying" if float(lying_frac) >= 0.5 else "standing"
+            result.setdefault(int(real_id), {})[win_dt] = {
+                "posture": posture,
+                "facing":  facing,
+            }
+        log(f"Vision features loaded: {sum(len(v) for v in result.values())} windows "
+            f"across {len(result)} cows")
+    except sqlite3.OperationalError:
+        log("Vision feature columns not yet in DB — labels will be omitted")
+    return result
+
+
+def get_features_for(vision_index: dict, real_id: int, frame_dt) -> dict | None:
+    """
+    Look up vision features for a cow at a given frame datetime.
+    Finds the most recent window that started at or before frame_dt.
+    Returns None if no data available.
+    """
+    if real_id is None or real_id not in vision_index or frame_dt is None:
+        return None
+    windows = vision_index[real_id]
+    best = None
+    for win_dt in windows:
+        if win_dt <= frame_dt:
+            if best is None or win_dt > best:
+                best = win_dt
+    return windows[best] if best is not None else None
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -474,7 +571,7 @@ def api_sensor_chart():
 # ═══════════════════════════════════════════════════════════════════════════════
 # Video loop  (background thread)
 # ═══════════════════════════════════════════════════════════════════════════════
-def _video_loop(args, assignment, scores_df, session_start_dt):
+def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None):
     global _latest_jpeg
 
     vid = Path(args.video)
@@ -558,9 +655,11 @@ def _video_loop(args, assignment, scores_df, session_start_dt):
         if current_fdt: STATE.set_dt(current_fdt)
 
         for d in dets:
-            draw_box(frame,d["x1"],d["y1"],d["x2"],d["y2"],
-                     d["temp_id"],d["conf"],
-                     animal_id=assignment.get(int(d["temp_id"])))
+            _aid     = assignment.get(int(d["temp_id"]))
+            _feats   = get_features_for(vision_index or {}, _aid, current_fdt)
+            draw_box(frame, d["x1"], d["y1"], d["x2"], d["y2"],
+                     d["temp_id"], d["conf"],
+                     animal_id=_aid, features=_feats)
             if args.draw_pose and d.get("kps"):
                 draw_pose(frame,d["kps"],
                           color=id_color(int(d["temp_id"])),
@@ -694,6 +793,9 @@ def main():
         else:
             log("No sensor data loaded.")
 
+    # ── vision features ──────────────────────────────────────────────────────
+    vision_index = load_vision_features(str(db), args.session_id)
+
     # ── SIGINT ───────────────────────────────────────────────────────────────
     def _sigint(s,f):
         log("Interrupted.")
@@ -703,7 +805,7 @@ def main():
     # ── video thread ─────────────────────────────────────────────────────────
     vt = threading.Thread(
         target=_video_loop,
-        args=(args, assignment, None, session_start_dt),
+        args=(args, assignment, None, session_start_dt, vision_index),
         daemon=True)
     vt.start()
 

@@ -41,10 +41,11 @@ LYING_MIN_AR       = 1.10   # above this → LYING
 
 # Minimum mean keypoint confidence to trust the frame at all.
 # Frames with kps_coverage < this threshold are always UNCERTAIN.
-MIN_KPS_COVERAGE   = 0.20
+# YOLOv8-Pose often outputs low floats — 0.05 accepts any attempted placement.
+MIN_KPS_COVERAGE   = 0.05
 
 # Minimum detection confidence to include a frame in classification.
-MIN_DET_CONF       = 0.30
+MIN_DET_CONF       = 0.10
 
 
 def extract_posture(
