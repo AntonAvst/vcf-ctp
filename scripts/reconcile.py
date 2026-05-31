@@ -40,6 +40,8 @@ import pandas as pd
 from scipy.stats import pearsonr
 from itertools import product
 
+from vision_features import run_vision_features, migrate_timeline_schema
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -1103,6 +1105,8 @@ def run(args) -> None:
 
     # ── database ──────────────────────────────────────────────────────────────
     conn = init_db(args.db)
+    migrate_timeline_schema(conn)
+
 
     # ── load tracks from SQLite ───────────────────────────────────────────────
     log("Loading tracks from SQLite...")
@@ -1215,7 +1219,7 @@ def run(args) -> None:
     # ── update known_temp_ids ─────────────────────────────────────────────────
     update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
 
-    # ── Step D — sensor sequencer ─────────────────────────────────────────────
+    # ── Step D — sensor sequencer + Vision feature extractor ─────────────────────────────────────────────
     timeline_df = step_d_sensor_sequencer(
         tracks_df   = tracks_df,
         kinetics_df = kinetics_df,
@@ -1225,6 +1229,21 @@ def run(args) -> None:
     )
     if not timeline_df.empty:
         timeline_df["session_id"] = args.session
+
+    # ── Step E — Vision feature extractor ─────────────────────────────────────────────
+    timeline_df = run_vision_features(
+        session_id    = args.session,
+        timeline_df   = timeline_df,
+        conn          = conn,
+        assignment    = full_assignment,
+        is_night      = is_night,
+        kps_parquet   = str(Path(args.embed_parquet).parent / "kps.parquet") if args.embed_parquet else None,
+        embed_parquet = args.embed_parquet or None,
+        gallery_dir   = args.gallery_dir,
+        ema_alpha     = args.ema_alpha,
+        dry_run       = args.dry_run,
+        bin_minutes   = args.bin_minutes,
+    )
 
     # ── Step E — write to DB ──────────────────────────────────────────────────
     step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
