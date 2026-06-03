@@ -33,16 +33,27 @@ import torchvision.models as tv
 
 EXPECTED_KP = 19
 
-_FNAME_RE = re.compile(r'_S(\d{14})')
+_FNAME_RE = re.compile(r'^(?P<camera>.+?)_S(?P<start>\d{14})(?:_E(?P<end>\d{14}))?')
 
-def epoch_from_filename(video_path: str):
-    m = _FNAME_RE.search(Path(video_path).stem)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
-        except ValueError:
-            pass
-    return None
+def parse_filename(video_path: str):
+    """Extract (camera_id, start_dt, end_dt) from filename.
+    Format: <camera>_S<YYYYMMDDHHmmss>_E<YYYYMMDDHHmmss>
+    Returns (camera_id: str, start_dt: datetime|None, end_dt: datetime|None).
+    """
+    stem = Path(video_path).stem
+    m = _FNAME_RE.search(stem)
+    if not m:
+        return stem, None, None
+    camera_id = m.group("camera")
+    try:
+        start_dt = datetime.strptime(m.group("start"), "%Y%m%d%H%M%S")
+    except (ValueError, TypeError):
+        start_dt = None
+    try:
+        end_dt = datetime.strptime(m.group("end"), "%Y%m%d%H%M%S") if m.group("end") else None
+    except (ValueError, TypeError):
+        end_dt = None
+    return camera_id, start_dt, end_dt
 
 def log(msg: str) -> None:
     print(f"[track] {msg}", flush=True)
@@ -72,10 +83,8 @@ def parse_args():
     ap.add_argument("--model",      required=True, help="Detector .pt")
     ap.add_argument("--source",     required=True, help="Video path")
     ap.add_argument("--outdir",     required=True, help="Output folder")
-    ap.add_argument("--session_id", default="",
-                    help="Unique session id. Defaults to video filename stem.")
+    # session_id and camera_id are now derived from the filename automatically
     ap.add_argument("--tracker",    default="bytetrack.yaml")
-    ap.add_argument("--camera_id",  default="cam0")
     ap.add_argument("--imgsz",      type=int,   default=960)
     ap.add_argument("--conf",       type=float, default=0.25)
     ap.add_argument("--iou",        type=float, default=0.45)
@@ -89,13 +98,13 @@ def parse_args():
     ap.add_argument("--pose_conf",  type=float, default=0.25)
     ap.add_argument("--pose_kp_conf_thresh", type=float, default=0.30,
                     help="Keypoint conf: >=thresh v=2, <thresh v=1 (default: 0.30)")
-    ap.add_argument("--commit_every", type=int, default=50,
-                    help="Commit SQLite transaction every N frames (default: 50). "
-                         "Lower = more crash-safe, slightly more I/O.")
-    ap.add_argument("--save_every", type=int, default=24,
-                    help="Flush tracks (SQLite + Parquet) every N frames (default: 24). "
-                         "Overrides --commit_every when specified. "
-                         "Lower = more crash-safe, slightly more I/O.")
+    ap.add_argument("--save_every", type=int, default=10,
+                    help="Sample interval: keep only the most recent detection per "
+                         "temp_id within each N-frame window (default: 10). "
+                         "Higher = sparser data.")
+    ap.add_argument("--flush_every", type=int, default=5,
+                    help="Flush to SQLite + Parquet every M windows, i.e. every "
+                         "save_every * flush_every frames (default: 5).")
     # ── reconcile.py integration ──────────────────────────────────────────────
     ap.add_argument("--kinetics", required=True,
                     help="kinetic_data_*.csv — passed to reconcile.py after tracking finishes.")
@@ -177,10 +186,13 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def register_session(conn, session_id, video_path, camera_id, start_dt):
+def register_session(conn, session_id, video_path, camera_id, start_dt, end_dt=""):
+    # Delete any existing data for this session so a re-run is a clean overwrite.
+    conn.execute("DELETE FROM raw_tracks WHERE session_id = ?", (session_id,))
     conn.execute(
-        "INSERT OR IGNORE INTO video_sessions (session_id,video_path,camera_id,start_dt) VALUES (?,?,?,?)",
-        (session_id, video_path, camera_id, start_dt)
+        "INSERT OR REPLACE INTO video_sessions "
+        "(session_id,video_path,camera_id,start_dt,end_dt) VALUES (?,?,?,?,?)",
+        (session_id, video_path, camera_id, start_dt, end_dt)
     )
     conn.commit()
 
@@ -287,22 +299,31 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
 
     crops_dir     = ensure_dir(outdir / "crops") if args.save_crops else None
-    session_id    = args.session_id or Path(args.source).stem
     db_path       = outdir / "calving_project.db"
     embed_pq_path = outdir / "embeds.parquet"
     kps_pq_path   = outdir / "kps.parquet"
 
+    # derive camera_id, start_dt, end_dt from filename
+    camera_id, start_dt, end_dt = parse_filename(args.source)
+    if start_dt is None:
+        log("Warning: could not parse S<timestamp> from filename — frame_datetime will be empty.")
+    session_id = f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S') if start_dt else 'unknown'}"
+
     log("Starting tracking")
     log(f"  model        : {args.model}")
     log(f"  source       : {args.source}")
+    log(f"  camera_id    : {camera_id}")
+    log(f"  start_dt     : {start_dt.isoformat() if start_dt else 'unknown'}")
+    log(f"  end_dt       : {end_dt.isoformat() if end_dt else 'unknown'}")
     log(f"  session_id   : {session_id}")
     log(f"  outdir       : {outdir}")
     log(f"  db           : {db_path}")
-    # --save_every is the canonical flush interval; --commit_every is kept for
-    # backwards compatibility. If the user supplied --save_every explicitly it
-    # wins; otherwise fall back to --commit_every.
-    _save_interval = args.save_every
-    log(f"  save_every   : {_save_interval} frames  (commit_every={args.commit_every})")
+    _save_every     = args.save_every                    # N-frame sampling window
+    _flush_every    = args.flush_every                   # flush every M windows
+    _flush_interval = _save_every * _flush_every         # absolute frame count between flushes
+    log(f"  save_every   : {_save_every} frames/window  "
+        f"flush_every={_flush_every} windows  "
+        f"(flush each {_flush_interval} frames)")
     if args.pose_model:
         log(f"  pose_model   : {args.pose_model}")
 
@@ -324,11 +345,11 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     log(f"Video: {W}x{H} @ {fps:.2f} fps  frames~{total_frames or 'unknown'}")
 
-    _epoch = epoch_from_filename(args.source)
-    log(f"Epoch from filename: {_epoch.isoformat()}" if _epoch
-        else "Warning: could not parse epoch — frame_datetime will be empty.")
+    _epoch = start_dt  # already parsed from filename above
     register_session(conn, session_id, str(args.source),
-                     args.camera_id, _epoch.isoformat() if _epoch else "")
+                     camera_id,
+                     start_dt.isoformat() if start_dt else "",
+                     end_dt.isoformat()   if end_dt   else "")
 
     db_batch:   list = []
     embed_rows: list = []
@@ -350,9 +371,13 @@ def main():
     warned_kp_mismatch    = False
     embed_row_counter     = 0
     kps_row_counter       = 0
-    last_commit_frame     = 0
+    windows_since_flush   = 0   # counts completed N-frame windows since last flush
     frame_idx             = 0
     t_start               = time()
+
+    # Holds the most recent detection per temp_id within the current N-frame window.
+    # Overwritten on each new detection for that temp_id; committed at window boundary.
+    _window_latest: dict = {}
 
     pbar = tqdm(total=total_frames or None,
                 desc=f"Tracking {Path(args.source).name}",
@@ -366,9 +391,48 @@ def main():
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
-    def _maybe_commit():
-        nonlocal last_commit_frame
-        if frame_idx - last_commit_frame >= _save_interval:
+    def _commit_window():
+        """Called at every N-frame window boundary.
+        Moves the latest-per-tid rows into the db/embed/kps batches,
+        then flushes to disk every M windows."""
+        nonlocal windows_since_flush, embed_row_counter, kps_row_counter
+
+        for tid, det in _window_latest.items():
+            ep_row = None
+            if det["embed"] is not None:
+                ep_row = embed_row_counter
+                embed_rows.append({
+                    "session_id":  session_id,
+                    "frame_index": det["frame_index"],
+                    "temp_id":     tid,
+                    "embed":       det["embed"],
+                })
+                embed_row_counter += 1
+
+            kp_row = None
+            if det["kps_arr"] is not None:
+                kp_row = kps_row_counter
+                kps_rows.append({
+                    "session_id":  session_id,
+                    "frame_index": det["frame_index"],
+                    "temp_id":     tid,
+                    "kps":         det["kps_arr"],
+                    "kps_kconf":   det["kconf_arr"],
+                })
+                kps_row_counter += 1
+
+            db_batch.append((
+                session_id, det["frame_index"], det["t_sec"], det["frame_datetime"],
+                tid, det["conf"],
+                det["x1"], det["y1"], det["x2"], det["y2"],
+                det["cx"], det["cy"], det["w"], det["h"],
+                det["kps_mean"], ep_row, kp_row,
+            ))
+
+        _window_latest.clear()
+        windows_since_flush += 1
+
+        if windows_since_flush >= _flush_every:
             if db_batch:
                 conn.executemany(INSERT_SQL, db_batch)
                 db_batch.clear()
@@ -377,7 +441,7 @@ def main():
             kps_writer.flush(kps_rows);     kps_rows.clear()
             pbar.set_postfix(frames=frame_idx,
                              fps=f"{frame_idx/max(time()-t_start,1e-6):.1f}")
-            last_commit_frame = frame_idx
+            windows_since_flush = 0
 
     while True:
         if _stop:
@@ -401,7 +465,10 @@ def main():
         if (not results or results[0].boxes is None
                 or results[0].boxes.xyxy is None
                 or results[0].boxes.id is None):
-            frame_idx += 1; pbar.update(1); _maybe_commit(); continue
+            frame_idx += 1; pbar.update(1)
+            if frame_idx % _save_every == 0:
+                _commit_window()
+            continue
 
         r     = results[0]
         xyxy  = r.boxes.xyxy.cpu().numpy()
@@ -461,50 +528,36 @@ def main():
                 kps_mean_list[i]  = float(np.nanmean(sc)) if sc is not None else 0.0
                 kps_kconf_list[i] = sc.tolist() if sc is not None else [0.0]*Kn
 
-        # ── accumulate rows ───────────────────────────────────────────────────
+        # ── update window-latest per temp_id ─────────────────────────────────
         for j, (box, tid, conf_j) in enumerate(zip(xyxy, tids, confs)):
             x1,y1,x2,y2 = box.tolist()
             cx_j = (x1+x2)/2.0;  cy_j = (y1+y2)/2.0
             w_j  = x2-x1;        h_j  = y2-y1
 
-            # embed
-            ep_row = None
-            if embed_vecs[j] is not None:
-                ep_row = embed_row_counter
-                embed_rows.append({
-                    "session_id":  session_id,
-                    "frame_index": frame_idx,
-                    "temp_id":     int(tid),
-                    "embed":       embed_vecs[j].astype(np.float32),
-                })
-                embed_row_counter += 1
-
-            # kps
-            kp_row   = None
             kps_mean = None
+            kps_arr  = None
+            kconf_arr = None
             if kps_flat_list[j] is not None:
-                kp_row   = kps_row_counter
-                kps_mean = kps_mean_list[j]
+                kps_mean  = kps_mean_list[j]
                 kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
                 kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
-                kps_rows.append({
-                    "session_id":  session_id,
-                    "frame_index": frame_idx,
-                    "temp_id":     int(tid),
-                    "kps":         kps_arr,
-                    "kps_kconf":   kconf_arr,
-                })
-                kps_row_counter += 1
 
-            db_batch.append((
-                session_id, frame_idx, round(t_sec,3), frame_datetime_str,
-                int(tid), float(conf_j),
-                float(x1), float(y1), float(x2), float(y2),
-                float(cx_j), float(cy_j), float(w_j), float(h_j),
-                kps_mean, ep_row, kp_row,
-            ))
+            _window_latest[int(tid)] = {
+                "frame_index":    frame_idx,
+                "t_sec":          round(t_sec, 3),
+                "frame_datetime": frame_datetime_str,
+                "conf":           float(conf_j),
+                "x1": float(x1), "y1": float(y1),
+                "x2": float(x2), "y2": float(y2),
+                "cx": float(cx_j), "cy": float(cy_j),
+                "w":  float(w_j),  "h":  float(h_j),
+                "kps_mean":  kps_mean,
+                "embed":     embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None,
+                "kps_arr":   kps_arr,
+                "kconf_arr": kconf_arr,
+            }
 
-            # optional crop
+            # optional crop (unchanged — runs every detection, not gated by window)
             if crops_dir is not None:
                 tid_i = int(tid)
                 crop_occurrence[tid_i] += 1
@@ -514,16 +567,23 @@ def main():
                     mw,mh = args.min_crop_wh
                     if cw >= int(mw) and ch >= int(mh):
                         cv2.imwrite(
-                            str(crops_dir/f"{args.camera_id}_id{tid_i:04d}_f{frame_idx:06d}.jpg"),
+                            str(crops_dir/f"{camera_id}_id{tid_i:04d}_f{frame_idx:06d}.jpg"),
                             frame[cy1:cy2, cx1:cx2])
 
-        frame_idx += 1; pbar.update(1); _maybe_commit()
+        frame_idx += 1; pbar.update(1)
+        # commit window at every N-th frame boundary
+        if frame_idx % _save_every == 0:
+            _commit_window()
 
     # ── flush & close ─────────────────────────────────────────────────────────
     pbar.close()
+    # commit any partial window that didn't land on a boundary
+    if _window_latest:
+        _commit_window()
     if db_batch:
         conn.executemany(INSERT_SQL, db_batch)
     if _epoch:
+        # Update end_dt with frame-accurate value (overrides filename-parsed end_dt)
         conn.execute("UPDATE video_sessions SET end_dt=? WHERE session_id=?",
                      ((_epoch + timedelta(seconds=frame_idx/max(1e-6,fps))).isoformat(),
                       session_id))
@@ -594,36 +654,36 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────────────────────────────────────
 # DET=/home/anton/thesis_workspace/vcf-ctp/models/cow_detector/best.pt
 # POSE=/home/anton/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
-# VID=/home/anton/thesis_workspace/raw_data/calving/6558/refet_33_S20241221070000_E20241221080000_6558.mp4
+# CALV=/home/anton/thesis_workspace/raw_data/calving/6558
+# VID=refet_33_S20241221070000_E20241221080000_6558.mp4   # camera_id, start_dt, end_dt parsed from filename
 # OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21
 # KIN=/home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv
-# BIH=/home/anton/thesis_workspace/raw_data/CollarData/behavior_data_6558_7509_7774.csv
-# DB=$OUT/calving_project.db
 #
 # python3 track_and_dump.py \
 #   --model      "$DET" \
-#   --source     "$VID" \
+#   --source     "$CALV/$VID" \
 #   --outdir     "$OUT" \
-#   --session_id "refet33_20241221" \
-#   --camera_id  "refet_33" \
 #   --kinetics   "$KIN" \
 #   --gallery_dir /home/anton/thesis_workspace/reid_gallery \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
-#   --save_crops \
 #   --pose_model "$POSE" --pose_imgsz 384 --pose_conf 0.25 \
-#   --crop_every 100 --min_crop_wh 100 100 \
-#   --save_every 24        # flush tracks every 24 frames (default)
+#   --save_every 10    # snapshot latest detection per cow every N frames (default: 10)
+#   --flush_every 5    # flush to SQLite + Parquet every M windows, i.e. N*M frames (default: 5)
+#   --save_crops --crop_every 100 --min_crop_wh 100 100
+#
+# session_id is auto-derived from filename: refet_33_20241221070000
+# Re-running the same file overwrites the previous session cleanly.
 #
 # reconcile.py runs automatically when tracking finishes (or on Ctrl+C).
 # To run reconcile manually on an existing session:
 #   python3 reconcile.py \
-#     --db      "$OUT/calving_project.db" \
-#     --session "refet33_20241221" \
+#     --db       "$OUT/calving_project.db" \
+#     --session  "refet_33_20241221070000" \
 #     --kinetics "$KIN" \
 #     --gallery_dir /home/anton/thesis_workspace/reid_gallery
 #
 # Outputs in $OUT/:
 #   calving_project.db   — SQLite (video_sessions + raw_tracks)
-#   embeds.parquet       — embed[128] per detection
-#   kps.parquet          — kps[57] + kps_kconf[19] per detection
+#   embeds.parquet       — embed[128], one row per cow per window
+#   kps.parquet          — kps[57] + kps_kconf[19], one row per cow per window
 #   crops/               — optional JPEGs
