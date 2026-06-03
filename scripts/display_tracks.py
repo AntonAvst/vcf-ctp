@@ -18,6 +18,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# Vision feature classifiers — live per-frame labels for all temp_ids
+try:
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from vision_features.features.posture import extract_posture
+    from vision_features.features.facing  import extract_facing
+    from vision_features.schema import Posture, Facing, POSTURE_NAMES, FACING_NAMES
+    _VISION_AVAILABLE = True
+except ImportError:
+    _VISION_AVAILABLE = False
+
+
 # ── optional deps checked at runtime ─────────────────────────────────────────
 try:
     from flask import Flask, Response, request, jsonify
@@ -84,6 +96,43 @@ def id_color(tid):
     rng = np.random.default_rng(int(tid) * 123457)
     c = rng.integers(64, 255, size=3, dtype=np.uint8).tolist()
     return int(c[0]), int(c[1]), int(c[2])
+
+def classify_frame_features(d: dict) -> dict | None:
+    """
+    Run posture + facing classifiers on a single detection dict.
+    d must have "kps" (list of 19 (x,y,v) tuples) and "kps_conf" (list[19]).
+    Returns {"posture": str|None, "facing": str|None} or None if unavailable.
+    """
+    if not _VISION_AVAILABLE:
+        return None
+    kps_raw  = d.get("kps")
+    kps_conf = d.get("kps_conf")
+    if not kps_raw or not kps_conf:
+        return None
+    try:
+        # Reshape to (1, 19, 3) and (1, 19) for the vectorised extractors
+        kps_arr  = np.array(kps_raw,  dtype=np.float32).reshape(1, 19, 3)
+        kc_arr   = np.array(kps_conf, dtype=np.float32).reshape(1, 19)
+        bbox_arr = np.array([[d["x1"], d["y1"], d["x2"], d["y2"]]],
+                            dtype=np.float32)
+        det_arr  = np.array([d.get("conf", 1.0)], dtype=np.float32)
+
+        p_out = extract_posture(kps_arr, kc_arr, bbox_arr, det_arr)
+        f_out = extract_facing(kps_arr, kc_arr, bbox_arr,
+                               posture=p_out["posture"])
+
+        posture_label = int(p_out["posture"][0])
+        facing_label  = int(f_out["facing"][0])
+
+        posture_str = (POSTURE_NAMES.get(Posture(posture_label))
+                       if posture_label != int(Posture.UNCERTAIN) else None)
+        facing_str  = (FACING_NAMES.get(Facing(facing_label))
+                       if facing_label != int(Facing.UNCERTAIN) else None)
+
+        return {"posture": posture_str, "facing": facing_str}
+    except Exception:
+        return None
+
 
 def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None):
     """
@@ -655,8 +704,15 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         if current_fdt: STATE.set_dt(current_fdt)
 
         for d in dets:
-            _aid     = assignment.get(int(d["temp_id"]))
-            _feats   = get_features_for(vision_index or {}, _aid, current_fdt)
+            _aid = assignment.get(int(d["temp_id"]))
+
+            # Live classification (all temp_ids, requires --draw_pose / kps loaded)
+            _feats = classify_frame_features(d) if d.get("kps") else None
+
+            # Fall back to DB lookup for resolved cows when live classify unavailable
+            if _feats is None and _aid is not None:
+                _feats = get_features_for(vision_index or {}, _aid, current_fdt)
+
             draw_box(frame, d["x1"], d["y1"], d["x2"], d["y2"],
                      d["temp_id"], d["conf"],
                      animal_id=_aid, features=_feats)
