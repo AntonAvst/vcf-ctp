@@ -655,9 +655,13 @@ if __name__ == "__main__":
 # DET=/home/anton/thesis_workspace/vcf-ctp/models/cow_detector/best.pt
 # POSE=/home/anton/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
 # CALV=/home/anton/thesis_workspace/raw_data/calving/6558
-# VID=refet_33_S20241221070000_E20241221080000_6558.mp4   # camera_id, start_dt, end_dt parsed from filename
+# VID_NAME=refet_33_S20241221070000_E20241221080000_6558.mp4
+# VID=$CALV/$VID_NAME
 # OUT=/home/anton/thesis_workspace/outputs/tracks/refet33_2024-12-21
-# KIN=/home/anton/thesis_workspace/raw_data/CollarData/kinetic_data_6558_7509_7774.csv
+# COLLAR=/home/anton/thesis_workspace/raw_data/CollarData
+# KIN=$COLLAR/kinetic_data_6558_7509_7774.csv
+# BIH=$COLLAR/behavior_data_6558_7509_7774.csv
+# DB=$OUT/calving_project.db
 #
 # python3 track_and_dump.py \
 #   --model      "$DET" \
