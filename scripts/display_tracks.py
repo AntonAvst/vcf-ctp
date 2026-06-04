@@ -124,11 +124,19 @@ def classify_frame_features(d: dict) -> dict | None:
         posture_label = int(p_out["posture"][0])
         facing_label  = int(f_out["facing"][0])
 
-        posture_str = (POSTURE_NAMES.get(Posture(posture_label))
+        # Return None for uncertain — draw_box omits None parts from the label
+        posture_str = (POSTURE_NAMES[Posture(posture_label)]
                        if posture_label != int(Posture.UNCERTAIN) else None)
-        facing_str  = (FACING_NAMES.get(Facing(facing_label))
+        facing_str  = (FACING_NAMES[Facing(facing_label)]
                        if facing_label != int(Facing.UNCERTAIN) else None)
 
+        # Never return the string "uncertain" — treat it as None
+        if posture_str == "uncertain": posture_str = None
+        if facing_str  == "uncertain": facing_str  = None
+
+        # Only return a dict if at least one label is meaningful
+        if posture_str is None and facing_str is None:
+            return None
         return {"posture": posture_str, "facing": facing_str}
     except Exception:
         return None
@@ -304,9 +312,11 @@ def load_vision_features(db_path: str, session_id: str) -> dict:
             posture = None
             if lying_frac is not None:
                 posture = "lying" if float(lying_frac) >= 0.5 else "standing"
+            # Sanitise: treat "uncertain" and empty string as None
+            clean_facing = facing if (facing and facing != "uncertain") else None
             result.setdefault(int(real_id), {})[win_dt] = {
                 "posture": posture,
-                "facing":  facing,
+                "facing":  clean_facing,
             }
         log(f"Vision features loaded: {sum(len(v) for v in result.values())} windows "
             f"across {len(result)} cows")

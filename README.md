@@ -123,11 +123,14 @@ vision_features/
 3. Call both functions in `extractor.py` (two marked locations)
 
 ### `display_tracks.py`
-- Visualization tool: overlays tracks + pose skeleton on video
+- Browser-based visualizer — replaces X11/SDL2/ffplay/Tkinter; no display server required (WSL-compatible)
+- Streams annotated video as MJPEG via Flask; sensor charts rendered server-side as PNG via matplotlib
+- Opens `http://localhost:5000` automatically in the Windows browser (via `cmd.exe /c start`)
 - Reads directly from SQLite (`raw_tracks`, `video_sessions`) — no CSV required
-- Imports `match_identity` for live kinetic matching (Pearson r + Hungarian)
-- Draws score table overlay: temp_id × AnimalId correlation matrix
-- Supports ffplay / cv2 / mp4 sinks; TkControls panel for pause / fast-forward (1×/2×/4×/8×) / quit
+- Imports `match_identity` for live kinetic matching; draws score table overlay (temp_id × AnimalId)
+- Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
+- Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s
+- Requires: `pip install flask`
 
 ### `match_identity.py`
 - Kinetic matching: bbox centroid speed ↔ collar ΔKineticsCountR
@@ -191,7 +194,7 @@ python3 assign_identity.py --db ... --session ... --remove 71
 | **A** | Kinetic matcher | bbox centroid speed ↔ ΔR · Pearson r · Hungarian → temp_id ↔ AnimalId |
 | **A.5** | Manual merge | Load `manual_assignments` from DB; manual overrides kinetic on conflict |
 | **B** | Gallery builder | Group embeds by confirmed AnimalId → EMA mean → separate day/night galleries. Routes on `video_sessions.is_night`. Never mixes modalities. |
-| **C** | Cosine resolver | Query `gallery_embed_day` or `gallery_embed_night` (never cross-query). Heals temp_id switches and enables cross-video continuity. Falls back to kinetics-only if gallery is empty. |
+| **C** | Cosine resolver | 3-tier query per unresolved temp_id: (1) flat real_id gallery, (2) pose-conditioned real_id gallery, (3) TempPoseGallery — cross-session same-camera temp matching. If a match to a real_id is found → assign it. If a match to another temp_id is found → inherit its synthetic id or mint a new one. Backpropagates: if a synthetic id gets resolved to a real_id, all prior timeline rows are updated. Falls back to kinetics-only if all galleries are empty. |
 | **A.6** | Duplicate resolver | Merge any temp_ids assigned to the same AnimalId (tracker switches); remap loser embed rows to winner and rebuild gallery. |
 | **D** | Sensor sequencer | Δf_12/f_23/v/kinR → forward-fill to video time grid |
 | **B-vision** | Vision feature extractor | Load kps from Parquet → classify posture + facing per frame → aggregate to window scalars → write to timeline → update pose-conditioned gallery |
@@ -208,7 +211,7 @@ python3 assign_identity.py --db ... --session ... --remove 71
 
 ---
 
-## Databases (7 total)
+## Databases (8 total)
 
 ### `cow_registry` — static lookup
 - real_id (PK), breed, parity, pen_id, collar_id, baseline_window
@@ -236,8 +239,8 @@ python3 assign_identity.py --db ... --session ... --remove 71
 
 ### `reid_registry` — one row per confirmed real identity
 - real_id (PK = AnimalId from collar)
-- **gallery_embed_day[128]** — EMA mean embedding from daytime sessions (RGB)
-- **gallery_embed_night[128]** — EMA mean embedding from night/IR sessions (grayscale)
+- **gallery_embed_day[128]** — flat EMA mean embedding from daytime sessions (RGB); fallback vector
+- **gallery_embed_night[128]** — flat EMA mean embedding from night/IR sessions (grayscale); fallback vector
 - gallery_n_day, gallery_n_night — session counts per gallery
 - gallery_conf_day, gallery_conf_night — quality score
 - last_updated_day_dt, last_updated_night_dt
@@ -245,13 +248,30 @@ python3 assign_identity.py --db ... --session ... --remove 71
 - first_seen_dt, match_method ('kinetic' | 'cosine_day' | 'cosine_night')
 - Updated by reconcile.py after each video
 
-**EMA update rule:**
+**Per-cow gallery — two layers:**
+
+The primary gallery is the **pose-conditioned 8-slot gallery** stored in `gallery_pose_{day|night}.npy` (outside SQLite). Each cow gets up to 8 independent 128D vectors — one per (posture × facing) combination:
+
 ```
-gallery_embed_new = α × mean(session_embeds) + (1 − α) × gallery_embed_old
+slot 0: standing × left       slot 4: lying × left
+slot 1: standing × right      slot 5: lying × right
+slot 2: standing × toward     slot 6: lying × toward
+slot 3: standing × away       slot 7: lying × away
+```
+
+Only frames where both `posture_conf` and `facing_conf` meet the threshold contribute to a slot. Unpopulated slots are absent (not zero) — the cosine resolver's 3-level fallback handles sparsity:
+1. Query exact slot (e.g. `standing_left`)
+2. Fall back to same posture, any facing (e.g. all `standing_*` populated slots, take max cosine)
+3. Fall back to all populated slots across both postures (equivalent to flat gallery)
+
+The **flat gallery** (`gallery_embed_day/night` in SQLite + `gallery_{day|night}.npy`) is the mean-pool of all session embeddings regardless of pose. It is the Level 3 fallback and is also used during early sessions before pose slots are populated.
+
+**EMA update rule (per slot, and for flat):**
+```
+gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_embed_old
 α = 0.1–0.2  (slow drift; old sightings fade gradually)
 ```
-- Day sessions (is_night=False) → update gallery_embed_day only
-- Night sessions (is_night=True) → update gallery_embed_night only
+- Day sessions (is_night=False) → update day galleries only; night → night only
 - Galleries **never** cross-contaminate across modalities
 - Kinetic-confirmed sessions → full α update
 - Cosine-only confirmed sessions → α/2 update (self-referential — weight conservatively)
@@ -280,6 +300,13 @@ gallery_embed_new = α × mean(session_embeds) + (1 − α) × gallery_embed_old
 - event_id (PK), real_id (FK → reid_registry), calving_dt
 - outcome: Unassisted | Assisted | Twin | Veterinarian-assisted
 
+### `temp_id_merges` — tracker-switch merge log
+- session_id, winner_tid, loser_tid, real_id, winner_reason, loser_reason, merged_dt
+- Written by reconcile.py Step A.6 when two temp_ids are assigned the same AnimalId (tracker switch)
+- `winner_tid` survives; `loser_tid` embed rows are remapped to winner before gallery rebuild
+- winner_reason / loser_reason: `'manual'` | `'more_frames'` | `'kinetic'`
+- UNIQUE on (session_id, loser_tid) — a loser can only be merged once per session
+
 ---
 
 ## Pose Keypoint Index Map (19 kp)
@@ -307,13 +334,13 @@ python3 track_and_dump.py \
     --gallery_dir ./reid_gallery \
     --save_every 24
 
-# 2. Validate visually
+# 2. Validate visually (opens http://localhost:5000 in browser)
 python3 display_tracks.py \
     --video      raw_data/videos/refet33_S20241221070000_E20241221080000.mp4 \
     --db         outputs/refet33_20241221/calving_project.db \
     --session_id refet33_20241221 \
     --kinetics   raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
-    --draw_pose --show_fps --sink ffplay
+    --draw_pose --show_fps
 
 # 3a. If kinetics coverage is good — reconcile runs automatically (Step 1 above)
 
@@ -346,16 +373,17 @@ python3 reconcile.py \
 2. **Wall-clock as universal join key** — frame_datetime links video to collar data; filename `_S<timestamp>` is the source
 3. **Arrays in Parquet, never SQLite blobs** — embed[128], kps[19×3], kps_kconf[19] live in per-session Parquet files; SQLite holds integer row pointers
 4. **real_id is nullable** — pipeline doesn't block on unresolved identities; modality_mask signals quality
-5. **Two-stage identity resolution** — kinetic matching (primary) confirms AnimalId; cosine resolver (secondary) heals temp_id switches and enables cross-video continuity
+5. **Two-stage identity resolution** — kinetic matching (primary) confirms AnimalId; cosine resolver (secondary) heals temp_id switches and enables cross-video continuity. Cosine resolver uses a 3-tier query: flat gallery → pose-conditioned gallery → TempPoseGallery (cross-session temp matching)
 6. **Manual assignment as first-class fallback** — `assign_identity.py` writes to `manual_assignments`; reconcile merges these with kinetic results, manual taking priority
 7. **Duplicate resolver (Step A.6)** — when two temp_ids are assigned the same AnimalId (tracker switch), the loser's embed rows are remapped to the winner before gallery rebuild
 8. **Pose raw data stays in raw_tracks / Parquet** — reconcile.py extracts scalar features into resolved_cow_timeline; raw kps recomputable any time
 9. **Sensor temporal mismatch handled by forward-fill** — behavior ~90s, kinetics ~15min → upsampled into video time grid in resolved_cow_timeline
 10. **kps_coverage column** — tells the model how reliable vision features are per window (partial occlusion awareness)
 11. **display_tracks.py is the integration testbed** — use it to visually validate identity assignments before committing to feature extraction
-12. **Dual day/night gallery** — `reid_registry` stores separate `gallery_embed_day` and `gallery_embed_night` vectors per cow; modalities never cross-contaminate
+12. **Dual day/night gallery, two layers per cow** — each cow has a flat fallback vector (`gallery_embed_{day|night}` in SQLite) and up to 8 pose-conditioned vectors (`gallery_pose_{day|night}.npy`). The 8-slot gallery is the primary query target; the flat vector is the Level 3 fallback when all pose slots are empty. Modalities never cross-contaminate.
 13. **Pluggable vision feature extractor** — `vision_features/` is a self-contained package; adding a new feature means one new file in `features/` and two lines in `extractor.py`; no other files change
-14. **Pose-conditioned 8-slot gallery** — `gallery_pose_{day|night}.npy` stores separate embeddings per (posture × facing) slot per cow, improving cosine discrimination; falls back gracefully to flat gallery when slots are unpopulated
+14. **Pose-conditioned 8-slot gallery** — 8 slots per cow per modality = {standing, lying} × {left, right, toward, away}. Only high-confidence classified frames contribute to each slot. Cosine resolver queries exact slot first, then degrades gracefully to posture-level then flat. Galleries build up progressively — early sessions use flat fallback; discrimination improves automatically as slots populate.
+15. **Synthetic IDs for unresolved cows** — when a temp_id matches another temp_id cross-session but no real_id is known yet, reconcile.py mints a negative synthetic id (from `synthetic_id_counter.npy`). The synthetic id propagates consistently until a future kinetic match resolves it to a real AnimalId, at which point all prior timeline rows are backpropagated automatically
 
 ---
 
@@ -419,6 +447,9 @@ python3 reconcile.py \
     gallery_night.npy                       # flat gallery_embed_night[128] per cow
     gallery_pose_day.npy                    # 8-slot pose-conditioned (N_cows, 8, 128)
     gallery_pose_night.npy                  # 8-slot pose-conditioned (N_cows, 8, 128)
+    temp_gallery_pose_day.npy               # TempPoseGallery — cross-session temp matching (day)
+    temp_gallery_pose_night.npy             # TempPoseGallery — cross-session temp matching (night)
+    synthetic_id_counter.npy               # monotonic counter for minting synthetic IDs
   collar_data/                              # collar CSVs backed up here
 ```
 

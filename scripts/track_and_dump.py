@@ -665,7 +665,7 @@ if __name__ == "__main__":
 #
 # python3 track_and_dump.py \
 #   --model      "$DET" \
-#   --source     "$CALV/$VID" \
+#   --source     "$VID" \
 #   --outdir     "$OUT" \
 #   --kinetics   "$KIN" \
 #   --gallery_dir /home/anton/thesis_workspace/reid_gallery \
