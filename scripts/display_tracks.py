@@ -29,6 +29,9 @@ try:
 except ImportError:
     _VISION_AVAILABLE = False
 
+# Drive I/O layer
+from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
+
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
 try:
@@ -793,6 +796,9 @@ def parse_args():
     ap.add_argument("--kinetic_csv",  default="")
     ap.add_argument("--behavior_csv", default="")
     ap.add_argument("--sensor_lookback", type=float, default=2.0)
+    ap.add_argument("--bypass_upload_check", action="store_true",
+                    help="Skip dirty-flag check when reading from Drive "
+                         "(proceeds with potentially stale data — use with caution)")
     return ap.parse_args()
 
 
@@ -803,9 +809,22 @@ def main():
     global SENSOR_DATA, SENSOR_AIDS
     args = parse_args()
 
-    vid = Path(args.video); db = Path(args.db)
+    vid = Path(args.video)
     if not vid.exists(): raise FileNotFoundError(f"Video not found: {vid}")
-    if not db.exists():  raise FileNotFoundError(f"DB not found: {db}")
+
+    # ── Drive: pull canonical DB before reading ───────────────────────────────
+    dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
+    try:
+        dm.check_flag("db")
+    except DriveNotSyncedError as e:
+        log(f"ERROR: {e}")
+        log("Use --bypass_upload_check to proceed with current Drive state.")
+        return
+    try:
+        db = dm.pull_db(allow_stale=args.bypass_upload_check)
+    except DriveUnavailableError as e:
+        log(f"ERROR pulling DB: {e}")
+        return
 
     # ── identity assignment ──────────────────────────────────────────────────
     assignment = {}

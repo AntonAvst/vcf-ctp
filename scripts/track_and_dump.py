@@ -31,6 +31,9 @@ import torch
 import torch.nn as nn
 import torchvision.models as tv
 
+# Drive I/O layer
+from drive_manager import DriveManager, DriveUnavailableError
+
 EXPECTED_KP = 19
 
 _FNAME_RE = re.compile(r'^(?P<camera>.+?)_S(?P<start>\d{14})(?:_E(?P<end>\d{14}))?')
@@ -81,8 +84,10 @@ class Embedder128(nn.Module):
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model",      required=True, help="Detector .pt")
-    ap.add_argument("--source",     required=True, help="Video path")
-    ap.add_argument("--outdir",     required=True, help="Output folder")
+    ap.add_argument("--source",     required=True,
+                    help="Video path (local file — videos are never uploaded to Drive)")
+    ap.add_argument("--outdir",     required=True,
+                    help="Output folder (ignored if drive_manager resolves session dir)")
     # session_id and camera_id are now derived from the filename automatically
     ap.add_argument("--tracker",    default="bytetrack.yaml")
     ap.add_argument("--imgsz",      type=int,   default=960)
@@ -113,6 +118,9 @@ def parse_args():
     ap.add_argument("--corr_threshold",   type=float, default=0.7)
     ap.add_argument("--cosine_threshold", type=float, default=0.75)
     ap.add_argument("--ema_alpha",        type=float, default=0.15)
+    ap.add_argument("--bypass_upload_check", action="store_true",
+                    help="Skip dirty-flag check when reading from Drive "
+                         "(proceeds with potentially stale data — use with caution)")
     return ap.parse_args()
 
 
@@ -276,7 +284,31 @@ class KpsWriter:
 def main():
     args = parse_args()
 
-    outdir        = ensure_dir(Path(args.outdir))
+    # ── Drive setup ───────────────────────────────────────────────────────────
+    dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
+
+    # Validate video path (local only — pass-through)
+    try:
+        video_path = dm.get_video_path(args.source)
+    except FileNotFoundError as e:
+        print(f"[track] ERROR: {e}")
+        raise SystemExit(1)
+
+    # Pull canonical DB from Drive before writing anything
+    try:
+        db_path = dm.pull_db(allow_stale=False)
+    except DriveUnavailableError as e:
+        print(f"[track] ERROR pulling DB from Drive: {e}")
+        raise SystemExit(1)
+
+    # derive camera_id, start_dt, end_dt from filename
+    camera_id, start_dt, end_dt = parse_filename(args.source)
+    if start_dt is None:
+        log("Warning: could not parse S<timestamp> from filename — frame_datetime will be empty.")
+    session_id = f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S') if start_dt else 'unknown'}"
+
+    # Resolve output dir through drive_manager (local write buffer)
+    outdir = dm.get_session_dir(session_id)
 
     # ── output dir safety check + clean ──────────────────────────────────────
     py_files = list(outdir.rglob("*.py"))
@@ -299,15 +331,12 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
 
     crops_dir     = ensure_dir(outdir / "crops") if args.save_crops else None
-    db_path       = outdir / "calving_project.db"
     embed_pq_path = outdir / "embeds.parquet"
     kps_pq_path   = outdir / "kps.parquet"
 
-    # derive camera_id, start_dt, end_dt from filename
-    camera_id, start_dt, end_dt = parse_filename(args.source)
-    if start_dt is None:
-        log("Warning: could not parse S<timestamp> from filename — frame_datetime will be empty.")
-    session_id = f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S') if start_dt else 'unknown'}"
+    # Mark parquet files as dirty (local writes about to start)
+    dm.mark_dirty("parquet", session_id=session_id)
+    dm.mark_dirty("db",      session_id=session_id)
 
     log("Starting tracking")
     log(f"  model        : {args.model}")
@@ -602,6 +631,20 @@ def main():
     log(f"DB  → {db_path}")
     if crops_dir:
         log(f"crops → {crops_dir}")
+
+    # ── Upload outputs to Drive ───────────────────────────────────────────────
+    log("=" * 60)
+    log("Uploading session outputs to Drive...")
+    log("=" * 60)
+
+    # DB snapshot
+    dm.sync_db(session_id=session_id)
+
+    # Parquet files
+    for pq_path in [embed_pq_path, kps_pq_path]:
+        if pq_path.exists():
+            drive_rel = f"outputs/{session_id}/{pq_path.name}"
+            dm.write_file(pq_path, drive_rel, flag="parquet")
 
     # ── run reconcile.py ──────────────────────────────────────────────────────
     log("=" * 60)

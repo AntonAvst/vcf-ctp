@@ -36,6 +36,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Drive I/O layer
+from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -91,6 +94,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ema_alpha",        type=float, default=0.15)
     ap.add_argument("--dry_run",          action="store_true",
                     help="Pass --dry_run to reconcile (no DB writes during reconcile)")
+    ap.add_argument("--bypass_upload_check", action="store_true",
+                    help="Skip dirty-flag check when reading from Drive "
+                         "(proceeds with potentially stale data — use with caution)")
 
     return ap.parse_args()
 
@@ -112,13 +118,31 @@ CREATE TABLE IF NOT EXISTS manual_assignments (
 );
 """
 
-def open_db(db_path: str) -> sqlite3.Connection:
-    if not Path(db_path).exists():
-        raise FileNotFoundError(f"DB not found: {db_path}")
-    conn = sqlite3.connect(db_path)
+def open_db(db_path: str, bypass: bool = False) -> sqlite3.Connection:
+    """
+    Pull the canonical DB from Drive, then open the local copy.
+    Raises DriveNotSyncedError if unsynced writes exist (unless bypass=True).
+    """
+    dm = DriveManager(bypass=bypass, caller=__file__)
+    # Dirty-flag check — assign_identity both reads and writes the DB
+    try:
+        dm.check_flag("db")
+    except DriveNotSyncedError as e:
+        raise DriveNotSyncedError(str(e))
+
+    # Pull canonical DB from Drive
+    try:
+        local_db = dm.pull_db(allow_stale=False)
+    except DriveUnavailableError as e:
+        if Path(db_path).exists():
+            log(f"WARNING: could not pull DB from Drive — using local copy: {e}")
+            local_db = Path(db_path)
+        else:
+            raise FileNotFoundError(f"DB not found locally and could not pull from Drive: {e}")
+
+    conn = sqlite3.connect(str(local_db))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    # ensure manual_assignments table exists (idempotent)
     conn.executescript(MANUAL_ASSIGNMENTS_DDL)
     conn.commit()
     return conn
@@ -357,8 +381,8 @@ def main() -> None:
     log(f"session : {args.session}")
 
     try:
-        conn = open_db(db_path)
-    except FileNotFoundError as e:
+        conn = open_db(db_path, bypass=args.bypass_upload_check)
+    except (FileNotFoundError, DriveNotSyncedError, DriveUnavailableError) as e:
         log(f"ERROR: {e}")
         sys.exit(1)
 
@@ -410,6 +434,10 @@ def main() -> None:
     log(f"Done — {len(pairs)} assignment(s) written for session '{args.session}'")
 
     conn.close()
+
+    # Sync DB back to Drive after writing manual assignments
+    dm = DriveManager(caller=__file__)
+    dm.sync_db(session_id=args.session)
 
     # ── --run_reconcile ───────────────────────────────────────────────────────
     if args.run_reconcile:

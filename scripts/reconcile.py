@@ -46,6 +46,9 @@ from vision_features.gallery import (
     mint_synthetic_id, is_synthetic, backpropagate_resolution,
 )
 
+# Drive I/O layer
+from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -110,6 +113,9 @@ def parse_args() -> argparse.Namespace:
                     help="Run all steps but do not write to the database")
     ap.add_argument("--verbose", action="store_true",
                     help="Print extra diagnostic output")
+    ap.add_argument("--bypass_upload_check", action="store_true",
+                    help="Skip dirty-flag check when reading from Drive "
+                         "(proceeds with potentially stale data — use with caution)")
 
     return ap.parse_args()
 
@@ -1199,8 +1205,36 @@ def run(args) -> None:
     log(f"gallery_dir : {args.gallery_dir}")
     log(f"dry_run     : {args.dry_run}")
 
+    # ── Drive setup ───────────────────────────────────────────────────────────
+    bypass = getattr(args, "bypass_upload_check", False)
+    dm = DriveManager(bypass=bypass, caller=__file__)
+
+    # Dirty-flag check: reconcile reads from DB and gallery — both must be clean
+    try:
+        dm.check_flag("db")
+        dm.check_flag("gallery")
+        dm.check_flag("parquet")
+    except DriveNotSyncedError as e:
+        log(f"ERROR: {e}")
+        log("Use --bypass_upload_check to proceed with current Drive state.")
+        return
+
+    # Pull the canonical DB from Drive before opening
+    try:
+        db_local = dm.pull_db(allow_stale=False)
+    except DriveUnavailableError as e:
+        log(f"ERROR pulling DB: {e}")
+        return
+
+    # Pull gallery files from Drive
+    dm.pull_gallery()
+
+    # Resolve gallery_dir to the local copy
+    gallery_dir = str(dm.get_gallery_dir())
+    log(f"Using local gallery_dir: {gallery_dir}")
+
     # ── database ──────────────────────────────────────────────────────────────
-    conn = init_db(args.db)
+    conn = init_db(str(db_local))
     migrate_timeline_schema(conn)
 
 
@@ -1266,7 +1300,7 @@ def run(args) -> None:
         is_night           = is_night,
         conn               = conn,
         args               = args,
-        gallery_dir        = args.gallery_dir,
+        gallery_dir        = gallery_dir,
         dry_run            = args.dry_run,
     )
 
@@ -1280,7 +1314,7 @@ def run(args) -> None:
         is_night           = is_night,
         conn               = conn,
         args               = args,
-        gallery_dir        = args.gallery_dir,
+        gallery_dir        = gallery_dir,
         session_id         = args.session,
         camera_id          = camera_id,
         dry_run            = args.dry_run,
@@ -1312,7 +1346,7 @@ def run(args) -> None:
             is_night           = is_night,
             conn               = conn,
             args               = args,
-            gallery_dir        = args.gallery_dir,
+            gallery_dir        = gallery_dir,
             dry_run            = args.dry_run,
         )
 
@@ -1341,7 +1375,7 @@ def run(args) -> None:
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
             kps_parquet   = str(Path(args.embed_parquet).parent / "kps.parquet") if args.embed_parquet else None,
             embed_parquet = args.embed_parquet or None,
-            gallery_dir   = args.gallery_dir,
+            gallery_dir   = gallery_dir,
             ema_alpha     = args.ema_alpha,
             dry_run       = args.dry_run,
             bin_minutes   = args.bin_minutes,
@@ -1367,6 +1401,25 @@ def run(args) -> None:
     log(f"Timeline rows   : {len(timeline_df)}")
     if args.dry_run:
         log("dry_run=True — no data written to DB or gallery files")
+
+    # ── Upload updated files to Drive ─────────────────────────────────────────
+    if not args.dry_run:
+        section("Drive sync")
+        # DB
+        dm.sync_db(session_id=args.session)
+        # Gallery .npy files
+        modality = "night" if detect_is_night_from_tracks(tracks_df) else "day"
+        gallery_files = [
+            f"gallery_{modality}.npy",
+            f"gallery_pose_{modality}.npy",
+            f"temp_gallery_pose_{modality}.npy",
+            "synthetic_id_counter.npy",
+        ]
+        from drive_manager import LOCAL_GALLERY_DIR, DRIVE_GALLERY_PREFIX
+        for fname in gallery_files:
+            local_f = LOCAL_GALLERY_DIR / fname
+            if local_f.exists():
+                dm.write_file(local_f, f"{DRIVE_GALLERY_PREFIX}/{fname}", flag="gallery")
 
     conn.close()
     log("Done.")
