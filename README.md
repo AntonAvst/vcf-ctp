@@ -11,7 +11,7 @@
 
 ## Existing Code
 
-### `drive_manager.py` *(new)*
+### `drive_manager.py`
 - Central Google Drive I/O abstraction layer — all scripts read/write through this module
 - Drive (`thesis_google_drive:vcf_ctp_data`) is the single source of truth for all data
 - Local (`~/thesis_workspace/vcf-ctp/data/`) is a write buffer for the current session only
@@ -61,7 +61,6 @@ python3 drive_manager.py pull-db                         # pull DB from Drive to
 python3 drive_manager.py list-sessions                   # list session folders on Drive
 python3 drive_manager.py upload-kinetics /path/to/dir/   # batch-upload kinetics CSVs
 python3 drive_manager.py upload-behavior /path/to/dir/   # batch-upload behavior CSVs
-python3 drive_manager.py upload-ledger   calving_ledger.csv
 python3 drive_manager.py clear-flag      db|parquet|gallery   # emergency manual flag clear
 ```
 
@@ -178,7 +177,7 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 
 ---
 
-### `vision_features/` *(new)*
+### `vision_features/`
 - Python package implementing Stage 2-B: vision feature extraction from raw keypoints
 - Must be placed in the same directory as `reconcile.py` (i.e. `scripts/vision_features/`)
 - Called by `reconcile.py` after Step D; never called directly
@@ -275,6 +274,60 @@ python3 assign_identity.py --db ... --session ... --list
 python3 assign_identity.py --db ... --session ... --remove 71
 ```
 
+
+---
+
+### `calving_ledger_ingest.py`
+- Ingests a farm's calving ledger file (.xlsx or .csv) into `calving_ledger` + `calving_features`
+- Pulls canonical DB from Drive via `drive_manager` at startup; syncs back after writing
+- Farm-specific parsing is fully isolated in adapter classes — the orchestrator never contains farm logic
+- Idempotent: skips already-ingested events by default (keyed on `real_id + calving_dt`); `--overwrite` to replace
+- `--dry_run` parses and validates without touching the DB — works with no Drive connection
+- Auto-migrates schema: any extra column returned by an adapter triggers `ALTER TABLE ADD COLUMN`
+
+**Adapter structure:**
+```
+scripts/
+  calving_ledger_ingest.py      ← orchestrator
+  adapters/
+    __init__.py
+    base_adapter.py             ← abstract base: load_and_parse() → canonical DataFrame
+    gazit_adapter.py            ← Gazit farm parsing logic
+```
+
+**`BaseAdapter` contract** — every adapter implements one method:
+```python
+def parse(self, df_raw: pd.DataFrame, source_file: str) -> pd.DataFrame:
+    # returns canonical DataFrame with real_id, calving_dt, outcome,
+    # parity, n_calves (required) + any subset of nullable feature cols
+```
+
+**Gazit-specific parsing rules** (in `gazit_adapter.py`, nowhere else):
+
+| Rule | Value |
+|---|---|
+| Date format | Excel serial + time fraction → datetime |
+| `n_calves >= 2` | → `Twin` (overrides all other rules) |
+| `קשה` (hard) | → `Assisted` |
+| `קלה` (easy) | → `Unassisted` |
+| `ללא התערבות` (no intervention) | → `Unassisted` |
+| "הפוכה" in notes | → `is_breech = True` |
+
+**Adding a new farm:**
+1. Create `adapters/my_farm_adapter.py`, subclass `BaseAdapter`, set `FARM_NAME`
+2. Implement `parse()` with that farm's column names and outcome vocabulary
+3. Add one entry to `ADAPTERS` dict in `calving_ledger_ingest.py`
+
+**CLI flags:**
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--file` | required | Path to ledger file (.xlsx or .csv) |
+| `--farm` | *(auto from filename)* | Farm identifier — e.g. `gazit` |
+| `--dry_run` | off | Parse + validate only, no DB writes, no Drive needed |
+| `--overwrite` | off | Replace existing rows (default: skip) |
+| `--bypass_upload_check` | off | Skip dirty-flag check |
+
 ---
 
 ## Sensor Data
@@ -333,7 +386,7 @@ python3 assign_identity.py --db ... --session ... --remove 71
 
 ---
 
-## Databases (8 total)
+## Databases (9 total)
 
 ### `cow_registry` — static lookup
 - real_id (PK), breed, parity, pen_id, collar_id, baseline_window
@@ -419,8 +472,20 @@ gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_e
 - Raw kps arrays stay in `raw_tracks` / Parquet — not copied here
 
 ### `calving_ledger` — ground truth
-- event_id (PK), real_id (FK → reid_registry), calving_dt
-- outcome: Unassisted | Assisted | Twin | Veterinarian-assisted
+- event_id (PK), real_id (FK → reid_registry), calving_dt, outcome
+- outcome enum: `Unassisted` | `Assisted` | `Twin` | `Veterinarian`
+- source_farm, source_file, ingested_at — audit trail
+- Written by `calving_ledger_ingest.py`; consumed by Stage 3 dataset builder
+
+### `calving_features` — per-calving model input features (1:1 with calving_ledger)
+- event_id (PK, FK → calving_ledger)
+- **Direct from ledger:** parity, gestation_days, days_in_milk, dry_days, milk_at_dryoff, dry_off_scc, n_calves
+- **Derived from calving_dt:** calving_hour, calving_month, calving_season
+- **Derived from notes:** is_breech
+- **Cross-event (prior calving for same cow):** days_since_last_calving, prior_outcome, prior_n_calves
+- notes_raw — cleaned free-text
+- All feature columns are nullable — missing data is a first-class value, not an error
+- Schema is additive: new farm-specific columns trigger `ALTER TABLE ADD COLUMN` automatically
 
 ### `temp_id_merges` — tracker-switch merge log
 - session_id, winner_tid, loser_tid, real_id, winner_reason, loser_reason, merged_dt
@@ -489,7 +554,14 @@ python3 reconcile.py \
     # add --dry_run to test without writing
     # add --kinetics /path/to/file.csv to override auto-discovery
 
-# 5. Check sync status / recover from failures
+# 5. Ingest calving ledger (once per farm file — idempotent)
+python3 calving_ledger_ingest.py \
+    --file  ~/thesis_workspace/raw_data/gazit_calving_events_202505_202605.xlsx \
+    --farm  gazit
+    # add --dry_run to validate without writing
+    # add --overwrite to re-ingest an already-loaded file
+
+# 6. Check sync status / recover from failures
 python3 drive_manager.py status
 python3 drive_manager.py retry-buffer
 ```
@@ -516,6 +588,8 @@ python3 drive_manager.py retry-buffer
 16. **Drive as single source of truth** — all structured data lives on Google Drive (`thesis_google_drive:vcf_ctp_data`). Local disk is a write buffer only. drive_manager.py enforces this via dirty flags that block read scripts from running against stale Drive data.
 17. **Collar CSVs auto-discovered by time window** — reconcile.py and track_and_dump.py call `load_collar_data()` which lists Drive's `collar_data/`, parses `s/e` timestamps from canonical filenames, and merges all overlapping files. No `--kinetics` argument needed in normal operation.
 18. **Batch processing with single model load** — track_and_dump.py accepts a directory as `--source`. Models and DB are loaded once; `process_video()` is called per file. A `processing_log.csv` on Drive records every video processed, its outcome, and performance metrics.
+19. **Pluggable calving ledger adapters** — each farm's ledger format is parsed by a dedicated `BaseAdapter` subclass. Farm-specific column names, date formats, language of outcome values, and derivation rules are fully isolated in the adapter. The orchestrator (`calving_ledger_ingest.py`) only calls `parse()`. Adding a new farm = one new file in `adapters/`, zero changes elsewhere.
+20. **Calving features split from ground truth** — `calving_ledger` holds only the label (outcome + identity + datetime). `calving_features` holds all model input features keyed on `event_id`. The two tables evolve independently: new farms can introduce new feature columns via auto-migration without touching existing rows or code.
 
 ---
 
@@ -549,6 +623,11 @@ python3 drive_manager.py retry-buffer
     display_tracks.py
     match_identity.py
     assign_identity.py
+    calving_ledger_ingest.py                # ledger ingestion orchestrator
+    adapters/
+      __init__.py
+      base_adapter.py                       # abstract base — farm adapter contract
+      gazit_adapter.py                      # Gazit farm parsing logic
     vision_features/
       __init__.py
       schema.py
@@ -606,14 +685,6 @@ thesis_google_drive:vcf_ctp_data/           # Google Drive (source of truth)
 raw_data/videos/                            # LOCAL ONLY — never synced
 ```
 
-### rclone setup (WSL)
-```bash
-sudo apt install rclone
-rclone config          # interactive wizard — choose Google Drive, authenticate
-# verify:
-rclone listremotes     # should show: thesis_google_drive:
-python3 drive_manager.py status
-```
 
 ---
 
@@ -632,7 +703,7 @@ python3 drive_manager.py status
 | Re-Identification Module | May 3, 2026 | ✓ Done |
 | Vision Feature Extraction | May 29, 2026 | ✓ Done |
 | Database pipeline + cloud storage | June 5, 2026 | ✓ Done |
-| Calving Ledger Ingestion | June 14, 2026 | — |
+| Calving Ledger Ingestion | June 14, 2026 | ✓ Done |
 | Working Pipeline | June 20, 2026 | — |
 | Temporal Prediction Model | July 26, 2026 | — |
 | Model Retraining and Fine-tuning | August 30, 2026 | — |
