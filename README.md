@@ -11,20 +11,100 @@
 
 ## Existing Code
 
+### `drive_manager.py` *(new)*
+- Central Google Drive I/O abstraction layer — all scripts read/write through this module
+- Drive (`thesis_google_drive:vcf_ctp_data`) is the single source of truth for all data
+- Local (`~/thesis_workspace/vcf-ctp/data/`) is a write buffer for the current session only
+- Dirty flags (`db`, `parquet`, `gallery`) block downstream read scripts when local writes are unsynced
+- Upload failures are buffered locally (`.buffer/pending/`) and retried automatically
+- All uploads logged locally to `upload_log_staging.csv`; flushed to `upload_log.csv` on Drive in a single round-trip at end of batch — never once per file
+- Graceful Ctrl+C: finishes the current file, flushes staged log rows, then exits cleanly
+- Key path constants (edit once at top of file):
+
+| Constant | Value |
+|---|---|
+| `RCLONE_REMOTE` | `thesis_google_drive` |
+| `DRIVE_ROOT` | `thesis_google_drive:vcf_ctp_data` |
+| `LOCAL_ROOT` | `~/thesis_workspace/vcf-ctp/data/` |
+| `BUFFER_DIR` | `~/thesis_workspace/vcf-ctp/.buffer/` |
+
+**Library API (imported by other scripts):**
+
+```python
+from drive_manager import DriveManager
+dm = DriveManager(caller=__file__, bypass=False)
+
+dm.pull_db()                              # pull canonical DB from Drive (blocking)
+dm.sync_db(session_id)                    # push local DB snapshot to Drive
+dm.pull_gallery(modality)                 # pull gallery .npy files from Drive
+dm.get_db_path()                          # → local path (checks dirty flag)
+dm.get_gallery_dir()                      # → local reid_gallery/ path
+dm.get_parquet_path(session_id, "embeds") # → local path (checks dirty flag)
+dm.get_session_dir(session_id)            # → local outputs/<session_id>/
+dm.get_kinetics_path(filename)            # → local collar_data/<filename>
+dm.get_video_path(path)                   # pass-through — validates local file exists
+dm.write_file(local_path, drive_rel_dest) # upload with retry + buffer on failure
+dm.mark_dirty(flag, session_id)           # set flag before writing
+dm.mark_clean(flag)                       # set flag after successful upload
+dm.check_flag(flag)                       # raises DriveNotSyncedError if dirty
+dm.flush_buffer()                         # retry all pending buffered uploads
+```
+
+**CLI commands:**
+
+```bash
+python3 drive_manager.py status                          # Drive connection, dirty flags, buffer
+python3 drive_manager.py retry-buffer                    # upload all buffered files
+python3 drive_manager.py pull-db                         # pull DB from Drive to local
+python3 drive_manager.py list-sessions                   # list session folders on Drive
+python3 drive_manager.py upload-kinetics /path/to/dir/   # batch-upload kinetics CSVs
+python3 drive_manager.py upload-behavior /path/to/dir/   # batch-upload behavior CSVs
+python3 drive_manager.py upload-ledger   calving_ledger.csv
+python3 drive_manager.py clear-flag      db|parquet|gallery   # emergency manual flag clear
+```
+
+**Collar CSV batch upload** (`upload-kinetics` / `upload-behavior`):
+- Accepts a directory path — processes all `.csv` files found
+- Skips files with fewer than 2 data lines
+- Scans each file and renames it on upload:
+  `kinetic_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<id1>_<id2>_....csv`
+  `behavior_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<id1>_<id2>_....csv`
+- Start/end timestamps derived from the earliest and latest `datetime` values in the file
+- Animal IDs sorted ascending, joined with `_`
+
+**Dirty flags — what they block:**
+
+| Flag | Set dirty by | Blocks |
+|---|---|---|
+| `db` | `track_and_dump.py` on first DB write | `reconcile.py`, `display_tracks.py`, `assign_identity.py` |
+| `parquet` | `track_and_dump.py` on first parquet write | `reconcile.py` |
+| `gallery` | `reconcile.py` on gallery update | `reconcile.py` (next session), `display_tracks.py` |
+
+All blocked scripts accept `--bypass_upload_check` to skip the flag check and proceed with whatever is currently on Drive (logs a warning, flag stays dirty).
+
+**Failure buffer:**
+- Failed uploads are copied to `.buffer/pending/` with a `.meta.json` sidecar (dest, caller, size, attempt count)
+- Max 5 attempts across sessions; after that the file is marked `abandoned` and requires manual intervention
+- Retry backoff: 2 s → 8 s → 32 s within a session; cross-session retries triggered by any new upload or `retry-buffer`
+- `upload_failures.log` and `bypass_warnings.log` live in `.buffer/` — local only, never uploaded
+
+---
+
 ### `track_and_dump.py`
 - Runs YOLO detection + ByteTrack/BoT-SORT tracking + YOLOv8-Pose (19 kp) + Embedder128 (MobileNetV3 → 128D L2-norm)
-- Outputs to `<outdir>/`: `calving_project.db` (SQLite), `embeds.parquet`, `kps.parquet`, optional `crops/`
+- Outputs to Drive via `drive_manager`: `calving_project.db` (SQLite), `embeds.parquet`, `kps.parquet`, optional `crops/`
 - Arrays (embed[128], kps[19×3], kps_kconf[19]) stored in Parquet — **never in SQLite**. SQLite stores integer row pointers (`embed_parquet_row`, `kps_parquet_row`)
 - Parses wall-clock start time from filename token `_S<YYYYMMDDHHmmss>`
 - **Calls `reconcile.py` automatically** after tracking finishes (pass `--kinetics`)
+- Pulls canonical DB from Drive at startup via `drive_manager.pull_db()`; marks `db` and `parquet` flags dirty before writing; syncs both to Drive on completion
+- Video files are local only — pass-through via `drive_manager.get_video_path()`
 - Key CLI flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--model` | required | Detector `.pt` |
-| `--source` | required | Video path |
-| `--outdir` | required | Output folder |
-| `--session_id` | filename stem | Unique session key |
+| `--source` | required | Video path (local only — never uploaded) |
+| `--outdir` | required | Output folder (used as fallback; session dir resolved via drive_manager) |
 | `--tracker` | `bytetrack.yaml` | Tracker config |
 | `--camera_id` | `cam0` | Camera label |
 | `--imgsz` | 960 | Detector image size |
@@ -38,20 +118,23 @@
 | `--save_crops` | off | Save JPEG crops |
 | `--crop_every` | 1 | Save crop every N-th detection |
 | `--min_crop_wh` | 0 0 | Min crop width/height |
-| `--save_every` | 24 | Flush tracks (SQLite + Parquet) every N frames. Overrides `--commit_every`. Lower = more crash-safe, slightly more I/O. |
-| `--commit_every` | 50 | SQLite commit interval (frames) — legacy, use `--save_every` instead |
+| `--save_every` | 24 | Flush tracks (SQLite + Parquet) every N frames |
 | `--kinetics` | required | `kinetic_data_*.csv` — forwarded to reconcile.py |
 | `--gallery_dir` | `./reid_gallery` | Gallery directory — forwarded to reconcile.py |
 | `--corr_threshold` | 0.7 | Kinetic match Pearson r threshold |
 | `--cosine_threshold` | 0.75 | Cosine similarity threshold |
 | `--ema_alpha` | 0.15 | Gallery EMA decay |
+| `--bypass_upload_check` | off | Skip dirty-flag check (proceeds with stale Drive data) |
+
+---
 
 ### `reconcile.py`
 - Post-processing pipeline: kinetic match → gallery update → cosine resolve → vision features → timeline write
 - Called automatically by `track_and_dump.py`, or run manually per session
+- Pulls canonical DB and gallery files from Drive via `drive_manager` before processing
+- Checks `db`, `parquet`, and `gallery` dirty flags at entry — aborts if any are dirty (unless `--bypass_upload_check`)
+- Syncs DB and updated gallery `.npy` files back to Drive after completion
 - Steps in order: A (kinetic match) → A.5 (merge manual overrides) → B (gallery builder) → C (cosine resolver) → A.6 (resolve duplicate assignments) → D (sensor sequencer) → B-vision (vision feature extractor) → E (write to DB)
-- Reads tracks from SQLite (`raw_tracks`); optionally loads embeds from `--embed_parquet`
-- Writes to `resolved_cow_timeline` and updates `reid_registry` + gallery `.npy` files
 - Imports `vision_features` package for Step B-vision — the `vision_features/` folder must be in the same directory
 - Key CLI flags:
 
@@ -60,7 +143,7 @@
 | `--db` | required | Path to `calving_project.db` |
 | `--session` | required | `session_id` to process |
 | `--kinetics` | required | `kinetic_data_*.csv` |
-| `--gallery_dir` | `./reid_gallery` | Directory with gallery `.npy` files |
+| `--gallery_dir` | `./reid_gallery` | Directory with gallery `.npy` files (overridden by drive_manager) |
 | `--embed_parquet` | *(optional)* | Parquet file with embed[128] per detection |
 | `--corr_threshold` | 0.7 | Min Pearson r for kinetic match |
 | `--min_active_bins` | 3 | Min active kinetics bins required |
@@ -73,6 +156,9 @@
 | `--cosine_min_embeds` | 5 | Min embed rows for a temp_id to be queried via cosine |
 | `--dry_run` | off | Run all steps, write nothing |
 | `--verbose` | off | Extra diagnostic output |
+| `--bypass_upload_check` | off | Skip dirty-flag check |
+
+---
 
 ### `vision_features/` *(new)*
 - Python package implementing Stage 2-B: vision feature extraction from raw keypoints
@@ -122,26 +208,37 @@ vision_features/
 2. Add output columns to `schema.py` (`TIMELINE_VISION_COLS` and `TIMELINE_ALTER_SQLS`)
 3. Call both functions in `extractor.py` (two marked locations)
 
+---
+
 ### `display_tracks.py`
 - Browser-based visualizer — replaces X11/SDL2/ffplay/Tkinter; no display server required (WSL-compatible)
 - Streams annotated video as MJPEG via Flask; sensor charts rendered server-side as PNG via matplotlib
 - Opens `http://localhost:5000` automatically in the Windows browser (via `cmd.exe /c start`)
-- Reads directly from SQLite (`raw_tracks`, `video_sessions`) — no CSV required
+- Pulls canonical DB from Drive via `drive_manager` at startup; checks `db` dirty flag
 - Imports `match_identity` for live kinetic matching; draws score table overlay (temp_id × AnimalId)
 - Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
 - Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s
+- Accepts `--bypass_upload_check` to proceed when DB flag is dirty
 - Requires: `pip install flask`
+
+---
 
 ### `match_identity.py`
 - Kinetic matching: bbox centroid speed ↔ collar ΔKineticsCountR
 - Pearson correlation per 15-min bin, Hungarian assignment
+- Does not use drive_manager — never touches the DB; reads CSVs passed directly as arguments
 - `score_up_to(tracks_df, kinetics_df, up_to_datetime, bin_minutes, ...)` → assignment dict + scores_df (used by `display_tracks.py` for live overlays)
 - Standalone CLI: `python3 match_identity.py --tracks tracks.csv --kinetics ... --output ...`
 
+---
+
 ### `assign_identity.py`
 - Manual identity assignment tool — use when kinetics data is unavailable or doesn't cover the video window
+- Pulls canonical DB from Drive via `drive_manager` at startup; checks `db` dirty flag
+- Syncs DB back to Drive after writing assignments
 - Writes assignments to a `manual_assignments` table in SQLite; reconcile.py merges these in Step A.5, with manual overriding kinetic on conflict
 - Can optionally call `reconcile.py` directly after writing (`--run_reconcile`)
+- Accepts `--bypass_upload_check` to proceed when DB flag is dirty
 - Key operations:
 
 ```bash
@@ -166,11 +263,13 @@ python3 assign_identity.py --db ... --session ... --remove 71
 - Columns: AnimalId, datetime, f_1_2, f_2_3, v
 - Interval: ~90 seconds
 - Proprietary collar-derived behavioral features
+- Upload with: `python3 drive_manager.py upload-behavior /path/to/dir/`
 
 ### `kinetic_data_*.csv`
 - Columns: AnimalId, datetime, KineticsCountX, KineticsCountY, KineticsCountZ, KineticsCountR
 - Interval: ~15 minutes
 - Cumulative accelerometer counts; deltas computed for matching and features
+- Upload with: `python3 drive_manager.py upload-kinetics /path/to/dir/`
 
 ---
 
@@ -179,7 +278,7 @@ python3 assign_identity.py --db ... --session ... --remove 71
 ### Stage 1 — Inference (`track_and_dump.py`, per video)
 **Inputs:** Raw MP4, YOLO `.pt` models  
 **Process:** Detect → Track (temp_id) → Pose (kps) → Embed (128D) → call reconcile.py  
-**Outputs written:**
+**Outputs written (to Drive via drive_manager):**
 - `raw_tracks` — append-only, one row per detection (scalar columns); arrays in Parquet
 - `video_sessions` — one row per video file registered
 
@@ -323,15 +422,18 @@ gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_e
 ## Typical Workflow
 
 ```bash
+# 0. First-time setup — upload collar CSVs to Drive
+python3 drive_manager.py upload-kinetics ~/thesis_workspace/raw_data/CollarData/
+python3 drive_manager.py upload-behavior ~/thesis_workspace/raw_data/CollarData/
+
 # 1. Run inference + reconcile (single command)
 python3 track_and_dump.py \
     --model      models/cow_detector/best.pt \
     --source     raw_data/videos/refet33_S20241221070000_E20241221080000.mp4 \
     --outdir     outputs/refet33_20241221 \
-    --session_id refet33_20241221 \
     --pose_model models/cow_pose/best.pt \
-    --kinetics   raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
-    --gallery_dir ./reid_gallery \
+    --kinetics   ~/thesis_workspace/vcf-ctp/data/collar_data/kinetic_data_s...__6366_7507_7513.csv \
+    --gallery_dir ~/thesis_workspace/vcf-ctp/data/reid_gallery \
     --save_every 24
 
 # 2. Validate visually (opens http://localhost:5000 in browser)
@@ -339,7 +441,7 @@ python3 display_tracks.py \
     --video      raw_data/videos/refet33_S20241221070000_E20241221080000.mp4 \
     --db         outputs/refet33_20241221/calving_project.db \
     --session_id refet33_20241221 \
-    --kinetics   raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
+    --kinetics   ~/thesis_workspace/vcf-ctp/data/collar_data/kinetic_data_s...__6366_7507_7513.csv \
     --draw_pose --show_fps
 
 # 3a. If kinetics coverage is good — reconcile runs automatically (Step 1 above)
@@ -356,13 +458,16 @@ python3 assign_identity.py \
 python3 reconcile.py \
     --db          outputs/refet33_20241221/calving_project.db \
     --session     refet33_20241221 \
-    --kinetics    raw_data/collar_data/kinetic_data_6366_7507_7513.csv \
-    --gallery_dir ./reid_gallery \
+    --kinetics    ~/thesis_workspace/vcf-ctp/data/collar_data/kinetic_data_s...__6366_7507_7513.csv \
     --embed_parquet outputs/refet33_20241221/embeds.parquet \
     --corr_threshold 0.7 \
     --cosine_threshold 0.75 \
     --ema_alpha 0.15
     # add --dry_run to test without writing
+
+# 5. Check sync status / recover from failures
+python3 drive_manager.py status
+python3 drive_manager.py retry-buffer
 ```
 
 ---
@@ -383,17 +488,18 @@ python3 reconcile.py \
 12. **Dual day/night gallery, two layers per cow** — each cow has a flat fallback vector (`gallery_embed_{day|night}` in SQLite) and up to 8 pose-conditioned vectors (`gallery_pose_{day|night}.npy`). The 8-slot gallery is the primary query target; the flat vector is the Level 3 fallback when all pose slots are empty. Modalities never cross-contaminate.
 13. **Pluggable vision feature extractor** — `vision_features/` is a self-contained package; adding a new feature means one new file in `features/` and two lines in `extractor.py`; no other files change
 14. **Pose-conditioned 8-slot gallery** — 8 slots per cow per modality = {standing, lying} × {left, right, toward, away}. Only high-confidence classified frames contribute to each slot. Cosine resolver queries exact slot first, then degrades gracefully to posture-level then flat. Galleries build up progressively — early sessions use flat fallback; discrimination improves automatically as slots populate.
-15. **Synthetic IDs for unresolved cows** — when a temp_id matches another temp_id cross-session but no real_id is known yet, reconcile.py mints a negative synthetic id (from `synthetic_id_counter.npy`). The synthetic id propagates consistently until a future kinetic match resolves it to a real AnimalId, at which point all prior timeline rows are backpropagated automatically
+15. **Synthetic IDs for unresolved cows** — when a temp_id matches another temp_id cross-session but no real_id is known yet, reconcile.py mints a negative synthetic id (from `synthetic_id_counter.npy`). The synthetic id propagates consistently until a future kinetic match resolves it to a real AnimalId, at which point all prior timeline rows are backpropagated automatically.
+16. **Drive as single source of truth** — all structured data lives on Google Drive (`thesis_google_drive:vcf_ctp_data`). Local disk is a write buffer only. drive_manager.py enforces this via dirty flags that block read scripts from running against stale Drive data.
 
 ---
 
 ## Storage Architecture
 
-### Decision: SQLite + Parquet + University OneDrive (50GB)
+### Decision: SQLite + Parquet + Google Drive
 
 **Database engine:** SQLite for all structured tables. Zero infrastructure, full SQL, pandas-native.  
 **Array storage:** Parquet files (pyarrow) for embed[128], kps[19×3], kps_kconf[19] — one file pair per session. SQLite stores integer row pointers, never raw blobs.  
-**Cloud backup:** University OneDrive (50GB) via `rclone` mount in WSL.  
+**Cloud storage:** Google Drive via rclone (`thesis_google_drive` remote). drive_manager.py handles all sync.  
 **Raw video:** Local disk only — not synced. Re-processable from source.
 
 ### Storage budget (per hour of video processed)
@@ -407,21 +513,17 @@ python3 reconcile.py \
 | reid_gallery .npy pose-conditioned (total, not per hour) | ~8 MB |
 | **Total processed output per hour** | **~280 MB** |
 
-50 GB OneDrive → comfortably holds ~175 hours of processed output.
-
 ### Directory layout
 ```
-~/thesis_workspace/                         # local WSL
-  raw_data/
-    videos/                                 # raw MP4s — LOCAL ONLY, never synced
-    collar_data/                            # collar CSVs — small, sync these
+~/thesis_workspace/vcf-ctp/
   scripts/
+    drive_manager.py                        # Drive I/O layer — import in all scripts
     reconcile.py
     track_and_dump.py
     display_tracks.py
     match_identity.py
     assign_identity.py
-    vision_features/                        # vision feature extraction package
+    vision_features/
       __init__.py
       schema.py
       extractor.py
@@ -432,35 +534,63 @@ python3 reconcile.py \
       gallery/
         __init__.py
         pose_conditioned.py
+  data/                                     # LOCAL write buffer (drive_manager managed)
+    calving_project.db                      # pulled from Drive before each session
+    outputs/<session_id>/
+      embeds.parquet
+      kps.parquet
+    reid_gallery/                           # pulled from Drive before reconcile
+    collar_data/                            # local copies of uploaded collar CSVs
+  .buffer/                                  # LOCAL only — never uploaded
+    db_sync_status.json                     # dirty flag for DB
+    parquet_sync_status.json                # dirty flag for parquet files
+    gallery_sync_status.json                # dirty flag for gallery files
+    upload_log_staging.csv                  # append-only; flushed to Drive at end of batch
+    upload_failures.log                     # failure log
+    bypass_warnings.log                     # log of --bypass_upload_check usages
+    pending/                                # buffered failed uploads
+      <timestamp>_<filename>               # copy of file to retry
+      <timestamp>_<filename>.meta.json     # dest, caller, attempt count, error
 
-~/onedrive_mount/thesis_data/               # rclone → university OneDrive
-  calving_project.db                        # SQLite — all structured tables
+thesis_google_drive:vcf_ctp_data/           # Google Drive (source of truth)
+  calving_project.db
+  outputs/<session_id>/
+    embeds.parquet
+    kps.parquet
+  reid_gallery/
+    gallery_day.npy
+    gallery_night.npy
+    gallery_pose_day.npy
+    gallery_pose_night.npy
+    temp_gallery_pose_day.npy
+    temp_gallery_pose_night.npy
+    synthetic_id_counter.npy
+  collar_data/
+    kinetic_data_s<start>-e<end>__<ids>.csv
+    behavior_data_s<start>-e<end>__<ids>.csv
   models/
     cow_detector/best.pt
     cow_pose/best.pt
-  outputs/
-    <session_id>/
-      embeds.parquet                        # embed[128] per detection
-      kps.parquet                           # kps[19×3] + kps_kconf per detection
-  reid_gallery/
-    gallery_day.npy                         # flat gallery_embed_day[128] per cow
-    gallery_night.npy                       # flat gallery_embed_night[128] per cow
-    gallery_pose_day.npy                    # 8-slot pose-conditioned (N_cows, 8, 128)
-    gallery_pose_night.npy                  # 8-slot pose-conditioned (N_cows, 8, 128)
-    temp_gallery_pose_day.npy               # TempPoseGallery — cross-session temp matching (day)
-    temp_gallery_pose_night.npy             # TempPoseGallery — cross-session temp matching (night)
-    synthetic_id_counter.npy               # monotonic counter for minting synthetic IDs
-  collar_data/                              # collar CSVs backed up here
+  upload_log.csv                            # permanent audit trail of all uploads
+
+raw_data/videos/                            # LOCAL ONLY — never synced
 ```
 
 ### rclone setup (WSL)
 ```bash
 sudo apt install rclone
-rclone config                               # interactive wizard — choose OneDrive, sign in
-rclone mount "university_onedrive:thesis_data" ~/onedrive_mount \
-    --vfs-cache-mode writes &
+rclone config          # interactive wizard — choose Google Drive, authenticate
+# verify:
+rclone listremotes     # should show: thesis_google_drive:
+python3 drive_manager.py status
 ```
-Scripts write directly to `~/onedrive_mount/` — syncs automatically.
+
+---
+
+## ToDo
+
+- [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
+  When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
 
 ---
 
@@ -471,12 +601,10 @@ Scripts write directly to `~/onedrive_mount/` — syncs automatically.
 | Sensor Pipeline | April 12, 2026 | ✓ Done |
 | Re-Identification Module | May 3, 2026 | ✓ Done |
 | Vision Feature Extraction | May 29, 2026 | ✓ Done |
-| Database pipeline + cloud storage | June 5, 2026 | — |
+| Database pipeline + cloud storage | June 5, 2026 | ✓ Done |
 | Working Pipeline | June 14, 2026 | — |
 | Temporal Prediction Model | July 26, 2026 | — |
 | Model Retraining and Fine-tuning | August 30, 2026 | — |
 | Empirical Evaluation | September 30, 2026 | — |
 | Research Paper | October 30, 2026 | — |
 | Thesis Document | November 30, 2026 | — |
-
----
