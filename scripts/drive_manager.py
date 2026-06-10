@@ -15,6 +15,8 @@ Usage (library mode — imported by other scripts):
     dm.write_file(local_path, drive_dest, caller=__file__)
     dm.get_video_path("/path/to/local/video.mp4")        # pass-through, validates existence
     dm.get_kinetics_path()                               # → local path to kinetics CSV
+    dm.find_collar_files(start_dt, end_dt, 'kinetic')   # → list of local paths overlapping session
+    dm.load_collar_data(start_dt, end_dt, 'kinetic')    # → merged DataFrame of all matching CSVs
     dm.get_gallery_path("day")                           # → local path to gallery_day.npy
     dm.get_parquet_path(session_id, "embeds")            # → local path to embeds.parquet
     dm.get_session_dir(session_id)                       # → local output dir for session
@@ -329,14 +331,30 @@ def _rclone_upload(local_path: Path, drive_dest: str, timeout: int = 120) -> boo
     return r.returncode == 0
 
 
-def _rclone_download(drive_src: str, local_path: Path, timeout: int = 300) -> bool:
-    """Download a single file from Drive to local. Returns True on success."""
+def _rclone_download(drive_src: str, local_path: Path,
+                     timeout: int = 300) -> "tuple[bool, bool]":
+    """
+    Download a single file from Drive to local.
+    Returns (ok, not_found):
+      ok        — True if download succeeded
+      not_found — True if the file simply doesn't exist on Drive yet
+                  (vs a real connectivity/auth failure)
+    """
     local_path.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
         ["rclone", "copyto", drive_src, str(local_path)],
-        capture_output=True, timeout=timeout
+        capture_output=True, text=True, timeout=timeout
     )
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True, False
+    # rclone exits non-zero for both "file not found" and network errors.
+    # "object not found" or "no such file" in stderr → the file doesn't exist yet.
+    err = (r.stderr or "").lower()
+    not_found = any(phrase in err for phrase in (
+        "object not found", "no such file", "not found", "no objects found",
+        "couldn't find", "directory not found",
+    ))
+    return False, not_found
 
 
 def _drive_path(relative: str) -> str:
@@ -629,9 +647,10 @@ def pull_db(allow_stale: bool = False) -> Path:
     """
     Pull the canonical DB from Drive to local.  Blocking.
 
-    If the pull fails and no local copy exists → raises DriveUnavailableError.
-    If the pull fails but a local copy exists → warns and continues (allow_stale=True),
-    or raises DriveUnavailableError (allow_stale=False).
+    Three outcomes:
+      1. Pull succeeds            → return local path (normal case)
+      2. File not on Drive yet    → first run; return local path (will be created fresh)
+      3. Pull failed (network)    → use stale local copy if allow_stale=True, else raise
 
     Returns local DB path.
     """
@@ -639,11 +658,12 @@ def pull_db(allow_stale: bool = False) -> Path:
     drive_src = _drive_path(DRIVE_DB_PATH)
 
     _log(f"Pulling DB from Drive: {drive_src}")
+    ok = False
+    not_found = False
     try:
-        ok = _rclone_download(drive_src, LOCAL_DB_PATH)
+        ok, not_found = _rclone_download(drive_src, LOCAL_DB_PATH)
     except Exception as e:
-        ok = False
-        _log(f"DB pull failed: {e}")
+        _log(f"DB pull exception: {e}")
 
     if ok:
         _log(f"DB pulled successfully: {LOCAL_DB_PATH}  "
@@ -651,7 +671,14 @@ def pull_db(allow_stale: bool = False) -> Path:
         mark_clean("db")
         return LOCAL_DB_PATH
 
-    # Pull failed
+    if not_found:
+        # First run — DB doesn't exist on Drive yet. A fresh one will be created
+        # locally by init_db() and uploaded to Drive at end of session.
+        _log("DB not found on Drive — first run, a new DB will be created locally.")
+        mark_clean("db")
+        return LOCAL_DB_PATH
+
+    # Pull failed due to network / auth issue
     if LOCAL_DB_PATH.exists():
         msg = (f"WARNING: could not pull DB from Drive (Drive may be unavailable). "
                f"Using stale local copy: {LOCAL_DB_PATH}")
@@ -706,7 +733,7 @@ def pull_gallery(modality: str = "") -> None:
         drive_src   = _drive_path(f"{DRIVE_GALLERY_PREFIX}/{fname}")
         local_dest  = LOCAL_GALLERY_DIR / fname
         try:
-            ok = _rclone_download(drive_src, local_dest, timeout=30)
+            ok, _ = _rclone_download(drive_src, local_dest, timeout=30)
             if ok:
                 _log(f"Pulled gallery: {fname}")
             else:
@@ -727,7 +754,7 @@ def ensure_local(drive_relative: str, local_path: Path,
     _log(f"ensure_local: pulling missing file: {local_path.name}")
     drive_src = _drive_path(drive_relative)
     try:
-        ok = _rclone_download(drive_src, local_path)
+        ok, _ = _rclone_download(drive_src, local_path)
     except Exception as e:
         ok = False
         _log(f"ensure_local: pull failed: {e}")
@@ -743,6 +770,140 @@ def ensure_local(drive_relative: str, local_path: Path,
         raise DriveUnavailableError(msg)
 
     return local_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collar file discovery (Drive-based, time-window overlap)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_collar_files(session_start_dt: "datetime",
+                      session_end_dt:   "datetime",
+                      kind: str = "kinetic") -> "list[Path]":
+    """
+    Discover collar CSV files on Drive whose time window overlaps the session.
+
+    Canonical filename format (set by _cmd_upload_collar):
+        kinetic_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<ids>.csv
+        behavior_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<ids>.csv
+
+    kind: "kinetic" | "behavior"
+
+    Steps:
+      1. List collar_data/ on Drive via rclone lsf
+      2. Parse s/e timestamps from each matching filename
+      3. Keep files where [file_start, file_end] overlaps [session_start, session_end]
+      4. Pull matching files to local collar_data/ if not already present
+      5. Return list of local Path objects (may be empty)
+    """
+    import re as _re
+
+    prefix   = f"{kind}_data_"
+    drive_dir = f"{DRIVE_ROOT}/{DRIVE_COLLAR_PREFIX}/"
+
+    # List files on Drive
+    try:
+        r = subprocess.run(
+            ["rclone", "lsf", drive_dir],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception as e:
+        _log(f"find_collar_files: rclone lsf failed: {e}")
+        return []
+
+    if r.returncode != 0:
+        _log(f"find_collar_files: could not list {drive_dir}: {r.stderr.strip()}")
+        return []
+
+    all_files = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    candidates = [f for f in all_files if f.startswith(prefix) and f.endswith(".csv")]
+
+    if not candidates:
+        _log(f"find_collar_files: no {kind}_data_*.csv files found on Drive")
+        return []
+
+    # Parse timestamp pattern: s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>
+    _ts_re  = _re.compile(
+        r"s(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2})-e(\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2})"
+    )
+    _ts_fmt = "%Y_%m_%d-%H_%M_%S"
+
+    LOCAL_COLLAR_DIR.mkdir(parents=True, exist_ok=True)
+    matched: list[Path] = []
+
+    for fname in candidates:
+        m = _ts_re.search(fname)
+        if not m:
+            _log(f"  find_collar_files: skipping unparseable filename: {fname}")
+            continue
+        try:
+            file_start = datetime.strptime(m.group(1), _ts_fmt)
+            file_end   = datetime.strptime(m.group(2), _ts_fmt)
+        except ValueError:
+            continue
+
+        # Overlap check: [a_start, a_end] overlaps [b_start, b_end]
+        # iff a_start <= b_end AND a_end >= b_start
+        if file_start <= session_end_dt and file_end >= session_start_dt:
+            local_dest = LOCAL_COLLAR_DIR / fname
+            if not local_dest.exists():
+                _log(f"  Pulling collar file: {fname}")
+                ok, _ = _rclone_download(f"{drive_dir}{fname}", local_dest, timeout=60)
+                if not ok:
+                    _log(f"  WARNING: could not pull {fname} — skipping")
+                    continue
+            else:
+                _log(f"  Collar file already local: {fname}")
+            matched.append(local_dest)
+
+    _log(f"find_collar_files({kind}): {len(matched)} file(s) match "
+         f"[{session_start_dt.strftime('%Y-%m-%d %H:%M')} – "
+         f"{session_end_dt.strftime('%Y-%m-%d %H:%M')}]")
+    for p in matched:
+        _log(f"    {p.name}")
+
+    return matched
+
+
+def load_collar_data(session_start_dt: "datetime",
+                     session_end_dt:   "datetime",
+                     kind: str = "kinetic") -> "pd.DataFrame | None":
+    """
+    Pull all overlapping collar CSVs from Drive and merge into a single DataFrame.
+    Deduplicates rows by (AnimalId, datetime) after merging.
+
+    kind: "kinetic" | "behavior"
+    Returns a merged DataFrame, or None if no files found.
+    """
+    try:
+        import pandas as _pd
+    except ImportError:
+        _log("load_collar_data: pandas not available")
+        return None
+
+    files = find_collar_files(session_start_dt, session_end_dt, kind)
+    if not files:
+        return None
+
+    dfs = []
+    for f in files:
+        try:
+            df = _pd.read_csv(str(f), parse_dates=["datetime"])
+            dfs.append(df)
+        except Exception as e:
+            _log(f"  load_collar_data: could not read {f.name}: {e}")
+
+    if not dfs:
+        return None
+
+    merged = _pd.concat(dfs, ignore_index=True)
+    before = len(merged)
+    merged = merged.drop_duplicates(subset=["AnimalId", "datetime"])
+    after  = len(merged)
+    if before != after:
+        _log(f"  load_collar_data({kind}): deduplicated {before - after} overlapping rows")
+    _log(f"  load_collar_data({kind}): {after} rows, "
+         f"animals: {sorted(merged['AnimalId'].unique().tolist())}")
+    return merged
 
 
 # ─────────────────────────────────────────────────────────────────────────────

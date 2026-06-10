@@ -76,7 +76,9 @@ def parse_args() -> argparse.Namespace:
     # --- required ---
     ap.add_argument("--db",       required=True, help="Path to calving_project.db (SQLite)")
     ap.add_argument("--session",  required=True, help="session_id to process (from video_sessions)")
-    ap.add_argument("--kinetics", required=True, help="kinetic_data_*.csv for this session's animals")
+    ap.add_argument("--kinetics", default="",
+                    help="kinetic_data_*.csv path. If omitted, matching files are "
+                         "discovered automatically from Drive using the session time window.")
     # --- optional paths ---
     ap.add_argument("--gallery_dir",   default="./reid_gallery",
                     help="Directory containing gallery_day.npy / gallery_night.npy (default: ./reid_gallery)")
@@ -1200,7 +1202,7 @@ def run(args) -> None:
     """
     section("reconcile.py — ReID pipeline")
     log(f"session_id  : {args.session}")
-    log(f"kinetics    : {args.kinetics}")
+    log(f"kinetics    : {args.kinetics or '(auto-discover from Drive)'}")
     log(f"db          : {args.db}")
     log(f"gallery_dir : {args.gallery_dir}")
     log(f"dry_run     : {args.dry_run}")
@@ -1252,21 +1254,6 @@ def run(args) -> None:
     log(f"  {len(tracks_df)} rows, {tracks_df['temp_id'].nunique()} temp_ids, "
         f"frames {tracks_df['frame_index'].min()}–{tracks_df['frame_index'].max()}")
 
-    log("Loading kinetics CSV...")
-    kinetics_df = pd.read_csv(args.kinetics, parse_dates=["datetime"])
-    log(f"  {len(kinetics_df)} rows, animals: {sorted(kinetics_df['AnimalId'].unique())}")
-
-    # optional behavior CSV alongside kinetics
-    behavior_df = None
-    beh_candidate = Path(args.kinetics).parent / Path(args.kinetics).name.replace(
-        "kinetic_data", "behavior_data"
-    )
-    if beh_candidate.exists():
-        log(f"Loading behavior CSV: {beh_candidate}")
-        behavior_df = pd.read_csv(str(beh_candidate), parse_dates=["datetime"])
-        log(f"  {len(behavior_df)} rows")
-    else:
-        log(f"No behavior CSV found (looked for {beh_candidate.name}) — d_f12/f23/v will be NaN")
 
     # detect day/night
     is_night = detect_is_night_from_tracks(tracks_df)
@@ -1277,6 +1264,49 @@ def run(args) -> None:
     session_row = get_session(conn, args.session)
     camera_id   = (session_row.get("camera_id") or "cam0") if session_row else "cam0"
     log(f"camera_id={camera_id}")
+
+    # ── load kinetics + behavior — auto-discover from Drive unless --kinetics given ──
+    session_start = pd.to_datetime(
+        session_row.get("start_dt") if session_row else None, errors="coerce"
+    )
+    session_end = pd.to_datetime(
+        session_row.get("end_dt") if session_row else None, errors="coerce"
+    )
+    # Fall back to track timestamps if session row has no datetimes
+    if pd.isnull(session_start):
+        session_start = tracks_df["frame_datetime"].min()
+    if pd.isnull(session_end):
+        session_end = tracks_df["frame_datetime"].max()
+
+    if args.kinetics:
+        log(f"Loading kinetics CSV (manual override): {args.kinetics}")
+        kinetics_df = pd.read_csv(args.kinetics, parse_dates=["datetime"])
+        log(f"  {len(kinetics_df)} rows, animals: {sorted(kinetics_df['AnimalId'].unique())}")
+    else:
+        log("Auto-discovering kinetics CSVs from Drive...")
+        from drive_manager import load_collar_data as _load_collar
+        kinetics_df = _load_collar(session_start.to_pydatetime(),
+                                   session_end.to_pydatetime(), kind="kinetic")
+        if kinetics_df is None or kinetics_df.empty:
+            log("WARNING: no kinetics data found for this session window — "
+                "kinetic matching will be skipped.")
+            kinetics_df = pd.DataFrame(columns=["AnimalId","datetime",
+                                                 "KineticsCountX","KineticsCountY",
+                                                 "KineticsCountZ","KineticsCountR"])
+        else:
+            log(f"  {len(kinetics_df)} rows, animals: "
+                f"{sorted(kinetics_df['AnimalId'].unique().tolist())}")
+
+    # behavior — auto-discover from Drive
+    log("Auto-discovering behavior CSVs from Drive...")
+    from drive_manager import load_collar_data as _load_collar
+    behavior_df = _load_collar(session_start.to_pydatetime(),
+                               session_end.to_pydatetime(), kind="behavior")
+    if behavior_df is None or behavior_df.empty:
+        log("No behavior data found for this session window — d_f12/f23/v will be NaN")
+        behavior_df = None
+    else:
+        log(f"  {len(behavior_df)} rows")
 
     # ── Step A — kinetic matching ─────────────────────────────────────────────
     kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
