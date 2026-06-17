@@ -131,9 +131,14 @@ def load_kps_for_session(
     log(f"  {len(scalar_df)} scalar rows from SQLite")
 
     # ── Parquet path — load kps arrays and merge with scalar_df ──────────────
-    if kps_parquet and Path(kps_parquet).exists():
-        log(f"Loading kps arrays from parquet: {kps_parquet}")
-        kdf = pd.read_parquet(kps_parquet)
+    if kps_parquet:
+        _kp = Path(kps_parquet)
+        _kps_parts = sorted(_kp.glob("kps_part*.parquet")) if _kp.is_dir() else ([_kp] if _kp.exists() else [])
+    else:
+        _kps_parts = []
+    if _kps_parts:
+        log(f"Loading kps arrays from {len(_kps_parts)} parquet part(s): {kps_parquet}")
+        kdf = pd.concat([pd.read_parquet(p) for p in _kps_parts], ignore_index=True)
         if "session_id" in kdf.columns:
             kdf = kdf[kdf["session_id"] == session_id].copy()
 
@@ -414,7 +419,10 @@ def run_vision_features(
             log(f"  Vision features filled for {int(has_vision.sum())}/{len(timeline_df)} timeline rows")
 
     # ── Pose-conditioned gallery update (uses full kps_df incl. unresolved) ──
-    if embed_parquet and Path(embed_parquet).exists():
+    _ep = Path(embed_parquet) if embed_parquet else None
+    _embed_parts = (sorted(_ep.glob("embeds_part*.parquet")) if _ep and _ep.is_dir()
+                    else ([_ep] if _ep and _ep.exists() else []))
+    if _embed_parts:
         _update_pose_gallery(
             session_id   = session_id,
             camera_id    = camera_id,
@@ -428,7 +436,7 @@ def run_vision_features(
             dry_run      = dry_run,
         )
     else:
-        log("No embed_parquet provided — pose gallery update skipped.")
+        log("No embed_parquet provided or no parts found — pose gallery update skipped.")
 
     return timeline_df
 
@@ -460,8 +468,13 @@ def _update_pose_gallery(
     log("Updating pose-conditioned galleries...")
     modality = "night" if is_night else "day"
 
-    # ── Load embeddings ───────────────────────────────────────────────────────
-    edf = pd.read_parquet(embed_parquet)
+    # ── Load embeddings (multi-part or single file) ───────────────────────────
+    _ep = Path(embed_parquet)
+    _parts = sorted(_ep.glob("embeds_part*.parquet")) if _ep.is_dir() else ([_ep] if _ep.exists() else [])
+    if not _parts:
+        log("  embed_parquet path not found — gallery update skipped.")
+        return
+    edf = pd.concat([pd.read_parquet(p) for p in _parts], ignore_index=True)
     if "session_id" in edf.columns:
         edf = edf[edf["session_id"] == session_id].copy()
     if edf.empty:

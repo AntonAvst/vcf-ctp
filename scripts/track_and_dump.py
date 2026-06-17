@@ -245,58 +245,125 @@ KPS_SCHEMA = pa.schema([
 
 
 class EmbedWriter:
-    def __init__(self, path: Path):
-        self.path    = path
-        self._writer = pq.ParquetWriter(str(path), EMBED_SCHEMA, compression="snappy")
-        self.total   = 0
+    """Rolling multi-part Parquet writer.
+
+    Produces embeds_part000.parquet, embeds_part001.parquet, …
+    A new part file is opened whenever the current part would exceed
+    `rows_per_part` rows.  Each rollover releases the Arrow memory pool
+    so WSL doesn't accumulate a high-water mark across the whole session.
+    """
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0   # rows written to the current part
+        self.total         = 0   # rows written across all parts
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"embeds_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           EMBED_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        self._writer.close()
+        pa.default_cpu_memory_pool().release_unused()
+        self._part += 1
+        self._open_part()
 
     def flush(self, rows: list) -> None:
         if not rows:
             return
-        emb_arr = np.stack([r["embed"] for r in rows])
-        tbl = pa.table({
-            "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
-            "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
-            "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
-            "embed": pa.FixedSizeListArray.from_arrays(
-                pa.array(emb_arr.ravel().tolist(), pa.float32()), 128),
-        }, schema=EMBED_SCHEMA)
-        self._writer.write_table(tbl)
-        self.total += len(rows)
+        # Split into sub-batches that respect the part boundary.
+        start = 0
+        while start < len(rows):
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk = rows[start : start + remaining_in_part]
+            emb_arr = np.stack([r["embed"] for r in chunk])
+            tbl = pa.table({
+                "session_id":  pa.array([r["session_id"]  for r in chunk], pa.string()),
+                "frame_index": pa.array([r["frame_index"] for r in chunk], pa.int32()),
+                "temp_id":     pa.array([r["temp_id"]     for r in chunk], pa.int32()),
+                "embed": pa.FixedSizeListArray.from_arrays(
+                    pa.array(emb_arr.ravel().tolist(), pa.float32()), 128),
+            }, schema=EMBED_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+            if self._part_rows >= self.rows_per_part and start < len(rows):
+                self._roll()
 
     def close(self) -> None:
         self._writer.close()
-        size = self.path.stat().st_size / 1e6 if self.path.exists() else 0
-        log(f"embeds.parquet  -> {self.path}  ({self.total} rows, {size:.1f} MB)")
+        pa.default_cpu_memory_pool().release_unused()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"embeds  → {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [{self.outdir.name}]")
 
 
 class KpsWriter:
-    def __init__(self, path: Path):
-        self.path    = path
-        self._writer = pq.ParquetWriter(str(path), KPS_SCHEMA, compression="snappy")
-        self.total   = 0
+    """Rolling multi-part Parquet writer — mirrors EmbedWriter logic."""
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0
+        self.total         = 0
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"kps_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           KPS_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        self._writer.close()
+        pa.default_cpu_memory_pool().release_unused()
+        self._part += 1
+        self._open_part()
 
     def flush(self, rows: list) -> None:
         if not rows:
             return
-        kps_arr   = np.stack([r["kps"]       for r in rows])
-        kconf_arr = np.stack([r["kps_kconf"] for r in rows])
-        tbl = pa.table({
-            "session_id":  pa.array([r["session_id"]  for r in rows], pa.string()),
-            "frame_index": pa.array([r["frame_index"] for r in rows], pa.int32()),
-            "temp_id":     pa.array([r["temp_id"]     for r in rows], pa.int32()),
-            "kps": pa.FixedSizeListArray.from_arrays(
-                pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
-            "kps_kconf": pa.FixedSizeListArray.from_arrays(
-                pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
-        }, schema=KPS_SCHEMA)
-        self._writer.write_table(tbl)
-        self.total += len(rows)
+        start = 0
+        while start < len(rows):
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk     = rows[start : start + remaining_in_part]
+            kps_arr   = np.stack([r["kps"]       for r in chunk])
+            kconf_arr = np.stack([r["kps_kconf"] for r in chunk])
+            tbl = pa.table({
+                "session_id":  pa.array([r["session_id"]  for r in chunk], pa.string()),
+                "frame_index": pa.array([r["frame_index"] for r in chunk], pa.int32()),
+                "temp_id":     pa.array([r["temp_id"]     for r in chunk], pa.int32()),
+                "kps": pa.FixedSizeListArray.from_arrays(
+                    pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
+                "kps_kconf": pa.FixedSizeListArray.from_arrays(
+                    pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
+            }, schema=KPS_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+            if self._part_rows >= self.rows_per_part and start < len(rows):
+                self._roll()
 
     def close(self) -> None:
         self._writer.close()
-        size = self.path.stat().st_size / 1e6 if self.path.exists() else 0
-        log(f"kps.parquet     -> {self.path}  ({self.total} rows, {size:.1f} MB)")
+        pa.default_cpu_memory_pool().release_unused()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"kps     → {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [{self.outdir.name}]")
 
 
 
@@ -394,9 +461,9 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             (shutil.rmtree if item.is_dir() else item.unlink)(item if item.is_dir() else item)
         log(f"Cleared output directory: {outdir}")
 
-    crops_dir     = ensure_dir(outdir / "crops") if args.save_crops else None
-    embed_pq_path = outdir / "embeds.parquet"
-    kps_pq_path   = outdir / "kps.parquet"
+    crops_dir = ensure_dir(outdir / "crops") if args.save_crops else None
+    # Parquet writers use the session outdir; part files are named automatically.
+    # embed_pq_path / kps_pq_path are gone — use embed_writer._parts / kps_writer._parts.
 
     dm.mark_dirty("parquet", session_id=session_id)
     dm.mark_dirty("db",      session_id=session_id)
@@ -446,8 +513,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     embed_rows: list = []
     kps_rows:   list = []
 
-    embed_writer = EmbedWriter(embed_pq_path)
-    kps_writer   = KpsWriter(kps_pq_path)
+    embed_writer = EmbedWriter(outdir)
+    kps_writer   = KpsWriter(outdir)
 
     crop_occurrence    = defaultdict(int)
     warned_kp_mismatch = False
@@ -679,7 +746,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     # ── Upload outputs to Drive ───────────────────────────────────────────────
     log("Uploading session outputs to Drive...")
     dm.sync_db(session_id=session_id)
-    for pq_path in [embed_pq_path, kps_pq_path]:
+    for pq_path in sorted(outdir.glob("embeds_part*.parquet")) + \
+                   sorted(outdir.glob("kps_part*.parquet")):
         if pq_path.exists():
             dm.write_file(pq_path, f"outputs/{session_id}/{pq_path.name}",
                           flag="parquet")
@@ -718,7 +786,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             session            = session_id,
             kinetics           = args.kinetics,
             gallery_dir        = args.gallery_dir,
-            embed_parquet      = str(embed_pq_path),
+            embed_parquet      = str(outdir),   # directory — reconcile globs *_part*.parquet
             corr_threshold     = args.corr_threshold,
             min_active_bins    = 3,
             min_temp_id_frames = 0.10,
@@ -881,7 +949,7 @@ if __name__ == "__main__":
 #
 # ── With crops ───────────────────────────────────────────────────────────────
 # python3 track_and_dump.py ... \
-#   --save_crops --crop_every 100 --min_crop_wh 100 100 --crop_tags
+#   --save_crops --crop_every 300 --min_crop_wh 100 100 --crop_tags
 #   # add --crops_local to skip uploading crops to Drive
 #
 # ── Manual kinetics override (skip auto-discovery) ───────────────────────────

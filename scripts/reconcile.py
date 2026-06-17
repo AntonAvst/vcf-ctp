@@ -470,18 +470,27 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
     Returns DataFrame with columns [temp_id, embed_array (np.ndarray shape 128)].
     Tries parquet first, falls back to 'embed' column in tracks_df.
     """
-    if embed_parquet and Path(embed_parquet).exists():
-        log(f"Loading embeddings from parquet: {embed_parquet}")
-        df = pd.read_parquet(embed_parquet)
-        if "session_id" in df.columns:
-            df = df[df["session_id"] == session_id]
-        if "embed" in df.columns and isinstance(df["embed"].iloc[0], np.ndarray):
-            return df[["temp_id", "embed"]].copy()
-        elif "embed" in df.columns:
-            df["embed"] = df["embed"].apply(
-                lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
-            )
-            return df[["temp_id", "embed"]].copy()
+    if embed_parquet:
+        ep = Path(embed_parquet)
+        # Accept either a session directory (multi-part) or a single legacy file.
+        if ep.is_dir():
+            parts = sorted(ep.glob("embeds_part*.parquet"))
+        elif ep.exists():
+            parts = [ep]
+        else:
+            parts = []
+        if parts:
+            log(f"Loading embeddings from {len(parts)} parquet part(s): {ep}")
+            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+            if "session_id" in df.columns:
+                df = df[df["session_id"] == session_id]
+            if "embed" in df.columns and isinstance(df["embed"].iloc[0], np.ndarray):
+                return df[["temp_id", "embed"]].copy()
+            elif "embed" in df.columns:
+                df["embed"] = df["embed"].apply(
+                    lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
+                )
+                return df[["temp_id", "embed"]].copy()
 
     # fall back to 'embed' column in tracks CSV
     if "embed" not in tracks_df.columns:
@@ -1403,7 +1412,7 @@ def run(args) -> None:
             assignment    = full_assignment,
             is_night      = is_night,
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
-            kps_parquet   = str(Path(args.embed_parquet).parent / "kps.parquet") if args.embed_parquet else None,
+            kps_parquet   = str(Path(args.embed_parquet)) if args.embed_parquet else None,
             embed_parquet = args.embed_parquet or None,
             gallery_dir   = gallery_dir,
             ema_alpha     = args.ema_alpha,
