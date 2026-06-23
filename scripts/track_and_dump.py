@@ -113,7 +113,9 @@ def parse_args():
                          "tags to crop filenames. Requires --pose_model and vision_features/. "
                          "Falls back to 'unk' tags if classifiers are unavailable.")
     ap.add_argument("--crop_every", type=int, default=1,
-                    help="Save crop every N-th detection per track ID (default: 1)")
+                    help="Save crop every N-th sample frame per track ID (default: 1). "
+                         "Note: counts sample frames (i.e. every save_every frames), "
+                         "not raw video frames.")
     ap.add_argument("--min_crop_wh", type=int, nargs=2, metavar=("W","H"), default=(0,0))
     ap.add_argument("--embed_size", type=int, default=128)
     ap.add_argument("--pose_model", default="", help="YOLO-Pose .pt (optional)")
@@ -272,7 +274,7 @@ class EmbedWriter:
 
     def _roll(self) -> None:
         self._writer.close()
-        pa.default_cpu_memory_pool().release_unused()
+        # pa.default_cpu_memory_pool().release_unused()
         self._part += 1
         self._open_part()
 
@@ -301,7 +303,7 @@ class EmbedWriter:
 
     def close(self) -> None:
         self._writer.close()
-        pa.default_cpu_memory_pool().release_unused()
+        # pa.default_cpu_memory_pool().release_unused()
         total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
         log(f"embeds  → {len(self._parts)} part(s), {self.total} rows, "
             f"{total_mb:.1f} MB total  [{self.outdir.name}]")
@@ -328,8 +330,8 @@ class KpsWriter:
         self._part_rows = 0
 
     def _roll(self) -> None:
-        self._writer.close()
-        pa.default_cpu_memory_pool().release_unused()
+        # self._writer.close()
+        # pa.default_cpu_memory_pool().release_unused()
         self._part += 1
         self._open_part()
 
@@ -360,7 +362,7 @@ class KpsWriter:
 
     def close(self) -> None:
         self._writer.close()
-        pa.default_cpu_memory_pool().release_unused()
+        # pa.default_cpu_memory_pool().release_unused()
         total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
         log(f"kps     → {len(self._parts)} part(s), {self.total} rows, "
             f"{total_mb:.1f} MB total  [{self.outdir.name}]")
@@ -615,108 +617,112 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
         confs = (r.boxes.conf.cpu().numpy() if r.boxes.conf is not None
                  else np.zeros(len(xyxy), dtype=np.float32))
         tids  = r.boxes.id.cpu().numpy().astype(int)
-        crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
 
-        embed_vecs = [None] * len(crops)
-        if crops:
-            X = torch.from_numpy(
-                np.stack([to_tensor_bchw(c) for c in crops])
-            ).to(device)
-            with torch.no_grad():
-                Z = embedder(X).cpu().numpy()
-            embed_vecs = list(Z)
+        is_sample = (frame_idx % _save_every == 0)
 
-        kps_flat_list  = [None] * len(crops)
-        kps_mean_list  = [None] * len(crops)
-        kps_kconf_list = [None] * len(crops)
+        if is_sample:
+            crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
 
-        if pose_model and crops:
-            for i, pres in enumerate(pose_model.predict(
-                    source=crops, imgsz=args.pose_imgsz,
-                    conf=args.pose_conf, verbose=False, stream=False)):
-                if (pres.keypoints is None or pres.keypoints.data is None
-                        or not len(pres.keypoints.data)):
-                    continue
-                k  = pres.keypoints
-                xy = k.xy[0].cpu().numpy()
-                sc = k.conf[0].cpu().numpy() if k.conf is not None else None
-                Kn = xy.shape[0]
-                if EXPECTED_KP and Kn != EXPECTED_KP and not warned_kp_mismatch:
-                    log(f"Warning: pose model returned {Kn} kps, expected {EXPECTED_KP}")
-                    warned_kp_mismatch = True
-                vis = (np.where(sc >= args.pose_kp_conf_thresh, 2, 1).astype(int)
-                       if sc is not None else np.ones(Kn, dtype=int) * 2)
-                cx1, cy1, cx2, cy2 = used_boxes[i]
-                sx = max(1, cx2-cx1) / max(1, pres.orig_img.shape[1])
-                sy = max(1, cy2-cy1) / max(1, pres.orig_img.shape[0])
-                xy_full      = np.zeros((Kn,2), np.float32)
-                xy_full[:,0] = cx1 + xy[:,0] * sx
-                xy_full[:,1] = cy1 + xy[:,1] * sy
-                kps_flat_list[i]  = flat_kps_xyv(
-                    np.concatenate([xy_full, vis.reshape(-1,1)], axis=1))
-                kps_mean_list[i]  = float(np.nanmean(sc)) if sc is not None else 0.0
-                kps_kconf_list[i] = sc.tolist() if sc is not None else [0.0]*Kn
+            embed_vecs = [None] * len(crops)
+            if crops:
+                X = torch.from_numpy(
+                    np.stack([to_tensor_bchw(c) for c in crops])
+                ).to(device)
+                with torch.no_grad():
+                    Z = embedder(X).cpu().numpy()
+                embed_vecs = list(Z)
 
-        for j, (box, tid, conf_j) in enumerate(zip(xyxy, tids, confs)):
-            x1,y1,x2,y2 = box.tolist()
-            cx_j = (x1+x2)/2.0; cy_j = (y1+y2)/2.0
-            w_j  = x2-x1;       h_j  = y2-y1
-            kps_mean = None; kps_arr = None; kconf_arr = None
-            if kps_flat_list[j] is not None:
-                kps_mean  = kps_mean_list[j]
-                kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
-                kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
-            _window_latest[int(tid)] = {
-                "frame_index":    frame_idx,
-                "t_sec":          round(t_sec, 3),
-                "frame_datetime": frame_datetime_str,
-                "conf":           float(conf_j),
-                "x1": float(x1), "y1": float(y1),
-                "x2": float(x2), "y2": float(y2),
-                "cx": float(cx_j), "cy": float(cy_j),
-                "w":  float(w_j),  "h":  float(h_j),
-                "kps_mean":  kps_mean,
-                "embed":     embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None,
-                "kps_arr":   kps_arr,
-                "kconf_arr": kconf_arr,
-            }
+            kps_flat_list  = [None] * len(crops)
+            kps_mean_list  = [None] * len(crops)
+            kps_kconf_list = [None] * len(crops)
 
-            if crops_dir is not None:
-                tid_i = int(tid)
-                crop_occurrence[tid_i] += 1
-                if crop_occurrence[tid_i] % max(1, args.crop_every) == 0:
-                    cx1,cy1,cx2,cy2 = used_boxes[j]
-                    cw,ch = int(cx2-cx1), int(cy2-cy1)
-                    mw,mh = args.min_crop_wh
-                    if cw >= int(mw) and ch >= int(mh):
-                        tag = ""
-                        if args.crop_tags and _VISION_AVAILABLE and kps_arr is not None:
-                            try:
-                                _kps  = kps_arr.reshape(1, 19, 3)
-                                _kc   = kconf_arr.reshape(1, 19)
-                                _bbox = np.array([[x1, y1, x2, y2]], dtype=np.float32)
-                                _det  = np.array([float(conf_j)], dtype=np.float32)
-                                p_out = extract_posture(_kps, _kc, _bbox, _det)
-                                f_out = extract_facing(_kps, _kc, _bbox,
-                                                       posture=p_out["posture"])
-                                posture_val = int(p_out["posture"][0])
-                                facing_val  = int(f_out["facing"][0])
-                                p_name = POSTURE_NAMES.get(Posture(posture_val), "unk")
-                                f_name = FACING_NAMES.get(Facing(facing_val),   "unk")
-                                p_tag = p_name if p_name != "uncertain" else "unk"
-                                f_tag = f_name if f_name != "uncertain" else "unk"
-                                tag = f"_{p_tag}_{f_tag}"
-                            except Exception:
+            if pose_model and crops:
+                for i, pres in enumerate(pose_model.predict(
+                        source=crops, imgsz=args.pose_imgsz,
+                        conf=args.pose_conf, verbose=False, stream=False)):
+                    if (pres.keypoints is None or pres.keypoints.data is None
+                            or not len(pres.keypoints.data)):
+                        continue
+                    k  = pres.keypoints
+                    xy = k.xy[0].cpu().numpy()
+                    sc = k.conf[0].cpu().numpy() if k.conf is not None else None
+                    Kn = xy.shape[0]
+                    if EXPECTED_KP and Kn != EXPECTED_KP and not warned_kp_mismatch:
+                        log(f"Warning: pose model returned {Kn} kps, expected {EXPECTED_KP}")
+                        warned_kp_mismatch = True
+                    vis = (np.where(sc >= args.pose_kp_conf_thresh, 2, 1).astype(int)
+                           if sc is not None else np.ones(Kn, dtype=int) * 2)
+                    cx1, cy1, cx2, cy2 = used_boxes[i]
+                    sx = max(1, cx2-cx1) / max(1, pres.orig_img.shape[1])
+                    sy = max(1, cy2-cy1) / max(1, pres.orig_img.shape[0])
+                    xy_full      = np.zeros((Kn,2), np.float32)
+                    xy_full[:,0] = cx1 + xy[:,0] * sx
+                    xy_full[:,1] = cy1 + xy[:,1] * sy
+                    kps_flat_list[i]  = flat_kps_xyv(
+                        np.concatenate([xy_full, vis.reshape(-1,1)], axis=1))
+                    kps_mean_list[i]  = float(np.nanmean(sc)) if sc is not None else 0.0
+                    kps_kconf_list[i] = sc.tolist() if sc is not None else [0.0]*Kn
+
+            for j, (box, tid, conf_j) in enumerate(zip(xyxy, tids, confs)):
+                x1,y1,x2,y2 = box.tolist()
+                cx_j = (x1+x2)/2.0; cy_j = (y1+y2)/2.0
+                w_j  = x2-x1;       h_j  = y2-y1
+                kps_mean = None; kps_arr = None; kconf_arr = None
+                if kps_flat_list[j] is not None:
+                    kps_mean  = kps_mean_list[j]
+                    kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
+                    kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
+                _window_latest[int(tid)] = {
+                    "frame_index":    frame_idx,
+                    "t_sec":          round(t_sec, 3),
+                    "frame_datetime": frame_datetime_str,
+                    "conf":           float(conf_j),
+                    "x1": float(x1), "y1": float(y1),
+                    "x2": float(x2), "y2": float(y2),
+                    "cx": float(cx_j), "cy": float(cy_j),
+                    "w":  float(w_j),  "h":  float(h_j),
+                    "kps_mean":  kps_mean,
+                    "embed":     embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None,
+                    "kps_arr":   kps_arr,
+                    "kconf_arr": kconf_arr,
+                }
+
+                if crops_dir is not None:
+                    tid_i = int(tid)
+                    crop_occurrence[tid_i] += 1
+                    if crop_occurrence[tid_i] % max(1, args.crop_every) == 0:
+                        cx1,cy1,cx2,cy2 = used_boxes[j]
+                        cw,ch = int(cx2-cx1), int(cy2-cy1)
+                        mw,mh = args.min_crop_wh
+                        if cw >= int(mw) and ch >= int(mh):
+                            tag = ""
+                            if args.crop_tags and _VISION_AVAILABLE and kps_arr is not None:
+                                try:
+                                    _kps  = kps_arr.reshape(1, 19, 3)
+                                    _kc   = kconf_arr.reshape(1, 19)
+                                    _bbox = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+                                    _det  = np.array([float(conf_j)], dtype=np.float32)
+                                    p_out = extract_posture(_kps, _kc, _bbox, _det)
+                                    f_out = extract_facing(_kps, _kc, _bbox,
+                                                           posture=p_out["posture"])
+                                    posture_val = int(p_out["posture"][0])
+                                    facing_val  = int(f_out["facing"][0])
+                                    p_name = POSTURE_NAMES.get(Posture(posture_val), "unk")
+                                    f_name = FACING_NAMES.get(Facing(facing_val),   "unk")
+                                    p_tag = p_name if p_name != "uncertain" else "unk"
+                                    f_tag = f_name if f_name != "uncertain" else "unk"
+                                    tag = f"_{p_tag}_{f_tag}"
+                                except Exception:
+                                    tag = "_unk_unk"
+                            elif args.crop_tags:
                                 tag = "_unk_unk"
-                        elif args.crop_tags:
-                            tag = "_unk_unk"
-                        cv2.imwrite(
-                            str(crops_dir/f"{camera_id}_id{tid_i:04d}_f{frame_idx:06d}{tag}.jpg"),
-                            frame[cy1:cy2, cx1:cx2])
+                            cv2.imwrite(
+                                str(crops_dir/f"{camera_id}_id{tid_i:04d}_f{frame_idx:06d}{tag}.jpg"),
+                                frame[cy1:cy2, cx1:cx2])
+
+            _commit_window()
 
         frame_idx += 1; pbar.update(1)
-        if frame_idx % _save_every == 0:
-            _commit_window()
 
     # ── flush & close ─────────────────────────────────────────────────────────
     pbar.close()

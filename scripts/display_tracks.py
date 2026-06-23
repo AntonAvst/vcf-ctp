@@ -240,9 +240,22 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     kps_df = None
-    if want_pose and kps_parquet_path and Path(kps_parquet_path).exists():
-        kps_df = pd.read_parquet(kps_parquet_path)
-        kps_df = kps_df[kps_df["session_id"]==session_id].set_index(["frame_index","temp_id"])
+    if want_pose and kps_parquet_path:
+        kps_dir  = Path(kps_parquet_path).parent
+        kps_stem = Path(kps_parquet_path).name  # e.g. "kps.parquet" (ignored if parts exist)
+        # Collect all part files (kps_part000.parquet, …) or fall back to the exact path
+        part_files = sorted(kps_dir.glob("kps_part*.parquet"))
+        if not part_files and Path(kps_parquet_path).exists():
+            part_files = [Path(kps_parquet_path)]
+        if part_files:
+            kps_df = pd.concat([pd.read_parquet(str(p)) for p in part_files], ignore_index=True)
+            kps_df = kps_df[kps_df["session_id"]==session_id].copy()
+            kps_df["frame_index"] = kps_df["frame_index"].astype(int)
+            kps_df["temp_id"]     = kps_df["temp_id"].astype(int)
+            kps_df = kps_df.set_index(["frame_index","temp_id"])
+            log(f"kps parquet loaded: {len(part_files)} part(s), {len(kps_df)} rows for session")
+        else:
+            log(f"WARNING: no kps parquet files found in {kps_dir}")
     try:
         rows = conn.execute("""
             SELECT frame_index,frame_datetime,temp_id,det_conf,x1,y1,x2,y2,kps_conf,kps_parquet_row
@@ -638,7 +651,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 
     vid = Path(args.video)
     db  = Path(args.db)
-    kps_pq = str(db.parent/"kps.parquet")
+    kps_pq = str(db.parent / "outputs" / args.session_id / "kps.parquet")
 
     cap = cv2.VideoCapture(str(vid))
     if not cap.isOpened():
@@ -671,6 +684,10 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 
     # target ~25 fps output to browser (don't saturate the MJPEG stream)
     _frame_interval = 1.0 / min(fps, 25.0)
+
+    # carry-forward cache: tid -> last known detection dict (bbox + kps)
+    # keeps boxes and poses visible on non-sampled frames
+    det_cache = {}
 
     while True:
         if STATE.quit: break
@@ -709,8 +726,17 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
                 try: next_fi,next_fdt,next_rows = next(row_stream)
                 except StopIteration:
                     stream_done=True; next_rows=[]; next_fi=10**12
+            # update det_cache with fresh data for this sampled frame
+            # evict tids that are no longer present in this sample
+            active_tids = {int(d["temp_id"]) for d in dets}
+            for tid in list(det_cache.keys()):
+                if tid not in active_tids:
+                    del det_cache[tid]
+            for d in dets:
+                det_cache[int(d["temp_id"])] = d
         else:
-            dets=[]
+            # non-sampled frame — use cached detections so nothing flickers
+            dets = list(det_cache.values())
 
         if session_start_dt is not None:
             current_fdt = session_start_dt + timedelta(seconds=frame_idx/fps)
