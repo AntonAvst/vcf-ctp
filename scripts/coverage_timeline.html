@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCF-CTP — Data Coverage Timeline</title>
+<style>
+:root{
+  --s0:#f4f3ee;--s1:#f0efea;--s2:#ffffff;
+  --tp:#0b0b0b;--ts:#52514e;--tm:#898781;
+  --bd:rgba(11,11,11,.10);--bds:rgba(11,11,11,.18);
+  --r:8px;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:'SF Mono','Fira Code',monospace;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --s0:#111110;--s1:#1a1a19;--s2:#222221;
+    --tp:#ffffff;--ts:#c3c2b7;--tm:#898781;
+    --bd:rgba(255,255,255,.10);--bds:rgba(255,255,255,.18);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--s0);color:var(--tp);padding:2rem;min-width:600px}
+h1{font-size:18px;font-weight:500;margin-bottom:.2rem}
+.sub{font-size:13px;color:var(--tm);margin-bottom:1.5rem}
+.meta-bar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.25rem;font-size:12px;color:var(--tm)}
+.reload-btn{font-size:12px;padding:4px 10px;border-radius:var(--r);border:.5px solid var(--bds);background:transparent;color:var(--ts);cursor:pointer;font-family:var(--sans)}
+.reload-btn:hover{background:var(--s1)}
+.err{background:#fce8e8;border:.5px solid #e24b4a;border-radius:var(--r);padding:10px 14px;font-size:13px;color:#a32d2d;margin-bottom:1rem;display:none}
+.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:1.5rem}
+.scard{background:var(--s1);border-radius:var(--r);padding:9px 12px}
+.scard .sl{font-size:11px;color:var(--tm);margin-bottom:3px}
+.scard .sv{font-size:18px;font-weight:500}
+.ok{color:#0ca30c}.warn{color:#d03b3b}.neu{color:var(--tp)}
+.controls{display:flex;align-items:center;gap:6px;margin-bottom:1.25rem;flex-wrap:wrap}
+.zbtn,.nbtn{font-size:12px;padding:5px 12px;border-radius:var(--r);border:.5px solid var(--bds);background:transparent;color:var(--ts);cursor:pointer;font-family:var(--sans)}
+.zbtn.on{background:var(--s2);color:var(--tp);font-weight:500;border-color:var(--tm)}
+.zbtn:hover,.nbtn:hover{background:var(--s1);color:var(--tp)}
+.win-lbl{font-size:12px;color:var(--tm);white-space:nowrap;margin-left:2px}
+.jump-wrap{display:flex;align-items:center;gap:6px;margin-left:auto}
+.jump-wrap label{font-size:12px;color:var(--tm);white-space:nowrap}
+.jump-wrap input[type=date]{
+  font-size:12px;padding:4px 8px;border-radius:var(--r);
+  border:.5px solid var(--bds);background:var(--s2);
+  color:var(--tp);font-family:var(--sans);cursor:pointer;
+  color-scheme:light dark;
+}
+.chart-wrap{border:.5px solid var(--bds);border-radius:12px;overflow:hidden;background:var(--s2);margin-bottom:1rem}
+.lane{display:flex;align-items:stretch;border-bottom:.5px solid var(--bd)}
+.lane:last-child{border-bottom:none}
+.lane-lbl{width:104px;flex-shrink:0;padding:0 12px;display:flex;align-items:center;background:var(--s1);border-right:.5px solid var(--bd)}
+.lane-lbl span{font-size:11px;font-weight:500;color:var(--ts)}
+.lane-body{flex:1;position:relative;height:38px;overflow:visible}
+.lane-body.short{height:30px}
+.axis-row{display:flex;height:26px;border-top:.5px solid var(--bd);background:var(--s1)}
+.axis-spc{width:104px;flex-shrink:0;border-right:.5px solid var(--bd)}
+.axis-bdy{flex:1;position:relative;overflow:hidden}
+.tick{position:absolute;top:0;height:100%;display:flex;align-items:flex-start;padding-top:3px}
+.tick-line{position:absolute;left:0;top:0;width:.5px;height:7px;background:var(--bds)}
+.tick-lbl{font-size:10px;color:var(--tm);padding-left:3px;white-space:nowrap;font-family:var(--sans)}
+.block{position:absolute;top:6px;bottom:6px;border-radius:3px;cursor:default}
+.block:hover{opacity:.75}
+.gap-stripe{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(90deg,transparent 0,transparent 3px,rgba(210,60,60,.18) 3px,rgba(210,60,60,.18) 4px)}
+.edot{position:absolute;top:50%;transform:translate(-50%,-50%);width:9px;height:9px;border-radius:50%;cursor:default;z-index:2;border:2px solid var(--s2)}
+.edot:hover{transform:translate(-50%,-50%) scale(1.5)}
+.eghost{position:absolute;top:0;bottom:0;width:.5px;pointer-events:none;opacity:.2}
+.tt{position:absolute;background:var(--s2);border:.5px solid var(--bds);border-radius:var(--r);padding:5px 10px;font-size:11px;color:var(--tp);pointer-events:none;z-index:30;white-space:nowrap;display:none;bottom:calc(100% + 6px);transform:translateX(-50%);box-shadow:0 2px 8px rgba(0,0,0,.12)}
+.tt.vis{display:block}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--ts);align-items:center;margin-bottom:1.5rem}
+.li{display:flex;align-items:center;gap:4px}
+.lsq{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.ldot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.lgap{width:10px;height:10px;border-radius:2px;flex-shrink:0;background:repeating-linear-gradient(90deg,transparent 0,transparent 2px,rgba(210,60,60,.4) 2px,rgba(210,60,60,.4) 3px);border:.5px solid rgba(210,60,60,.4)}
+</style>
+</head>
+<body>
+
+<h1>VCF-CTP — data coverage timeline</h1>
+<p class="sub">Video sessions · collar sensor data · calving events</p>
+
+<div id="err" class="err"></div>
+
+<div class="meta-bar">
+  <span id="gen-at"></span>
+  <button class="reload-btn" onclick="loadData()">↺ Refresh</button>
+</div>
+
+<div class="summary" id="summary"></div>
+
+<div class="controls">
+  <button class="zbtn" onclick="setZoom('year',this)">Year</button>
+  <button class="zbtn" onclick="setZoom('month',this)">Month</button>
+  <button class="zbtn on" onclick="setZoom('week',this)">Week</button>
+  <button class="zbtn" onclick="setZoom('day',this)">Day</button>
+  <button class="nbtn" onclick="pan(-1)">&#8592;</button>
+  <button class="nbtn" onclick="pan(1)">&#8594;</button>
+  <span class="win-lbl" id="win-lbl"></span>
+  <div class="jump-wrap">
+    <label for="jump-input">Jump to</label>
+    <input type="date" id="jump-input" onchange="jumpTo(this.value)">
+  </div>
+</div>
+
+<div class="chart-wrap">
+  <div class="lane"><div class="lane-lbl"><span>Video</span></div><div class="lane-body" id="b-video"></div></div>
+  <div class="lane"><div class="lane-lbl"><span>Kinetics</span></div><div class="lane-body" id="b-kinetic"></div></div>
+  <div class="lane"><div class="lane-lbl"><span>Behavior</span></div><div class="lane-body" id="b-behavior"></div></div>
+  <div class="lane"><div class="lane-lbl"><span>Calving events</span></div><div class="lane-body short" id="b-calving"></div></div>
+  <div class="axis-row"><div class="axis-spc"></div><div class="axis-bdy" id="axis"></div></div>
+</div>
+
+<div class="legend">
+  <div class="li"><span class="lsq" style="background:#2a78d6"></span>Video session</div>
+  <div class="li"><span class="lsq" style="background:#1baf7a"></span>Kinetics collar</div>
+  <div class="li"><span class="lsq" style="background:#eda100"></span>Behavior collar</div>
+  <div class="li"><span class="ldot" style="background:#7F77DD"></span>Unassisted</div>
+  <div class="li"><span class="ldot" style="background:#D85A30"></span>Assisted</div>
+  <div class="li"><span class="ldot" style="background:#1baf7a"></span>Twin</div>
+  <div class="li"><span class="ldot" style="background:#eda100"></span>Vet-assisted</div>
+  <div class="li"><span class="lgap"></span>Gap</div>
+</div>
+
+<script>
+const DAY=86400000,HOUR=3600000,MIN=60000;
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+const ZOOM={
+  year: {span:365*DAY, step:30*DAY,  tickFmt:t=>{const d=new Date(t);return MON[d.getMonth()]+' '+d.getFullYear()}},
+  month:{span:30*DAY,  step:DAY,     tickFmt:t=>{const d=new Date(t);return d.getDate()+' '+MON[d.getMonth()]}},
+  week: {span:7*DAY,   step:DAY,     tickFmt:t=>{const d=new Date(t);return d.getDate()+' '+MON[d.getMonth()]}},
+  day:  {span:DAY,     step:2*HOUR,  tickFmt:t=>{const d=new Date(t);return d.getHours()+':00'}},
+};
+
+const OCOL={
+  'unassisted':'#7F77DD','assisted':'#D85A30','twin':'#1baf7a',
+  'veterinarian-assisted':'#eda100','vet':'#eda100',
+};
+
+let zoom='week', viewStart=Date.now()-3.5*DAY, DATA={};
+
+function ms(s){ return s ? new Date(s).getTime() : null; }
+
+// ── Data load ────────────────────────────────────────────────────────────────
+async function loadData(){
+  document.getElementById('err').style.display='none';
+  try{
+    const r=await fetch('metrics.json?_='+Date.now());
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    DATA=await r.json();
+    const gen=DATA.generated_at||'';
+    document.getElementById('gen-at').textContent=
+      gen ? 'Last export: '+new Date(gen).toLocaleString() : '';
+    autoCenter();
+    renderSummary();
+    render();
+  }catch(e){
+    showErr('Could not load metrics.json — '+e.message+'. Run: python3 metrics_export.py');
+    // Render with empty data so the chrome still shows
+    renderSummary();
+    render();
+  }
+}
+
+function showErr(msg){
+  const el=document.getElementById('err');
+  el.style.display='block';
+  el.textContent=msg;
+}
+
+function allTimestamps(){
+  const t=[];
+  ((DATA.sessions||{}).sessions||[]).forEach(s=>{
+    if(s.start) t.push(ms(s.start));
+    if(s.end)   t.push(ms(s.end));
+  });
+  ((DATA.sensor||{}).kinetic_files||[]).forEach(k=>{
+    if(k.start) t.push(ms(k.start));
+    if(k.end)   t.push(ms(k.end));
+  });
+  ((DATA.dataset||{}).calving_events||[]).forEach(c=>{
+    if(c.calving_dt) t.push(ms(c.calving_dt));
+  });
+  return t.filter(Boolean);
+}
+
+function autoCenter(){
+  const all=allTimestamps();
+  if(!all.length) return;
+  const minT=Math.min(...all), maxT=Math.max(...all);
+  const dataSpan=maxT-minT;
+  const winSpan=ZOOM[zoom].span;
+  // If data fits comfortably in the window, centre it; otherwise start at minT with a small left margin
+  if(dataSpan<=winSpan){
+    viewStart=minT-(winSpan-dataSpan)/2;
+  } else {
+    viewStart=minT-DAY*0.5;
+  }
+}
+
+// ── Rendering ────────────────────────────────────────────────────────────────
+function bodyW(id){
+  const el=document.getElementById(id);
+  return el ? Math.max(el.getBoundingClientRect().width||el.offsetWidth, 200) : 580;
+}
+
+function toX(t,W){ return ((t-viewStart)/ZOOM[zoom].span)*W; }
+
+function mkTip(body){
+  const t=document.createElement('div');
+  t.className='tt';
+  body.appendChild(t);
+  return t;
+}
+
+function renderBlocks(bodyId, blocks, color){
+  const body=document.getElementById(bodyId);
+  if(!body) return;
+  body.innerHTML='';
+  const W=bodyW(bodyId);
+  const vEnd=viewStart+ZOOM[zoom].span;
+  const tip=mkTip(body);
+
+  // Draw blocks
+  blocks.forEach(b=>{
+    const s=ms(b.start), e=ms(b.end);
+    if(!s||!e||e<viewStart||s>vEnd) return;
+    const x1=Math.max(0,toX(s,W));
+    const x2=Math.min(W,toX(e,W));
+    if(x2-x1<1) return;
+    const el=document.createElement('div');
+    el.className='block';
+    el.style.cssText=`left:${x1}px;width:${Math.max(2,x2-x1)}px;background:${color}`;
+    const lbl=b.label||b.session_id||b.file||'';
+    el.addEventListener('mouseenter',()=>{
+      tip.textContent=lbl+(e-s>0?' ('+fmtSpan(e-s)+')':'');
+      tip.style.left=(x1+(x2-x1)/2)+'px';
+      tip.classList.add('vis');
+    });
+    el.addEventListener('mouseleave',()=>tip.classList.remove('vis'));
+    body.appendChild(el);
+  });
+
+  // Gap stripes between consecutive blocks
+  const sorted=blocks
+    .map(b=>({s:ms(b.start),e:ms(b.end)}))
+    .filter(b=>b.s&&b.e&&b.e>viewStart&&b.s<vEnd)
+    .sort((a,b)=>a.s-b.s);
+  for(let i=1;i<sorted.length;i++){
+    const gs=sorted[i-1].e, ge=sorted[i].s;
+    if(ge-gs<30*MIN) continue;
+    const x1=Math.max(0,toX(gs,W));
+    const x2=Math.min(W,toX(ge,W));
+    if(x2<=x1) continue;
+    const g=document.createElement('div');
+    g.className='gap-stripe';
+    g.style.cssText=`left:${x1}px;width:${x2-x1}px`;
+    body.appendChild(g);
+  }
+}
+
+function renderCalving(bodyId, events){
+  const body=document.getElementById(bodyId);
+  if(!body) return;
+  body.innerHTML='';
+  const W=bodyW(bodyId);
+  const vEnd=viewStart+ZOOM[zoom].span;
+  const tip=mkTip(body);
+
+  events.forEach(ev=>{
+    const t=ms(ev.calving_dt);
+    if(!t||t<viewStart||t>vEnd) return;
+    const x=toX(t,W);
+    const col=OCOL[(ev.outcome||'').toLowerCase()]||'#7F77DD';
+
+    const ghost=document.createElement('div');
+    ghost.className='eghost';
+    ghost.style.cssText=`left:${x}px;background:${col}`;
+    body.appendChild(ghost);
+
+    const dot=document.createElement('div');
+    dot.className='edot';
+    dot.style.cssText=`left:${x}px;background:${col}`;
+    const lbl=`Cow ${ev.real_id} — ${ev.outcome||'?'} (${fmtDt(t)})`;
+    dot.addEventListener('mouseenter',()=>{
+      tip.textContent=lbl;
+      tip.style.left=x+'px';
+      tip.classList.add('vis');
+    });
+    dot.addEventListener('mouseleave',()=>tip.classList.remove('vis'));
+    body.appendChild(dot);
+  });
+}
+
+function renderAxis(){
+  const axis=document.getElementById('axis');
+  if(!axis) return;
+  axis.innerHTML='';
+  const W=Math.max(axis.getBoundingClientRect().width||axis.offsetWidth, 200);
+  const vEnd=viewStart+ZOOM[zoom].span;
+  const {step,tickFmt}=ZOOM[zoom];
+
+  // Align tick start to a clean boundary
+  let t=Math.ceil(viewStart/step)*step;
+  while(t<=vEnd){
+    const x=toX(t,W);
+    if(x>=0&&x<=W){
+      const tick=document.createElement('div');
+      tick.className='tick';
+      tick.style.left=x+'px';
+      tick.innerHTML=`<div class="tick-line"></div><span class="tick-lbl">${tickFmt(t)}</span>`;
+      axis.appendChild(tick);
+    }
+    t+=step;
+  }
+}
+
+function renderWindowLabel(){
+  const vEnd=viewStart+ZOOM[zoom].span;
+  const fmtFull=t=>{
+    const d=new Date(t);
+    if(zoom==='day') return `${d.getDate()} ${MON[d.getMonth()]} ${d.getFullYear()}, ${d.getHours()}:00`;
+    if(zoom==='year') return `${MON[d.getMonth()]} ${d.getFullYear()}`;
+    return `${d.getDate()} ${MON[d.getMonth()]} ${d.getFullYear()}`;
+  };
+  document.getElementById('win-lbl').textContent=fmtFull(viewStart)+' → '+fmtFull(vEnd);
+
+  // Sync date input to centre of view (only when not being edited)
+  const inp=document.getElementById('jump-input');
+  if(inp&&document.activeElement!==inp){
+    const centre=new Date(viewStart+ZOOM[zoom].span/2);
+    inp.value=`${centre.getFullYear()}-${String(centre.getMonth()+1).padStart(2,'0')}-${String(centre.getDate()).padStart(2,'0')}`;
+  }
+}
+
+function renderSummary(){
+  const sens=DATA.sensor||{};
+  const ds=DATA.dataset||{};
+  const sess=((DATA.sessions||{}).sessions)||[];
+  // Only count rows that have a real calving_dt (guard against garbage rows)
+  const cal=(ds.calving_events||[]).filter(e=>e.calving_dt);
+  const kinFiles=sens.kinetic_files||[];
+
+  let vidMs=0;
+  sess.forEach(s=>{ const a=ms(s.start),b=ms(s.end); if(a&&b) vidMs+=b-a; });
+
+  let sensorDays='—';
+  if(kinFiles.length){
+    const starts=kinFiles.map(k=>ms(k.start)).filter(Boolean);
+    const ends=kinFiles.map(k=>ms(k.end)).filter(Boolean);
+    if(starts.length&&ends.length)
+      sensorDays=Math.round((Math.max(...ends)-Math.min(...starts))/DAY)+'d';
+  }
+
+  let noVideo=0;
+  cal.forEach(ev=>{
+    const t=ms(ev.calving_dt);
+    if(t&&!sess.some(s=>ms(s.start)<=t&&ms(s.end)>=t)) noVideo++;
+  });
+
+  let noKin=0;
+  cal.forEach(ev=>{
+    const t=ms(ev.calving_dt);
+    if(t&&!kinFiles.some(k=>ms(k.start)<=t&&ms(k.end)>=t)) noKin++;
+  });
+
+  const cards=[
+    {l:'Video sessions',       v:sess.length,                    c:'neu'},
+    {l:'Video hours total',    v:(vidMs/HOUR).toFixed(1)+'h',   c:'neu'},
+    {l:'Sensor range',         v:sensorDays,                    c:'neu'},
+    {l:'Calving events',       v:cal.length||'—',               c:'neu'},
+    {l:'Events without video', v:noVideo,                       c:noVideo?'warn':'ok'},
+    {l:'Events without collar',v:noKin,                         c:noKin?'warn':'ok'},
+    {l:'Collar gaps',          v:(sens.gaps||[]).length,         c:(sens.gaps||[]).length?'warn':'ok'},
+  ];
+
+  document.getElementById('summary').innerHTML=cards.map(c=>
+    `<div class="scard"><div class="sl">${c.l}</div><div class="sv ${c.c}">${c.v}</div></div>`
+  ).join('');
+}
+
+function render(){
+  const sess=((DATA.sessions||{}).sessions)||[];
+  const sens=DATA.sensor||{};
+  const cal=((DATA.dataset||{}).calving_events||[]).filter(e=>e.calving_dt);
+
+  renderBlocks('b-video',    sess.map(s=>({start:s.start,end:s.end,label:s.session_id||s.video_path||''})), '#2a78d6');
+  renderBlocks('b-kinetic',  sens.kinetic_files||[],  '#1baf7a');
+  renderBlocks('b-behavior', sens.behavior_files||[], '#eda100');
+  renderCalving('b-calving', cal);
+  renderAxis();
+  renderWindowLabel();
+}
+
+// ── Controls ─────────────────────────────────────────────────────────────────
+function setZoom(z,btn){
+  const prevCentre=viewStart+ZOOM[zoom].span/2;
+  zoom=z;
+  viewStart=prevCentre-ZOOM[zoom].span/2;
+  document.querySelectorAll('.zbtn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  render();
+}
+
+function pan(dir){
+  viewStart+=dir*ZOOM[zoom].span*0.5;
+  render();
+}
+
+function jumpTo(val){
+  if(!val) return;
+  const t=new Date(val).getTime();
+  if(isNaN(t)) return;
+  viewStart=t-ZOOM[zoom].span/2;
+  render();
+}
+
+// ── Formatters ────────────────────────────────────────────────────────────────
+function fmtDt(t){
+  const d=new Date(t);
+  return `${d.getDate()} ${MON[d.getMonth()]} ${d.getHours()}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+function fmtSpan(ms){
+  if(ms<HOUR) return Math.round(ms/MIN)+'m';
+  if(ms<DAY)  return (ms/HOUR).toFixed(1)+'h';
+  return Math.round(ms/DAY)+'d';
+}
+
+window.addEventListener('load', loadData);
+window.addEventListener('resize', render);
+</script>
+</body>
+</html>

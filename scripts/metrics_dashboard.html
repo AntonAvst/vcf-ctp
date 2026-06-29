@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCF-CTP — Dev Metrics</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+:root{
+  --s0:#f4f3ee;--s1:#f0efea;--s2:#ffffff;
+  --tp:#0b0b0b;--ts:#52514e;--tm:#898781;
+  --bd:rgba(11,11,11,.10);--bds:rgba(11,11,11,.18);
+  --r:8px;--sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:'SF Mono','Fira Code',monospace;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --s0:#111110;--s1:#1a1a19;--s2:#222221;
+    --tp:#ffffff;--ts:#c3c2b7;--tm:#898781;
+    --bd:rgba(255,255,255,.10);--bds:rgba(255,255,255,.18);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--s0);color:var(--tp);padding:2rem;max-width:900px}
+h1{font-size:18px;font-weight:500;margin-bottom:.25rem}
+.sub{font-size:13px;color:var(--tm);margin-bottom:1.5rem}
+.tab-bar{display:flex;gap:2px;margin-bottom:1.5rem;flex-wrap:wrap}
+.tab{font-size:12px;padding:5px 14px;border-radius:var(--r);cursor:pointer;
+  color:var(--ts);border:.5px solid transparent;background:transparent;
+  font-family:var(--sans)}
+.tab.on{background:var(--s2);border-color:var(--bds);color:var(--tp);font-weight:500}
+.tab:hover{background:var(--s1)}
+.panel{display:none}.panel.on{display:block}
+.section{font-size:11px;font-weight:500;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--tm);margin:1.5rem 0 .6rem}
+.kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:1.25rem}
+.kpi{background:var(--s1);border-radius:var(--r);padding:.8rem 1rem}
+.kpi .kl{font-size:11px;color:var(--tm);margin-bottom:3px}
+.kpi .kv{font-size:21px;font-weight:500;line-height:1.1}
+.kpi .kd{font-size:11px;margin-top:2px}
+.ok{color:#0ca30c}.warn{color:#d03b3b}.neu{color:var(--tp)}
+.card{background:var(--s2);border:.5px solid var(--bds);border-radius:12px;
+  padding:1.1rem 1.25rem;margin-bottom:12px}
+.ctitle{font-size:12px;color:var(--ts);margin-bottom:.9rem}
+.bar-row{display:flex;align-items:center;gap:8px;margin-bottom:7px;font-size:12px}
+.bar-lbl{width:160px;flex-shrink:0;color:var(--ts);font-size:11px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
+.bar-track{flex:1;height:7px;background:var(--s1);border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px}
+.bar-num{width:44px;text-align:right;font-size:11px;color:var(--tm)}
+.info-row{display:flex;justify-content:space-between;padding:5px 0;
+  border-bottom:.5px solid var(--bd);font-size:12px}
+.info-row:last-child{border-bottom:none}
+.info-row .k{color:var(--tm)}.info-row .v{font-weight:500}
+.step-list{display:flex;flex-direction:column;gap:5px}
+.step-row{display:flex;align-items:center;gap:9px;font-size:12px;
+  padding:6px 10px;border-radius:var(--r);background:var(--s1)}
+.step-name{font-weight:500;min-width:60px;font-size:11px;font-family:var(--mono)}
+.step-desc{color:var(--ts);font-size:11px;flex:1}
+.badge{font-size:10px;font-weight:500;padding:2px 7px;border-radius:4px;flex-shrink:0}
+.b-ok{background:#eaf3de;color:#3b6d11}
+.b-warn{background:#faeeda;color:#854f0b}
+.b-none{background:var(--s0);color:var(--tm);border:.5px solid var(--bd)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.chart-wrap{position:relative;height:180px;margin:.5rem 0}
+.legend-row{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--ts);margin-top:8px}
+.l-item{display:flex;align-items:center;gap:4px}
+.l-sq{width:9px;height:9px;border-radius:2px;flex-shrink:0}
+.donut-row{display:flex;align-items:center;gap:1.25rem}
+.d-legend{display:flex;flex-direction:column;gap:7px}
+.d-item{display:flex;align-items:center;gap:7px;font-size:12px}
+.d-dot{width:9px;height:9px;border-radius:2px;flex-shrink:0}
+.d-name{color:var(--ts)}
+.d-val{font-weight:500;margin-left:auto;padding-left:12px}
+.th-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12px}
+.th-lbl{width:170px;flex-shrink:0;color:var(--ts);font-size:11px;font-family:var(--mono)}
+.th-val{width:44px;text-align:center;font-weight:500;background:var(--s1);
+  border-radius:4px;padding:2px 0;font-size:11px}
+.th-hint{font-size:11px;color:var(--tm);margin:-2px 0 8px 178px}
+input[type=range]{flex:1;accent-color:#2a78d6}
+.cmd-box{font-family:var(--mono);font-size:11px;color:var(--ts);line-height:1.9;
+  white-space:pre-wrap;background:var(--s1);border-radius:var(--r);
+  padding:.75rem 1rem;margin-top:.75rem}
+.meta-bar{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:1.25rem;font-size:12px;color:var(--tm)}
+.reload-btn{font-size:12px;padding:4px 10px;border-radius:var(--r);
+  border:.5px solid var(--bds);background:transparent;
+  color:var(--ts);cursor:pointer;font-family:var(--sans)}
+.reload-btn:hover{background:var(--s1)}
+.err{background:#fce8e8;border:.5px solid #e24b4a;border-radius:var(--r);
+  padding:10px 14px;font-size:13px;color:#a32d2d;margin-bottom:1rem;display:none}
+.empty{font-size:12px;color:var(--tm);font-style:italic;padding:.4rem 0}
+</style>
+</head>
+<body>
+<h1>VCF-CTP — development metrics</h1>
+<p class="sub">Pipeline health · identity resolution · sensor coverage · dataset · thresholds</p>
+
+<div id="err" class="err"></div>
+
+<div class="meta-bar">
+  <span id="gen-at"></span>
+  <button class="reload-btn" onclick="loadData()">↺ Refresh</button>
+</div>
+
+<div class="tab-bar">
+  <button class="tab on"  onclick="tab('pipeline',this)">Pipeline</button>
+  <button class="tab"     onclick="tab('identity',this)">Identity</button>
+  <button class="tab"     onclick="tab('sensor',this)">Sensor</button>
+  <button class="tab"     onclick="tab('dataset',this)">Dataset</button>
+  <button class="tab"     onclick="tab('thresholds',this)">Thresholds</button>
+</div>
+
+<!-- ── PIPELINE ─────────────────────────────────────────────────── -->
+<div id="p-pipeline" class="panel on">
+
+  <div class="section">Session summary</div>
+  <div class="kpi-row" id="kpi-pipeline"></div>
+
+  <div class="section">Reconcile step pass rates</div>
+  <div class="card">
+    <div class="ctitle">Rows produced per step across all sessions</div>
+    <div class="step-list" id="step-list"></div>
+  </div>
+
+  <div class="section">Recent videos</div>
+  <div class="card" id="proc-log-card">
+    <div class="ctitle">Last 6 processed videos (from processing_log.csv)</div>
+    <div id="proc-log-rows"></div>
+  </div>
+
+  <div class="section">Drive sync</div>
+  <div class="two-col">
+    <div class="card">
+      <div class="ctitle">Dirty flags</div>
+      <div id="dirty-flags"></div>
+    </div>
+    <div class="card">
+      <div class="ctitle">Upload buffer</div>
+      <div id="buffer-info"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── IDENTITY ─────────────────────────────────────────────────── -->
+<div id="p-identity" class="panel">
+
+  <div class="section">Resolution rates</div>
+  <div class="kpi-row" id="kpi-identity"></div>
+
+  <div class="section">Pearson r distribution (kinetic match quality)</div>
+  <div class="card">
+    <div class="ctitle">Histogram of per-bin Pearson r — target: most mass above 0.7 threshold</div>
+    <div class="chart-wrap"><canvas id="pearson-chart" role="img" aria-label="Pearson r histogram"></canvas></div>
+    <div class="legend-row">
+      <div class="l-item"><span class="l-sq" style="background:#2a78d6"></span>Accepted (r ≥ 0.7)</div>
+      <div class="l-item"><span class="l-sq" style="background:#d3d1c7"></span>Rejected</div>
+    </div>
+  </div>
+
+  <div class="section">Gallery state — per cow</div>
+  <div class="card" id="gallery-card">
+    <div class="ctitle">Session counts per gallery (day / night) — target: ≥ 4 pose slots populated</div>
+    <div id="gallery-bars"></div>
+  </div>
+
+  <div class="section">Modality mask distribution</div>
+  <div class="card">
+    <div class="ctitle">Fraction of resolved_cow_timeline rows with each modality bit set</div>
+    <div id="modality-bars"></div>
+  </div>
+</div>
+
+<!-- ── SENSOR ─────────────────────────────────────────────────── -->
+<div id="p-sensor" class="panel">
+
+  <div class="section">Collar file inventory</div>
+  <div class="kpi-row" id="kpi-sensor"></div>
+
+  <div class="section">Detected gaps (> 30 min between consecutive collar files)</div>
+  <div class="card" id="gap-card">
+    <div class="ctitle">A gap here means reconcile will have missing kinetics for sessions in that window</div>
+    <div id="gap-list"></div>
+  </div>
+
+  <div class="section">Kinetic file details</div>
+  <div class="card">
+    <div id="kinetic-file-list"></div>
+  </div>
+
+  <div class="section">Behavior file details</div>
+  <div class="card">
+    <div id="behavior-file-list"></div>
+  </div>
+</div>
+
+<!-- ── DATASET ─────────────────────────────────────────────────── -->
+<div id="p-dataset" class="panel">
+
+  <div class="section">Calving ledger</div>
+  <div class="kpi-row" id="kpi-dataset"></div>
+
+  <div class="two-col" style="margin-bottom:12px">
+    <div class="card">
+      <div class="ctitle">Class balance — calving outcome</div>
+      <div class="donut-row">
+        <canvas id="class-donut" width="100" height="100" role="img" aria-label="Calving outcome distribution"></canvas>
+        <div class="d-legend" id="class-legend"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ctitle">Modality completeness per event</div>
+      <div id="modality-complete"></div>
+    </div>
+  </div>
+
+  <div class="section">Vision feature fill rates</div>
+  <div class="card">
+    <div class="ctitle">% of resolved_cow_timeline rows with each vision column non-NULL</div>
+    <div id="vision-fills"></div>
+  </div>
+</div>
+
+<!-- ── THRESHOLDS ─────────────────────────────────────────────── -->
+<div id="p-thresholds" class="panel">
+  <div class="section">Key reconcile parameters</div>
+  <div class="card">
+    <div class="ctitle">Adjust and copy — values update the command preview below</div>
+    <div id="th-rows"></div>
+  </div>
+
+  <div class="section">Diagnostic guide</div>
+  <div class="card">
+    <div class="ctitle">Symptom → what to try</div>
+    <div class="step-list" id="th-guide"></div>
+  </div>
+
+  <div class="section">Command preview</div>
+  <div class="card">
+    <div class="ctitle">Copy and run — reconcile with current threshold values</div>
+    <div class="cmd-box" id="cmd-box"></div>
+  </div>
+</div>
+
+<script>
+let DATA={};
+const CHARTS={};
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+function tab(name,btn){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
+  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('on'));
+  document.getElementById('p-'+name).classList.add('on');
+  btn.classList.add('on');
+}
+
+// ── Data load ───────────────────────────────────────────────────────────────
+async function loadData(){
+  document.getElementById('err').style.display='none';
+  try{
+    const r=await fetch('metrics.json?_='+Date.now());
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    DATA=await r.json();
+    const gen=DATA.generated_at||'';
+    document.getElementById('gen-at').textContent=
+      gen?'Last export: '+new Date(gen).toLocaleString():'';
+    renderAll();
+  }catch(e){
+    const el=document.getElementById('err');
+    el.style.display='block';
+    el.textContent='Could not load metrics.json — '+e.message+
+      '. Run: python3 metrics_export.py';
+    renderThresholds(); // always render static section
+  }
+}
+
+function renderAll(){
+  renderPipeline();
+  renderIdentity();
+  renderSensor();
+  renderDataset();
+  renderThresholds();
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function kpis(containerId, cards){
+  document.getElementById(containerId).innerHTML=cards.map(c=>
+    `<div class="kpi"><div class="kl">${c.l}</div>
+     <div class="kv ${c.cls||'neu'}">${c.v??'—'}</div>
+     ${c.d?`<div class="kd ${c.dc||''}">${c.d}</div>`:''}
+    </div>`).join('');
+}
+
+function barRow(lbl,pct,color,display){
+  return `<div class="bar-row">
+    <span class="bar-lbl" title="${lbl}">${lbl}</span>
+    <span class="bar-track"><span class="bar-fill" style="width:${pct}%;background:${color}"></span></span>
+    <span class="bar-num">${display}</span>
+  </div>`;
+}
+
+function infoRow(k,v){
+  return `<div class="info-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+function badge(n, type='b-none'){
+  return `<span class="badge ${type}">${n}</span>`;
+}
+
+function stepBadge(n){
+  if(n===0) return badge('no data','b-none');
+  if(n>0)   return badge(n.toLocaleString(),'b-ok');
+  return badge('—','b-none');
+}
+
+// ── Pipeline ─────────────────────────────────────────────────────────────────
+function renderPipeline(){
+  const ps=(DATA.pipeline||{}).proc_summary||{};
+  const ss=(DATA.pipeline||{}).step_stats||{};
+
+  kpis('kpi-pipeline',[
+    {l:'Videos processed',  v:ps.total??'—'},
+    {l:'OK',                v:ps.ok??'—',        cls:'ok'},
+    {l:'Errors',            v:ps.error??'—',      cls:ps.error?'warn':'ok'},
+    {l:'Total frames',      v:ps.total_frames?ps.total_frames.toLocaleString():'—'},
+    {l:'Avg FPS',           v:ps.avg_fps??'—'},
+    {l:'Total hours',       v:ps.total_duration_s?(ps.total_duration_s/3600).toFixed(1)+'h':'—'},
+  ]);
+
+  const steps=[
+    {id:'A',   name:'Kinetic match',      desc:'Pearson r · Hungarian assignment',        key:'A_kinetic_match'},
+    {id:'A.5', name:'Manual merge',       desc:'manual_assignments consumed',             key:'A5_manual_merge'},
+    {id:'B',   name:'Gallery builder',    desc:'EMA update → day/night galleries',        key:'B_gallery_builder'},
+    {id:'C',   name:'Cosine resolver',    desc:'Switch healing / cross-video resolve',    key:'C_cosine_resolver'},
+    {id:'A.6', name:'Duplicate resolver', desc:'Tracker switch merges',                  key:'A6_duplicate_resolver'},
+    {id:'D',   name:'Sensor sequencer',   desc:'Forward-fill to video time grid',         key:'D_sensor_sequencer'},
+    {id:'B-V', name:'Vision extractor',   desc:'posture + facing → window aggregates',   key:'BV_vision_extractor'},
+    {id:'E',   name:'Write timeline',     desc:'Rows in resolved_cow_timeline',           key:'E_write_timeline'},
+  ];
+
+  document.getElementById('step-list').innerHTML=steps.map(s=>{
+    const n=ss[s.key]??0;
+    return `<div class="step-row">
+      <span class="step-name">${s.id}</span>
+      <span class="step-desc">${s.name} — ${s.desc}</span>
+      ${stepBadge(n)}
+    </div>`;
+  }).join('');
+
+  // Recent videos
+  const rv=(DATA.pipeline||{}).recent_videos||[];
+  const logEl=document.getElementById('proc-log-rows');
+  if(!rv.length){
+    logEl.innerHTML='<p class="empty">Populated after first batch run.</p>';
+  } else {
+    logEl.innerHTML=`
+      <div class="info-row" style="font-size:10px;font-weight:500;">
+        <span class="k" style="flex:1">Session</span>
+        <span class="k" style="width:70px">Status</span>
+        <span class="k" style="width:50px;text-align:right">FPS</span>
+      </div>`+
+      rv.map(r=>`<div class="info-row">
+        <span style="flex:1;font-size:11px;font-family:var(--mono)">${r.session_id||r.filename||''}</span>
+        <span style="width:70px;font-size:11px" class="${r.status==='ok'?'ok':r.status==='error'?'warn':''}">${r.status}</span>
+        <span style="width:50px;font-size:11px;text-align:right;color:var(--tm)">${r.fps??'—'}</span>
+      </div>`).join('');
+  }
+
+  // Dirty flags
+  const flags=(DATA.drive_status||{}).flags||{};
+  document.getElementById('dirty-flags').innerHTML=
+    ['db','parquet','gallery'].map(f=>{
+      const dirty=(flags[f]||{}).dirty;
+      return `<div class="step-row">
+        <span class="step-name">${f}</span>
+        <span class="step-desc">${dirty?'unsynced — downstream reads blocked':'clean'}</span>
+        ${badge(dirty?'dirty':'clean', dirty?'b-warn':'b-ok')}
+      </div>`;
+    }).join('');
+
+  // Buffer
+  const drv=DATA.drive_status||{};
+  document.getElementById('buffer-info').innerHTML=
+    infoRow('Pending uploads',drv.pending_count??'—')+
+    infoRow('Abandoned (>5 attempts)',drv.abandoned_count??'—')+
+    (drv.pending_count>0
+      ? '<p style="font-size:11px;color:var(--tm);margin-top:8px">Run: python3 drive_manager.py retry-buffer</p>'
+      : '');
+}
+
+// ── Identity ─────────────────────────────────────────────────────────────────
+function renderIdentity(){
+  const id=DATA.identity||{};
+  const bm=id.by_method||{};
+  const cosine=(bm.cosine_day||0)+(bm.cosine_night||0)+(bm.cosine||0);
+
+  kpis('kpi-identity',[
+    {l:'Kinetic matches',   v:bm.kinetic??'—'},
+    {l:'Cosine matches',    v:cosine||'—'},
+    {l:'Manual overrides',  v:bm.manual??'—'},
+    {l:'Unresolved',        v:id.unresolved??'—', cls:id.unresolved>0?'warn':'ok'},
+    {l:'Tracker switches',  v:id.switch_count??'—'},
+  ]);
+
+  // Pearson histogram
+  const hist=id.pearson_hist||[0,0,0,0,0,0,0];
+  const bins=id.pearson_bins||['0–0.2','0.2–0.4','0.4–0.6','0.6–0.7','0.7–0.8','0.8–0.9','0.9–1.0'];
+  const bgColors=bins.map((_,i)=>i>=4?'#2a78d6':'#d3d1c7');
+
+  if(CHARTS.pearson) CHARTS.pearson.destroy();
+  const ctx=document.getElementById('pearson-chart');
+  if(ctx){
+    CHARTS.pearson=new Chart(ctx,{
+      type:'bar',
+      data:{labels:bins,datasets:[{data:hist,backgroundColor:bgColors,borderWidth:0,borderRadius:3}]},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{grid:{display:false},ticks:{font:{size:10},color:'#898781'}},
+          y:{grid:{color:'#d3d1c7'},ticks:{font:{size:10},color:'#898781'},beginAtZero:true},
+        }
+      }
+    });
+  }
+
+  // Gallery bars
+  const gallery=id.gallery||[];
+  const galEl=document.getElementById('gallery-bars');
+  if(!gallery.length){
+    galEl.innerHTML='<p class="empty">Populated after first kinetic-confirmed session.</p>';
+  } else {
+    const maxN=Math.max(...gallery.map(g=>Math.max(g.gallery_n_day||0,g.gallery_n_night||0)),1);
+    galEl.innerHTML=gallery.map(g=>{
+      const d=g.gallery_n_day||0, n=g.gallery_n_night||0;
+      return `<div class="bar-row">
+        <span class="bar-lbl" title="cow ${g.real_id}">Cow ${g.real_id}</span>
+        <span class="bar-track" style="height:12px;position:relative">
+          <span class="bar-fill" style="width:${d/maxN*100}%;background:#2a78d6;position:absolute;top:0;height:50%"></span>
+          <span class="bar-fill" style="width:${n/maxN*100}%;background:#7F77DD;position:absolute;bottom:0;height:50%"></span>
+        </span>
+        <span class="bar-num" style="font-size:10px">${d}d/${n}n</span>
+      </div>`;
+    }).join('')+
+    `<div class="legend-row" style="margin-top:8px">
+      <div class="l-item"><span class="l-sq" style="background:#2a78d6"></span>Day sessions</div>
+      <div class="l-item"><span class="l-sq" style="background:#7F77DD"></span>Night sessions</div>
+    </div>`;
+  }
+
+  // Modality mask bars
+  const masks=id.modality_masks||[];
+  const totalMask=masks.reduce((s,r)=>s+r.n,0)||1;
+  const maskDefs=[
+    {mask:1,label:'Sensor only (bit 1)',       color:'#2a78d6'},
+    {mask:2,label:'Vision only (bit 2)',        color:'#1baf7a'},
+    {mask:3,label:'Sensor + Vision (1+2)',      color:'#eda100'},
+    {mask:4,label:'ReID only (bit 3)',          color:'#7F77DD'},
+    {mask:7,label:'All three (1+2+3)',          color:'#D85A30'},
+  ];
+  const maskMap=Object.fromEntries(masks.map(r=>[r.modality_mask,r.n]));
+  document.getElementById('modality-bars').innerHTML=
+    maskDefs.map(m=>{
+      const n=maskMap[m.mask]||0;
+      const pct=n/totalMask*100;
+      return barRow(m.label,pct,m.color,n?n.toLocaleString():'—');
+    }).join('')+
+    (!masks.length?'<p class="empty" style="margin-top:8px">Populated once resolved_cow_timeline has rows.</p>':'');
+}
+
+// ── Sensor ───────────────────────────────────────────────────────────────────
+function renderSensor(){
+  const sens=DATA.sensor||{};
+  const kin=sens.kinetic_files||[];
+  const beh=sens.behavior_files||[];
+  const gaps=sens.gaps||[];
+
+  kpis('kpi-sensor',[
+    {l:'Kinetic files',    v:kin.length},
+    {l:'Behavior files',   v:beh.length},
+    {l:'Gaps detected',    v:gaps.length, cls:gaps.length?'warn':'ok'},
+  ]);
+
+  const gapEl=document.getElementById('gap-list');
+  if(!gaps.length){
+    gapEl.innerHTML='<p class="empty">No gaps — continuous collar coverage detected.</p>';
+  } else {
+    gapEl.innerHTML=gaps.map(g=>
+      `<div class="step-row">
+        <span class="step-desc">${g.between?.[0]||''} → ${g.between?.[1]||''}</span>
+        ${badge(g.gap_minutes+'m gap','b-warn')}
+      </div>`).join('');
+  }
+
+  function fileTable(files,elId){
+    const el=document.getElementById(elId);
+    if(!files.length){el.innerHTML='<p class="empty">No files found in collar_data/.</p>';return;}
+    el.innerHTML=files.map(f=>
+      `<div class="info-row">
+        <span class="k" style="font-family:var(--mono);font-size:11px;flex:1">${f.file}</span>
+        <span class="v" style="font-size:11px;color:var(--tm)">
+          ${f.animal_ids?f.animal_ids.join(', '):''}
+        </span>
+      </div>`+
+      `<div style="font-size:10px;color:var(--tm);padding:0 0 6px 0">
+        ${f.start||'?'} → ${f.end||'?'}${f.legacy?' (legacy filename)':''}
+      </div>`).join('<div style="height:4px"></div>');
+  }
+  fileTable(kin,'kinetic-file-list');
+  fileTable(beh,'behavior-file-list');
+}
+
+// ── Dataset ───────────────────────────────────────────────────────────────────
+function renderDataset(){
+  const ds=DATA.dataset||{};
+  const cc=ds.class_counts||{};
+  const total=Object.values(cc).reduce((s,v)=>s+v,0);
+
+  kpis('kpi-dataset',[
+    {l:'Labeled events',      v:total||'—'},
+    {l:'Unique cows',         v:ds.unique_cows??'—'},
+    {l:'Avg timeline hours',  v:ds.avg_timeline_hrs??'—'},
+    {l:'Missing collar',      v:(ds.missing_collar||[]).length, cls:(ds.missing_collar||[]).length?'warn':'ok'},
+    {l:'Missing video',       v:(ds.missing_video||[]).length,  cls:(ds.missing_video||[]).length?'warn':'ok'},
+  ]);
+
+  // Class donut
+  const classes=['Unassisted','Assisted','Twin','Veterinarian-assisted'];
+  const colorsD=['#2a78d6','#1baf7a','#eda100','#D85A30'];
+  const dataD=classes.map(c=>cc[c.toLowerCase()]||cc[c]||0);
+
+  if(CHARTS.donut) CHARTS.donut.destroy();
+  const dCtx=document.getElementById('class-donut');
+  if(dCtx){
+    CHARTS.donut=new Chart(dCtx,{
+      type:'doughnut',
+      data:{labels:classes,datasets:[{data:dataD.map(v=>v||0.01),backgroundColor:colorsD,borderWidth:0}]},
+      options:{responsive:false,cutout:'64%',plugins:{legend:{display:false},tooltip:{enabled:false}}}
+    });
+  }
+  document.getElementById('class-legend').innerHTML=classes.map((c,i)=>
+    `<div class="d-item">
+      <span class="d-dot" style="background:${colorsD[i]}"></span>
+      <span class="d-name">${c}</span>
+      <span class="d-val">${dataD[i]??'—'}</span>
+    </div>`).join('');
+
+  // Modality completeness
+  const mc=ds.modality_completeness||{};
+  const mcTotal=Object.values(mc).reduce((s,v)=>s+v,0)||1;
+  document.getElementById('modality-complete').innerHTML=
+    [
+      {k:'sensor_only',    label:'Sensor only',       color:'#2a78d6'},
+      {k:'vision_only',    label:'Vision only',        color:'#1baf7a'},
+      {k:'sensor_vision',  label:'Sensor + Vision',    color:'#eda100'},
+      {k:'all',            label:'All modalities',     color:'#7F77DD'},
+      {k:'none',           label:'None',               color:'#d3d1c7'},
+    ].map(m=>barRow(m.label,(mc[m.k]||0)/mcTotal*100,m.color,mc[m.k]||0)).join('')+
+    (!Object.keys(mc).length
+      ?'<p class="empty" style="margin-top:8px">Populated after calving_ledger joined to timeline.</p>'
+      :'');
+
+  // Vision fill rates
+  const vf=ds.vision_fill_rates||{};
+  const ACTIVE_COLS=['lying_fraction','posture_transitions','facing_dominant','facing_entropy'];
+  const PENDING_COLS=['spine_angle','pelvic_tilt','tail_elevation','limb_symmetry',
+                      'head_drop','kps_coverage','restlessness','embed_mean'];
+  document.getElementById('vision-fills').innerHTML=
+    [...ACTIVE_COLS,...PENDING_COLS].map(col=>{
+      const pct=vf[col]??0;
+      const isActive=ACTIVE_COLS.includes(col);
+      return barRow(col,pct,isActive?'#2a78d6':'#d3d1c7',pct+'%')+
+        (!isActive&&pct===0
+          ?`<div style="font-size:10px;color:var(--tm);margin:-5px 0 5px 160px">pending implementation</div>`
+          :'');
+    }).join('');
+}
+
+// ── Thresholds ────────────────────────────────────────────────────────────────
+const TH=[
+  {f:'corr_threshold',     def:0.7,  min:0.3, max:0.95,step:0.05, unit:'r',         desc:'Min Pearson r for kinetic match acceptance'},
+  {f:'cosine_threshold',   def:0.75, min:0.4, max:0.98,step:0.01, unit:'cosine',    desc:'Min cosine similarity for switch-healing / cross-video'},
+  {f:'ema_alpha',          def:0.15, min:0.05,max:0.4, step:0.05, unit:'α',         desc:'Gallery EMA decay rate'},
+  {f:'min_active_bins',    def:3,    min:1,   max:8,   step:1,    unit:'bins',      desc:'Min active 15-min kinetic bins required'},
+  {f:'min_temp_id_frames', def:0.10, min:0.02,max:0.5, step:0.02, unit:'fraction',  desc:'Min fraction of session frames per temp_id'},
+  {f:'activity_pct',       def:0.25, min:0.1, max:0.6, step:0.05, unit:'percentile',desc:'ΔR percentile threshold for "active" kinetic bin'},
+  {f:'min_embeds_gallery', def:10,   min:2,   max:30,  step:1,    unit:'rows',      desc:'Min embed rows to contribute to gallery'},
+  {f:'cosine_min_embeds',  def:5,    min:2,   max:20,  step:1,    unit:'rows',      desc:'Min embed rows to be queried via cosine'},
+];
+const thVals={};
+TH.forEach(t=>thVals[t.f]=t.def);
+
+function renderThresholds(){
+  document.getElementById('th-rows').innerHTML=TH.map(t=>`
+    <div class="th-row">
+      <span class="th-lbl" title="${t.desc}">${t.f}</span>
+      <input type="range" min="${t.min}" max="${t.max}" step="${t.step}" value="${t.def}"
+        oninput="thVals['${t.f}']=parseFloat(this.value);
+          document.getElementById('tv-${t.f}').textContent=parseFloat(this.value).toFixed(${t.step<1?2:0});
+          updateCmd();">
+      <span class="th-val" id="tv-${t.f}">${t.def}</span>
+      <span style="font-size:10px;color:var(--tm);width:70px;text-align:right">${t.unit}</span>
+    </div>
+    <div class="th-hint">${t.desc}</div>
+  `).join('');
+
+  document.getElementById('th-guide').innerHTML=[
+    {s:'Many unresolved temp_ids',   a:'Lower --corr_threshold (try 0.6) or --min_active_bins (try 2)'},
+    {s:'Wrong identities assigned',  a:'Raise --corr_threshold (try 0.80) for stricter matching'},
+    {s:'Cosine heals few switches',  a:'Lower --cosine_threshold (try 0.65) or --cosine_min_embeds (3)'},
+    {s:'Gallery drifts too fast',    a:'Lower --ema_alpha (try 0.05–0.08)'},
+    {s:'Gallery won\'t adapt',       a:'Raise --ema_alpha (try 0.25)'},
+    {s:'Tiny temp_ids polluting ID', a:'Raise --min_temp_id_frames (try 0.20)'},
+  ].map(g=>`<div class="step-row">
+    <span class="badge b-warn">symptom</span>
+    <span class="step-desc"><strong style="font-weight:500">${g.s}</strong> → ${g.a}</span>
+  </div>`).join('');
+
+  updateCmd();
+}
+
+function updateCmd(){
+  const lines=['python3 reconcile.py \\',
+    '  --db    calving_project.db \\',
+    '  --session SESSION_ID \\'];
+  TH.forEach(t=>{
+    const v=typeof thVals[t.f]==='number'
+      ? thVals[t.f].toFixed(t.step<1?2:0)
+      : thVals[t.f];
+    lines.push(`  --${t.f} ${v} \\`);
+  });
+  lines[lines.length-1]=lines[lines.length-1].replace(' \\','');
+  document.getElementById('cmd-box').textContent=lines.join('\n');
+}
+
+window.addEventListener('load',loadData);
+</script>
+</body>
+</html>
