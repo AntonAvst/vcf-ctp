@@ -710,3 +710,9 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 | Empirical Evaluation | September 30, 2026 | — |
 | Research Paper | October 30, 2026 | — |
 | Thesis Document | November 30, 2026 | — |
+
+
+## TODO:
+1.  resolve session id logic
+2.  regenerate tracks with higher frame rate (< 0.5[sec])
+3.  filter out temp ids with less then epsilon instances

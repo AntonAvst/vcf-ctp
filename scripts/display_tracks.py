@@ -32,6 +32,9 @@ except ImportError:
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
 
+# session_id derivation — single source of truth, shared with track_and_dump.py
+from track_and_dump import parse_filename
+
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
 try:
@@ -48,7 +51,7 @@ def log(msg):
 # Shared playback state  (video thread writes, Flask threads read)
 # ═══════════════════════════════════════════════════════════════════════════════
 class _State:
-    FF_SPEEDS = [1, 2, 4, 8]
+    FF_SPEEDS = [1, 2, 4, 8, 12]
 
     def __init__(self):
         self._lock    = threading.Lock()
@@ -56,8 +59,13 @@ class _State:
         self.ff_idx   = 0
         self.ff_speed = 1
         self.quit     = False
-        self.show_table = True
         self.current_dt = None      # datetime | None — updated by video thread
+        # feature-display toggles (all on by default)
+        self.show_bbox      = True
+        self.show_id        = True
+        self.show_kp        = True
+        self.show_pose      = True
+        self.show_direction = True
 
     def toggle_pause(self):
         with self._lock:
@@ -69,6 +77,13 @@ class _State:
             self.ff_idx   = (self.ff_idx + 1) % len(self.FF_SPEEDS)
             self.ff_speed = self.FF_SPEEDS[self.ff_idx]
             return self.ff_speed
+
+    def toggle_feature(self, name):
+        attr = f"show_{name}"
+        with self._lock:
+            if hasattr(self, attr):
+                setattr(self, attr, not getattr(self, attr))
+            return getattr(self, attr, None)
 
     def do_quit(self):
         with self._lock:
@@ -82,6 +97,9 @@ class _State:
         with self._lock:
             return dict(paused=self.paused, ff_speed=self.ff_speed,
                         quit=self.quit,
+                        show_bbox=self.show_bbox, show_id=self.show_id,
+                        show_kp=self.show_kp, show_pose=self.show_pose,
+                        show_direction=self.show_direction,
                         current_dt=self.current_dt.isoformat()
                         if self.current_dt else None)
 
@@ -145,7 +163,8 @@ def classify_frame_features(d: dict) -> dict | None:
         return None
 
 
-def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None):
+def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None,
+             show_bbox=True, show_id=True, show_pose=True, show_direction=True):
     """
     Draw bounding box with a two-line label stack above it:
         Line 1 (top)    — vision features: posture · facing  (only when available)
@@ -153,12 +172,15 @@ def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None)
     conf is accepted for API compatibility but never displayed.
 
     features: dict with optional keys:
-        "posture" : str  e.g. "standing" | "lying"
-        "facing"  : str  e.g. "left" | "right" | "toward" | "away"
+        "posture" : str  e.g. "standing" | "lying"   (shown only if show_pose)
+        "facing"  : str  e.g. "left" | "right" | "toward" | "away"  (shown only if show_direction)
+
+    show_bbox/show_id/show_pose/show_direction independently gate each visual element.
     """
     color = id_color(tid)
     x1,y1,x2,y2 = [int(round(float(v))) for v in (x1,y1,x2,y2)]
-    cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
+    if show_bbox:
+        cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
 
     font      = cv2.FONT_HERSHEY_SIMPLEX
     id_scale  = 0.55
@@ -166,20 +188,22 @@ def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None)
     pad       = 4
 
     # ── identity label ────────────────────────────────────────────────────────
-    id_lbl = (f"cow {animal_id} (t{int(tid)})" if animal_id is not None
-              else f"id {int(tid)}")
-    (id_w, id_h), _ = cv2.getTextSize(id_lbl, font, id_scale, 2)
-    id_pill_h = id_h + pad * 2
-    id_y0     = max(0, y1 - id_pill_h)
-    cv2.rectangle(img, (x1, id_y0), (x1 + id_w + pad*2, id_y0 + id_pill_h), color, -1)
-    cv2.putText(img, id_lbl, (x1 + pad, id_y0 + id_h + pad - 1),
-                font, id_scale, (0,0,0), 2, cv2.LINE_AA)
+    id_y0 = y1
+    if show_id:
+        id_lbl = (f"cow {animal_id} (t{int(tid)})" if animal_id is not None
+                  else f"id {int(tid)}")
+        (id_w, id_h), _ = cv2.getTextSize(id_lbl, font, id_scale, 2)
+        id_pill_h = id_h + pad * 2
+        id_y0     = max(0, y1 - id_pill_h)
+        cv2.rectangle(img, (x1, id_y0), (x1 + id_w + pad*2, id_y0 + id_pill_h), color, -1)
+        cv2.putText(img, id_lbl, (x1 + pad, id_y0 + id_h + pad - 1),
+                    font, id_scale, (0,0,0), 2, cv2.LINE_AA)
 
     # ── features label (posture · facing) ────────────────────────────────────
     feat_parts = []
     if features:
-        if features.get("posture"): feat_parts.append(features["posture"])
-        if features.get("facing"):  feat_parts.append(features["facing"])
+        if show_pose      and features.get("posture"): feat_parts.append(features["posture"])
+        if show_direction and features.get("facing"):  feat_parts.append(features["facing"])
     if feat_parts:
         ft_lbl = "  ·  ".join(feat_parts)
         (ft_w, ft_h), _ = cv2.getTextSize(ft_lbl, font, ft_scale, 1)
@@ -201,7 +225,8 @@ EDGES = list(EDGE_SET)
 
 def draw_pose(img, kps_xyv, color, kps_conf=None, kp_radius=3, sk_thickness=2,
               kp_thresh=0.0, kp_conf_thresh=0.30, hide_lowconf=False,
-              show_index=False, index_scale=0.45, index_thickness=1, index_offset=6):
+              show_index=False, index_scale=0.45, index_thickness=1, index_offset=6,
+              show_kp=True, show_skeleton=True):
     K = len(kps_xyv)
     mask = [False]*K
     for i in range(K):
@@ -212,22 +237,24 @@ def draw_pose(img, kps_xyv, color, kps_conf=None, kp_radius=3, sk_thickness=2,
                 if float(kps_conf[i])<kp_conf_thresh: continue
             except: pass
         mask[i]=True
-    for i in range(K):
-        if not mask[i]: continue
-        x,y,_ = kps_xyv[i]
-        xi,yi = int(round(x)),int(round(y))
-        cv2.circle(img,(xi,yi),kp_radius,color,-1,lineType=cv2.LINE_AA)
-        if show_index:
-            s = str(i)
-            cv2.putText(img,s,(xi+index_offset,yi-index_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX,index_scale,(0,0,0),index_thickness+2,cv2.LINE_AA)
-            cv2.putText(img,s,(xi+index_offset,yi-index_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX,index_scale,(255,255,255),index_thickness,cv2.LINE_AA)
-    for (i,j) in EDGES:
-        if i<K and j<K and mask[i] and mask[j]:
-            xi,yi,_ = kps_xyv[i]; xj,yj,_ = kps_xyv[j]
-            cv2.line(img,(int(round(xi)),int(round(yi))),(int(round(xj)),int(round(yj))),
-                     color,sk_thickness,lineType=cv2.LINE_AA)
+    if show_kp:
+        for i in range(K):
+            if not mask[i]: continue
+            x,y,_ = kps_xyv[i]
+            xi,yi = int(round(x)),int(round(y))
+            cv2.circle(img,(xi,yi),kp_radius,color,-1,lineType=cv2.LINE_AA)
+            if show_index:
+                s = str(i)
+                cv2.putText(img,s,(xi+index_offset,yi-index_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX,index_scale,(0,0,0),index_thickness+2,cv2.LINE_AA)
+                cv2.putText(img,s,(xi+index_offset,yi-index_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX,index_scale,(255,255,255),index_thickness,cv2.LINE_AA)
+    if show_skeleton:
+        for (i,j) in EDGES:
+            if i<K and j<K and mask[i] and mask[j]:
+                xi,yi,_ = kps_xyv[i]; xj,yj,_ = kps_xyv[j]
+                cv2.line(img,(int(round(xi)),int(round(yi))),(int(round(xj)),int(round(yj))),
+                         color,sk_thickness,lineType=cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -524,7 +551,11 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
   <button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
   <button onclick="cycleFF()">⏩ Fast Forward</button>
   <span id="ffLabel">Speed: 1×</span>
-  <button onclick="toggleTable()">📊 Toggle Score Table</button>
+  <button id="t_bbox"      class="active" onclick="toggleFeature('bbox')">▭ Bbox</button>
+  <button id="t_id"        class="active" onclick="toggleFeature('id')">🏷 ID</button>
+  <button id="t_kp"        class="active" onclick="toggleFeature('kp')">• Keypoints</button>
+  <button id="t_pose"      class="active" onclick="toggleFeature('pose')">🦴 Pose</button>
+  <button id="t_direction" class="active" onclick="toggleFeature('direction')">🧭 Direction</button>
   <button id="qbtn" onclick="doQuit()">⏹ Quit</button>
   <span id="clock"></span>
   <span id="status"></span>
@@ -566,12 +597,16 @@ function refreshSensor(){
 
 // ── status polling ───────────────────────────────────────────────────────────
 let paused=false;
+const FEATURES = ['bbox','id','kp','pose','direction'];
 setInterval(()=>{
   fetch('/api/status').then(r=>r.json()).then(s=>{
     paused = s.paused;
     document.getElementById('pauseBtn').textContent = s.paused ? '▶ Resume' : '⏸ Pause';
     document.getElementById('pauseBtn').classList.toggle('active', s.paused);
     document.getElementById('ffLabel').textContent = `Speed: ${s.ff_speed}×`;
+    FEATURES.forEach(f=>{
+      document.getElementById('t_'+f).classList.toggle('active', !!s['show_'+f]);
+    });
     if(s.current_dt) document.getElementById('clock').textContent = '▶  '+s.current_dt.replace('T',' ').slice(0,19);
     if(s.quit){ document.getElementById('status').textContent='[stopped]'; }
   }).catch(()=>{});
@@ -583,7 +618,7 @@ setInterval(refreshSensor, 3000);
 // ── controls ─────────────────────────────────────────────────────────────────
 function togglePause(){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pause'})}); }
 function cycleFF()    { fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'ff'})}); }
-function toggleTable(){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'table'})}); }
+function toggleFeature(name){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggle_'+name})}); }
 function doQuit()     { fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'quit'})}); }
 </script>
 </body>
@@ -621,8 +656,9 @@ def api_control():
     action = request.json.get("action","")
     if action=="pause":   STATE.toggle_pause()
     elif action=="ff":    STATE.cycle_ff()
-    elif action=="table": STATE.show_table = not STATE.show_table
     elif action=="quit":  STATE.do_quit()
+    elif action.startswith("toggle_"):
+        STATE.toggle_feature(action[len("toggle_"):])
     return jsonify({"ok":True})
 
 @app.route("/api/sensor_chart")
@@ -646,11 +682,11 @@ def api_sensor_chart():
 # ═══════════════════════════════════════════════════════════════════════════════
 # Video loop  (background thread)
 # ═══════════════════════════════════════════════════════════════════════════════
-def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None):
+def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None, db_path=None):
     global _latest_jpeg
 
     vid = Path(args.video)
-    db  = Path(args.db)
+    db = Path(db_path) if db_path else Path(args.db)
     kps_pq = str(db.parent / "outputs" / args.session_id / "kps.parquet")
 
     cap = cv2.VideoCapture(str(vid))
@@ -696,7 +732,13 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
             time.sleep(0.05)
             continue
 
-        ff_speed = STATE.ff_speed
+        _snap = STATE.snapshot()
+        ff_speed        = _snap["ff_speed"]
+        _show_bbox      = _snap["show_bbox"]
+        _show_id        = _snap["show_id"]
+        _show_kp        = _snap["show_kp"]
+        _show_pose      = _snap["show_pose"]
+        _show_direction = _snap["show_direction"]
 
         ok, frame = cap.read()
         if not ok:
@@ -754,8 +796,10 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 
             draw_box(frame, d["x1"], d["y1"], d["x2"], d["y2"],
                      d["temp_id"], d["conf"],
-                     animal_id=_aid, features=_feats)
-            if args.draw_pose and d.get("kps"):
+                     animal_id=_aid, features=_feats,
+                     show_bbox=_show_bbox, show_id=_show_id,
+                     show_pose=_show_pose, show_direction=_show_direction)
+            if args.draw_pose and d.get("kps") and (_show_kp or _show_pose):
                 draw_pose(frame,d["kps"],
                           color=id_color(int(d["temp_id"])),
                           kps_conf=d.get("kps_conf"),
@@ -765,6 +809,8 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
                           kp_conf_thresh=args.kp_conf_thresh,
                           hide_lowconf=(not args.show_lowconf),
                           show_index=args.kp_index,
+                          show_kp=_show_kp,
+                          show_skeleton=_show_pose,
                           index_scale=args.kp_index_scale,
                           index_thickness=args.kp_index_thickness,
                           index_offset=args.kp_index_offset)
@@ -799,7 +845,9 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video",      required=True)
     ap.add_argument("--db",         required=True)
-    ap.add_argument("--session_id", required=True)
+    ap.add_argument("--session_id", default="",
+                     help="Override auto-derived session_id (normally derived "
+                          "from --video filename, same logic as track_and_dump.py)")
     ap.add_argument("--start",      type=int,   default=0)
     ap.add_argument("--max_fps",    type=float, default=0.0)
     ap.add_argument("--sink",       default="web",
@@ -837,6 +885,15 @@ def main():
 
     vid = Path(args.video)
     if not vid.exists(): raise FileNotFoundError(f"Video not found: {vid}")
+
+    # ── session_id: auto-derive from filename (same logic as track_and_dump.py) ──
+    if not args.session_id:
+        camera_id, start_dt, _end_dt = parse_filename(str(vid))
+        args.session_id = (f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
+                            if start_dt else f"{camera_id}_unknown")
+        log(f"session_id auto-derived: {args.session_id}")
+    else:
+        log(f"session_id (manual override): {args.session_id}")
 
     # ── Drive: pull canonical DB before reading ───────────────────────────────
     dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
@@ -915,9 +972,9 @@ def main():
 
     # ── video thread ─────────────────────────────────────────────────────────
     vt = threading.Thread(
-        target=_video_loop,
-        args=(args, assignment, None, session_start_dt, vision_index),
-        daemon=True)
+                            target=_video_loop,
+                            args=(args, assignment, None, session_start_dt, vision_index, str(db)),
+                            daemon=True)
     vt.start()
 
     # ── open Windows browser ─────────────────────────────────────────────────
@@ -948,7 +1005,8 @@ if __name__ == "__main__":
 # python3 display_tracks.py \
 #   --video      "$VID" \
 #   --db         "$DB" \
-#   --session_id refet33_20241221 \
 #   --draw_pose --kp_index --hide_occluded --kp_conf_thresh 0.35 \
 #   --kinetic_csv  "$KIN" \
 #   --behavior_csv "$BIH"
+# (session_id is now auto-derived from $VID's filename, same logic as
+#  track_and_dump.py; pass --session_id explicitly only to override.)

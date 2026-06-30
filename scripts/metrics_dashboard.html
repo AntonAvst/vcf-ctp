@@ -258,7 +258,7 @@ function tab(name,btn){
 async function loadData(){
   document.getElementById('err').style.display='none';
   try{
-    const r=await fetch('metrics.json?_='+Date.now());
+    const r=await fetch('../metrics/metrics.json?_='+Date.now());
     if(!r.ok) throw new Error('HTTP '+r.status);
     DATA=await r.json();
     const gen=DATA.generated_at||'';

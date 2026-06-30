@@ -41,7 +41,7 @@ DEFAULT_DB           = LOCAL_ROOT / "calving_project.db"
 DEFAULT_COLLAR_DIR   = LOCAL_ROOT / "collar_data"
 DEFAULT_GALLERY_DIR  = LOCAL_ROOT / "reid_gallery"
 DEFAULT_PROC_LOG     = LOCAL_ROOT / "processing_log.csv"          # synced from Drive
-DEFAULT_OUT          = SCRIPTS_DIR / "metrics.json"
+DEFAULT_OUT          = SCRIPTS_DIR.parent / "metrics" / "metrics.json"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
