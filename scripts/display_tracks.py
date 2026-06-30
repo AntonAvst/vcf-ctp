@@ -389,19 +389,24 @@ def get_features_for(vision_index: dict, real_id: int, frame_dt) -> dict | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sensor data  (loaded once into DataFrames)
 # ═══════════════════════════════════════════════════════════════════════════════
-def load_sensor_data(kin_path, beh_path):
+def load_sensor_data(kin_df, beh_df):
+    """
+    Build the {AnimalId -> indexed DataFrame} sensor lookup used for the
+    live sensor chart overlay. Accepts DataFrames (as returned by
+    drive_manager.load_collar_data) rather than file paths — sensor CSVs
+    are always auto-discovered from Drive by session time window, never
+    passed in as a manual path.
+    """
     import pandas as pd
     frames={}
-    if kin_path and Path(kin_path).exists():
-        kdf=pd.read_csv(kin_path,parse_dates=["datetime"])
-        kdf=kdf.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
+    if kin_df is not None and not kin_df.empty:
+        kdf=kin_df.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
         for col in ["KineticsCountX","KineticsCountY","KineticsCountZ","KineticsCountR"]:
             kdf[f"d{col.replace('KineticsCount','Kin')}"]=kdf.groupby("AnimalId")[col].diff()
         for aid,grp in kdf.groupby("AnimalId"):
             frames[int(aid)]=grp.set_index("datetime").sort_index()
-    if beh_path and Path(beh_path).exists():
-        bdf=pd.read_csv(beh_path,parse_dates=["datetime"])
-        bdf=bdf.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
+    if beh_df is not None and not beh_df.empty:
+        bdf=beh_df.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
         for aid,grp in bdf.groupby("AnimalId"):
             aid=int(aid)
             sub=grp.set_index("datetime")[["f_1_2","f_2_3","v"]].sort_index()
@@ -686,7 +691,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
     global _latest_jpeg
 
     vid = Path(args.video)
-    db = Path(db_path) if db_path else Path(args.db)
+    db = Path(db_path)   # always supplied by main() — no CLI fallback (no --db arg exists)
     kps_pq = str(db.parent / "outputs" / args.session_id / "kps.parquet")
 
     cap = cv2.VideoCapture(str(vid))
@@ -844,7 +849,8 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video",      required=True)
-    ap.add_argument("--db",         required=True)
+    # NOTE: no --db argument. The DB is always the canonical copy pulled from
+    # Drive via drive_manager.py.
     ap.add_argument("--session_id", default="",
                      help="Override auto-derived session_id (normally derived "
                           "from --video filename, same logic as track_and_dump.py)")
@@ -867,8 +873,8 @@ def parse_args():
     ap.add_argument("--kp_index_scale",     type=float, default=0.45)
     ap.add_argument("--kp_index_thickness", type=int,   default=1)
     ap.add_argument("--kp_index_offset",    type=int,   default=6)
-    ap.add_argument("--kinetic_csv",  default="")
-    ap.add_argument("--behavior_csv", default="")
+    # NOTE: no --kinetic_csv / --behavior_csv. Sensor data is always
+    # auto-discovered from Drive by session time window via drive_manager.
     ap.add_argument("--sensor_lookback", type=float, default=2.0)
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
@@ -932,17 +938,19 @@ def main():
     except Exception as e:
         log(f"WARNING: assignments not loaded: {e}")
 
-    # ── session start time ───────────────────────────────────────────────────
+    # ── session window (start/end) ────────────────────────────────────────────
     session_start_dt = None
+    session_end_dt = None
     try:
         from datetime import datetime as _dt2
         c2=sqlite3.connect(str(db))
-        row=c2.execute("SELECT start_dt FROM video_sessions WHERE session_id=?",
+        row=c2.execute("SELECT start_dt, end_dt FROM video_sessions WHERE session_id=?",
                        (args.session_id,)).fetchone()
         c2.close()
         if row and row[0]:
             session_start_dt=_dt2.fromisoformat(str(row[0]))
-            log(f"Session start_dt: {session_start_dt}")
+            session_end_dt=_dt2.fromisoformat(str(row[1])) if row[1] else session_start_dt
+            log(f"Session start_dt: {session_start_dt}  end_dt: {session_end_dt}")
     except: pass
     if session_start_dt is None:
         import re; from datetime import datetime as _dt3
@@ -950,16 +958,21 @@ def main():
         if m:
             try: session_start_dt=_dt3.strptime(m.group(1),"%Y%m%d%H%M%S"); log(f"start_dt from filename: {session_start_dt}")
             except: pass
+        session_end_dt = session_start_dt
 
-    # ── sensor data ──────────────────────────────────────────────────────────
-    if args.kinetic_csv or args.behavior_csv:
-        log("Loading sensor data...")
-        SENSOR_DATA = load_sensor_data(args.kinetic_csv, args.behavior_csv)
+    # ── sensor data — always auto-discovered from Drive by session time window ──
+    if session_start_dt is not None and session_end_dt is not None:
+        log("Auto-discovering collar data from Drive...")
+        kin_df = dm.load_collar_data(session_start_dt, session_end_dt, kind="kinetic")
+        beh_df = dm.load_collar_data(session_start_dt, session_end_dt, kind="behavior")
+        SENSOR_DATA = load_sensor_data(kin_df, beh_df)
         if SENSOR_DATA:
             SENSOR_AIDS = sorted(SENSOR_DATA.keys())
             log(f"Sensor data loaded for AnimalIds: {SENSOR_AIDS}")
         else:
-            log("No sensor data loaded.")
+            log("No sensor data found for this session window.")
+    else:
+        log("WARNING: no session window known — cannot auto-discover sensor data.")
 
     # ── vision features ──────────────────────────────────────────────────────
     vision_index = load_vision_features(str(db), args.session_id)
@@ -1004,9 +1017,8 @@ if __name__ == "__main__":
 # Example usage (--sink flag is now optional, defaults to web):
 # python3 display_tracks.py \
 #   --video      "$VID" \
-#   --db         "$DB" \
-#   --draw_pose --kp_index --hide_occluded --kp_conf_thresh 0.35 \
-#   --kinetic_csv  "$KIN" \
-#   --behavior_csv "$BIH"
+#   --draw_pose --kp_index --hide_occluded --kp_conf_thresh 0.35
 # (session_id is now auto-derived from $VID's filename, same logic as
-#  track_and_dump.py; pass --session_id explicitly only to override.)
+#  track_and_dump.py; pass --session_id explicitly only to override.
+#  db and sensor data are always resolved via drive_manager.py — there
+#  is no --db, --kinetic_csv, or --behavior_csv flag.)

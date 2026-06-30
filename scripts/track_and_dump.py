@@ -131,11 +131,8 @@ def parse_args():
                     help="Flush to SQLite + Parquet every M windows, i.e. every "
                          "save_every * flush_every frames (default: 5).")
     # ── reconcile.py integration ──────────────────────────────────────────────
-    ap.add_argument("--kinetics", default="",
-                    help="kinetic_data_*.csv path. If omitted, matching files are "
-                         "discovered automatically from Drive using the session time window.")
-    ap.add_argument("--gallery_dir", default="./reid_gallery",
-                    help="Gallery directory for reconcile.py (default: ./reid_gallery)")
+    # NOTE: kinetics and gallery_dir are NOT arguments — reconcile.py (called
+    # automatically below) resolves both via drive_manager, keyed off session_id.
     ap.add_argument("--corr_threshold",   type=float, default=0.7)
     ap.add_argument("--cosine_threshold", type=float, default=0.75)
     ap.add_argument("--ema_alpha",        type=float, default=0.15)
@@ -788,11 +785,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
         r_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(r_mod)
         r_args = _ap.Namespace(
-            db                 = str(db_path),
             session            = session_id,
-            kinetics           = args.kinetics,
-            gallery_dir        = args.gallery_dir,
-            embed_parquet      = str(outdir),   # directory — reconcile globs *_part*.parquet
             corr_threshold     = args.corr_threshold,
             min_active_bins    = 3,
             min_temp_id_frames = 0.10,
@@ -804,6 +797,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             cosine_min_embeds  = 5,
             dry_run            = False,
             verbose            = False,
+            bypass_upload_check = getattr(args, "bypass_upload_check", False),
         )
         r_mod.run(r_args)
     except Exception as exc:
@@ -958,18 +952,13 @@ if __name__ == "__main__":
 #   --save_crops --crop_every 300 --min_crop_wh 100 100 --crop_tags
 #   # add --crops_local to skip uploading crops to Drive
 #
-# ── Manual kinetics override (skip auto-discovery) ───────────────────────────
-# python3 track_and_dump.py ... \
-#   --kinetics ~/thesis_workspace/vcf-ctp/data/collar_data/kinetic_data_s...__6366_7507_7513.csv
-#
 # ── Re-run reconcile manually on an existing session ─────────────────────────
 # SESSION=refet_33_20241221070000   # auto-derived from filename _S<timestamp>
 # python3 reconcile.py \
-#   --session       "$SESSION" \
-#   --db            ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-#   --embed_parquet ~/thesis_workspace/vcf-ctp/data/outputs/$SESSION/embeds.parquet
+#   --session       "$SESSION"
 #   # add --dry_run to test without writing
-#   # add --kinetics /path/to/file.csv to override auto-discovery
+#   # db, kinetics, behavior, gallery, and parquet are all resolved via
+#   # drive_manager.py — there is no manual-override flag for any of them
 #
 # Notes:
 #   Models are loaded once and reused across all videos in a batch.

@@ -13,10 +13,14 @@ Writes:
   - metrics.json        (consumed by coverage_timeline.html / metrics_dashboard.html)
 
 Usage:
-  python3 metrics_export.py                        # uses defaults (paths from drive_manager constants)
-  python3 metrics_export.py --db path/to/db        # override DB path
-  python3 metrics_export.py --out path/to/out.json # override output path
-  python3 metrics_export.py --watch                # re-export every 30 s (dev mode)
+  python3 metrics_export.py                        # always uses drive_manager paths
+  python3 metrics_export.py --out path/to/out.json  # override OUTPUT path only (not a data source)
+  python3 metrics_export.py --watch                 # re-export every 30 s (dev mode)
+
+Note: there is no --db, --collar, --gallery, --proclog, or --buffer flag.
+Every data path is imported directly from drive_manager.py — never
+redefined or overridable here — so this script can't silently drift from
+the single source of truth.
 """
 
 import argparse
@@ -32,14 +36,17 @@ from pathlib import Path
 
 import pandas as pd
 
-# ── Default paths (mirror drive_manager.py constants) ────────────────────────
-LOCAL_ROOT   = Path("~/thesis_workspace/vcf-ctp/data/").expanduser()
-BUFFER_DIR   = Path("~/thesis_workspace/vcf-ctp/.buffer/").expanduser()
+# ── Paths — imported directly from drive_manager.py, never redefined here ────
+from drive_manager import (
+    LOCAL_ROOT, LOCAL_DB_PATH, LOCAL_GALLERY_DIR, LOCAL_COLLAR_DIR, BUFFER_DIR,
+    DriveManager,
+)
+
 SCRIPTS_DIR  = Path(__file__).parent
 
-DEFAULT_DB           = LOCAL_ROOT / "calving_project.db"
-DEFAULT_COLLAR_DIR   = LOCAL_ROOT / "collar_data"
-DEFAULT_GALLERY_DIR  = LOCAL_ROOT / "reid_gallery"
+DEFAULT_DB           = LOCAL_DB_PATH
+DEFAULT_COLLAR_DIR   = LOCAL_COLLAR_DIR
+DEFAULT_GALLERY_DIR  = LOCAL_GALLERY_DIR
 DEFAULT_PROC_LOG     = LOCAL_ROOT / "processing_log.csv"          # synced from Drive
 DEFAULT_OUT          = SCRIPTS_DIR.parent / "metrics" / "metrics.json"
 
@@ -499,29 +506,33 @@ def export_all(db_path: Path, collar_dir: Path, gallery_dir: Path,
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--db",      default=str(DEFAULT_DB),
-                        help="Path to calving_project.db")
-    parser.add_argument("--collar",  default=str(DEFAULT_COLLAR_DIR),
-                        help="Directory containing collar CSVs (local cache)")
-    parser.add_argument("--gallery", default=str(DEFAULT_GALLERY_DIR),
-                        help="Directory containing reid_gallery .npy files")
-    parser.add_argument("--proclog", default=str(DEFAULT_PROC_LOG),
-                        help="Path to processing_log.csv")
-    parser.add_argument("--buffer",  default=str(BUFFER_DIR),
-                        help="Path to .buffer/ directory")
+    # NOTE: no --db / --collar / --gallery / --proclog / --buffer flags.
+    # All data paths come directly from drive_manager.py's constants — see
+    # the module docstring for why.
     parser.add_argument("--out",     default=str(DEFAULT_OUT),
-                        help="Output path for metrics.json")
+                        help="Output path for metrics.json (the only overridable path — "
+                             "it's a destination, not a data source)")
     parser.add_argument("--watch",   action="store_true",
                         help="Re-export every 30 s (dev mode)")
     parser.add_argument("--pretty",  action="store_true", default=True,
                         help="Pretty-print JSON (default: on)")
+    parser.add_argument("--bypass_upload_check", action="store_true",
+                        help="Skip dirty-flag check when pulling the DB from Drive")
     args = parser.parse_args()
 
-    db_path     = Path(args.db).expanduser()
-    collar_dir  = Path(args.collar).expanduser()
-    gallery_dir = Path(args.gallery).expanduser()
-    proc_log    = Path(args.proclog).expanduser()
-    buffer_dir  = Path(args.buffer).expanduser()
+    # Pull the canonical DB from Drive (dev dashboard reads — never writes)
+    dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
+    try:
+        db_path = dm.pull_db(allow_stale=args.bypass_upload_check)
+    except Exception as exc:
+        print(f"WARNING: could not pull DB from Drive ({exc}); "
+              f"metrics will report db_missing if no local copy exists.")
+        db_path = DEFAULT_DB
+
+    collar_dir  = DEFAULT_COLLAR_DIR
+    gallery_dir = DEFAULT_GALLERY_DIR
+    proc_log    = DEFAULT_PROC_LOG
+    buffer_dir  = BUFFER_DIR
     out_path    = Path(args.out).expanduser()
 
     def run_once():

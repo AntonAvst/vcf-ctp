@@ -639,6 +639,32 @@ def get_gallery_dir(caller: str = "", bypass: bool = False) -> Path:
     return LOCAL_GALLERY_DIR
 
 
+def get_session_window(db_path: "Path | str", session_id: str):
+    """
+    Look up (start_dt, end_dt) for a session_id from video_sessions in the
+    (already-pulled) local DB. Returns (datetime, datetime) or (None, None)
+    if the session or its timestamps aren't found.
+
+    Centralizes session-window lookup so every script that needs it for
+    collar auto-discovery (find_collar_files / load_collar_data) goes
+    through the same logic instead of re-implementing its own SQL.
+    """
+    import sqlite3
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT start_dt, end_dt FROM video_sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None, None
+    start_dt = datetime.fromisoformat(str(row[0]))
+    end_dt = datetime.fromisoformat(str(row[1])) if row[1] else start_dt
+    return start_dt, end_dt
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DB sync helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -942,6 +968,9 @@ class DriveManager:
     def get_session_dir(self, session_id: str) -> Path:
         return get_session_dir(session_id)
 
+    def get_session_window(self, db_path: "Path | str", session_id: str):
+        return get_session_window(db_path, session_id)
+
     def get_kinetics_path(self, filename: str = "") -> Path:
         return get_kinetics_path(filename, caller=self.caller)
 
@@ -950,6 +979,18 @@ class DriveManager:
 
     def get_video_path(self, path: str) -> Path:
         return get_video_path(path)
+
+    # ── collar auto-discovery ────────────────────────────────────────────────
+
+    def find_collar_files(self, session_start_dt: "datetime",
+                          session_end_dt: "datetime",
+                          kind: str = "kinetic") -> "list[Path]":
+        return find_collar_files(session_start_dt, session_end_dt, kind)
+
+    def load_collar_data(self, session_start_dt: "datetime",
+                         session_end_dt: "datetime",
+                         kind: str = "kinetic") -> "pd.DataFrame | None":
+        return load_collar_data(session_start_dt, session_end_dt, kind)
 
     # ── sync operations ──────────────────────────────────────────────────────
 

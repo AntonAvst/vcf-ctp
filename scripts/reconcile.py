@@ -14,17 +14,18 @@ Steps (in order):
 
 Usage:
     python3 reconcile.py \\
-        --db        calving_project.db \\
         --session   session_001 \\
-        --kinetics  kinetic_data_6366_7507_7513.csv \\
-        --tracks    tracks.csv \\
-        [--gallery_dir   ./reid_gallery] \\
-        [--embed_parquet session_001_embeds.parquet] \\
         [--corr_threshold 0.7] \\
         [--min_active_bins 3] \\
         [--cosine_threshold 0.75] \\
         [--ema_alpha 0.15] \\
         [--dry_run]
+
+Note: --db, --kinetics, --gallery_dir, and --embed_parquet are NOT arguments.
+All data paths (DB, collar CSVs, gallery, parquet) are resolved exclusively
+through drive_manager.py, keyed off --session. This guarantees every run
+reads/writes the same canonical Drive-backed data regardless of who runs it
+or from which machine.
 
 Requirements: pip install pandas numpy scipy pyarrow
 """
@@ -74,17 +75,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- required ---
-    ap.add_argument("--db",       required=True, help="Path to calving_project.db (SQLite)")
     ap.add_argument("--session",  required=True, help="session_id to process (from video_sessions)")
-    ap.add_argument("--kinetics", default="",
-                    help="kinetic_data_*.csv path. If omitted, matching files are "
-                         "discovered automatically from Drive using the session time window.")
-    # --- optional paths ---
-    ap.add_argument("--gallery_dir",   default="./reid_gallery",
-                    help="Directory containing gallery_day.npy / gallery_night.npy (default: ./reid_gallery)")
-    ap.add_argument("--embed_parquet", default="",
-                    help="Parquet file with embed[128] columns keyed by (session_id, frame_index, temp_id). "
-                         "If omitted, embeds are read from tracks.csv 'embed' column.")
+    # NOTE: --db, --kinetics, --gallery_dir, --embed_parquet are intentionally
+    # NOT arguments. Every data path is resolved through drive_manager.py,
+    # keyed off --session, so there is exactly one source of truth (Drive).
 
     # --- step A: kinetic matching ---
     ap.add_argument("--corr_threshold",   type=float, default=0.7,
@@ -1211,9 +1205,7 @@ def run(args) -> None:
     """
     section("reconcile.py — ReID pipeline")
     log(f"session_id  : {args.session}")
-    log(f"kinetics    : {args.kinetics or '(auto-discover from Drive)'}")
-    log(f"db          : {args.db}")
-    log(f"gallery_dir : {args.gallery_dir}")
+    log("All data paths (db, kinetics, behavior, gallery, parquet) resolved via drive_manager")
     log(f"dry_run     : {args.dry_run}")
 
     # ── Drive setup ───────────────────────────────────────────────────────────
@@ -1269,7 +1261,9 @@ def run(args) -> None:
     log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
 
     # update is_night on the session row and load camera_id
-    upsert_session(conn, args.session, args.db, is_night)
+    # (video_path is registered by track_and_dump.py; this is just a fallback
+    #  INSERT OR IGNORE for sessions reconcile.py is run against standalone)
+    upsert_session(conn, args.session, "", is_night)
     session_row = get_session(conn, args.session)
     camera_id   = (session_row.get("camera_id") or "cam0") if session_row else "cam0"
     log(f"camera_id={camera_id}")
@@ -1287,30 +1281,23 @@ def run(args) -> None:
     if pd.isnull(session_end):
         session_end = tracks_df["frame_datetime"].max()
 
-    if args.kinetics:
-        log(f"Loading kinetics CSV (manual override): {args.kinetics}")
-        kinetics_df = pd.read_csv(args.kinetics, parse_dates=["datetime"])
-        log(f"  {len(kinetics_df)} rows, animals: {sorted(kinetics_df['AnimalId'].unique())}")
+    log("Auto-discovering kinetics CSVs from Drive...")
+    kinetics_df = dm.load_collar_data(session_start.to_pydatetime(),
+                                      session_end.to_pydatetime(), kind="kinetic")
+    if kinetics_df is None or kinetics_df.empty:
+        log("WARNING: no kinetics data found for this session window — "
+            "kinetic matching will be skipped.")
+        kinetics_df = pd.DataFrame(columns=["AnimalId","datetime",
+                                             "KineticsCountX","KineticsCountY",
+                                             "KineticsCountZ","KineticsCountR"])
     else:
-        log("Auto-discovering kinetics CSVs from Drive...")
-        from drive_manager import load_collar_data as _load_collar
-        kinetics_df = _load_collar(session_start.to_pydatetime(),
-                                   session_end.to_pydatetime(), kind="kinetic")
-        if kinetics_df is None or kinetics_df.empty:
-            log("WARNING: no kinetics data found for this session window — "
-                "kinetic matching will be skipped.")
-            kinetics_df = pd.DataFrame(columns=["AnimalId","datetime",
-                                                 "KineticsCountX","KineticsCountY",
-                                                 "KineticsCountZ","KineticsCountR"])
-        else:
-            log(f"  {len(kinetics_df)} rows, animals: "
-                f"{sorted(kinetics_df['AnimalId'].unique().tolist())}")
+        log(f"  {len(kinetics_df)} rows, animals: "
+            f"{sorted(kinetics_df['AnimalId'].unique().tolist())}")
 
     # behavior — auto-discover from Drive
     log("Auto-discovering behavior CSVs from Drive...")
-    from drive_manager import load_collar_data as _load_collar
-    behavior_df = _load_collar(session_start.to_pydatetime(),
-                               session_end.to_pydatetime(), kind="behavior")
+    behavior_df = dm.load_collar_data(session_start.to_pydatetime(),
+                                      session_end.to_pydatetime(), kind="behavior")
     if behavior_df is None or behavior_df.empty:
         log("No behavior data found for this session window — d_f12/f23/v will be NaN")
         behavior_df = None
@@ -1328,8 +1315,12 @@ def run(args) -> None:
             log(f"  Note: manual overrides kinetic for temp_ids: {sorted(conflicts)}")
         kinetic_assignment.update(manual_assignment)
 
-    # ── load embeds from parquet ──────────────────────────────────────────────
-    embed_df = load_embeds_for_session(tracks_df, args.embed_parquet, args.session)
+    # ── load embeds from parquet (always via drive_manager — never a CLI override) ──
+    # NOTE: embeds are written as multi-part files (embeds_part000.parquet, ...)
+    # by track_and_dump.py's EmbedWriter, so we pass the session directory —
+    # load_embeds_for_session() globs *_part*.parquet within it.
+    embed_parquet_path = str(dm.get_session_dir(args.session))
+    embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session)
 
     # ── Step B — gallery builder ──────────────────────────────────────────────
     gallery = step_b_gallery_builder(
@@ -1412,8 +1403,8 @@ def run(args) -> None:
             assignment    = full_assignment,
             is_night      = is_night,
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
-            kps_parquet   = str(Path(args.embed_parquet)) if args.embed_parquet else None,
-            embed_parquet = args.embed_parquet or None,
+            kps_parquet   = str(dm.get_parquet_path(args.session, "kps")),
+            embed_parquet = embed_parquet_path,
             gallery_dir   = gallery_dir,
             ema_alpha     = args.ema_alpha,
             dry_run       = args.dry_run,
@@ -1477,15 +1468,11 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # python3 reconcile.py \
-#   --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
 #   --session    refet33_20241221 \
-#   --kinetics   "$KIN" \
-#   --gallery_dir "$GAL" \
 #   --corr_threshold 0.7 \
 #   --min_active_bins 3 \
 #   --cosine_threshold 0.75 \
-#   --ema_alpha 0.15 \
-#   --embed_parquet ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/embeds.parquet 
+#   --ema_alpha 0.15
 #
 # Dry run (no DB writes):
 #   --dry_run
@@ -1493,13 +1480,13 @@ if __name__ == "__main__":
 # After running, validate visually:
 #   python3 display_tracks.py \
 #     --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.mp4 \
-#     --db         ~/thesis_workspace/outputs/tracks/refet33_2024-12-21/calving_project.db \
 #     --session_id refet33_20241221 \
-#     --kinetics   "$KIN" \
 #     --draw_pose --show_fps --sink ffplay
 #
 # Pipeline notes:
 #   - Run once per session after track_and_dump.py completes
+#   - DB, kinetics, behavior, gallery, and parquet are all resolved through
+#     drive_manager.py — there is no local-path override for any of them
 #   - Gallery files accumulate across sessions — more sessions = better cosine matching
 #   - Kinetic matching requires ≥3 active 15-min bins (45+ minutes of video)
 #   - Cosine resolver is a no-op on first run (empty gallery) — by design

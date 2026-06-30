@@ -2,6 +2,17 @@
 """
 match_identity.py — match camera temp_ids to sensor AnimalIds using kinetics correlation.
 
+Note on scope: this is the one script in the pipeline that intentionally does
+NOT go through drive_manager.py. It's a standalone correlation utility for
+ad-hoc debugging against any exported tracks.csv / kinetics.csv pair — by
+design it never touches the database (see Databases section of the project
+README). Inside the actual pipeline, reconcile.py and display_tracks.py never
+invoke this CLI; they call score_up_to()/compute_scores() directly with
+in-memory DataFrames that *they* already sourced from drive_manager. If you
+want this CLI mode itself to stop accepting raw file paths too, it would need
+to take --session and call dm.load_collar_data(...) / read tracks from the DB
+instead of --tracks/--kinetics — ask if you want that version instead.
+
 Strategy:
   - Divide the overlapping time window into 15-minute bins (aligned to kinetics intervals)
   - For each bin: compute camera displacement per temp_id and kinetics delta per animal

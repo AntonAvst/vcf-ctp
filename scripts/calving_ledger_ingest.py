@@ -27,14 +27,16 @@ Usage
 -----
   python3 calving_ledger_ingest.py \\
       --file  gazit_calving_events_202505_202605.xlsx \\
-      --farm  gazit \\
-      --db    ~/thesis_workspace/vcf-ctp/data/calving_project.db
+      --farm  gazit
 
   # Parse + validate only, write nothing:
-  python3 calving_ledger_ingest.py --file ... --farm gazit --db ... --dry_run
+  python3 calving_ledger_ingest.py --file ... --farm gazit --dry_run
 
   # Re-ingest (replace existing rows):
-  python3 calving_ledger_ingest.py --file ... --farm gazit --db ... --overwrite
+  python3 calving_ledger_ingest.py --file ... --farm gazit --overwrite
+
+Note: there is no --db flag. The database is always the canonical copy
+pulled from Drive via drive_manager.py.
 
 Adding a new farm
 -----------------
@@ -538,24 +540,22 @@ def main():
 
     # ---- Pull DB from Drive -------------------------------------------------
     sys.path.insert(0, os.path.dirname(__file__))
-    dm = None
     try:
         from drive_manager import DriveManager
-        dm = DriveManager(caller=__file__, bypass=args.bypass_upload_check)
-        if not args.dry_run:
-            print("[ingest] Pulling DB from Drive...")
-            dm.pull_db()
-        db_path = dm.get_db_path()
     except ImportError:
         print(
-            "WARNING: drive_manager not found. "
-            "Falling back to local DB at default path.",
+            "ERROR: drive_manager.py not found. The database path is never "
+            "configured anywhere except drive_manager.py — make sure it's "
+            "in the same directory as this script.",
             file=sys.stderr,
         )
-        db_path = os.path.join(
-            os.path.expanduser("~"),
-            "thesis_workspace", "vcf-ctp", "data", "calving_project.db",
-        )
+        sys.exit(1)
+
+    dm = DriveManager(caller=__file__, bypass=args.bypass_upload_check)
+    if not args.dry_run:
+        print("[ingest] Pulling DB from Drive...")
+        dm.pull_db()
+    db_path = dm.get_db_path()
 
     print(f"[ingest] Farm      : {farm}")
     print(f"[ingest] File      : {args.file}")
@@ -607,7 +607,7 @@ def main():
     conn.close()
 
     # ---- Sync DB back to Drive ----------------------------------------------
-    if not args.dry_run and dm is not None:
+    if not args.dry_run:
         try:
             dm.sync_db(session_id="ledger_ingest")
             print("[ingest] DB synced to Drive.")

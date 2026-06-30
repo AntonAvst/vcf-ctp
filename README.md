@@ -716,3 +716,6 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 1.  resolve session id logic
 2.  regenerate tracks with higher frame rate (< 0.5[sec])
 3.  filter out temp ids with less then epsilon instances
+4.  what to do about bbox overpopulation?
+5.  OCR?
+6.  change day-night logic to grayscale vs rgb
