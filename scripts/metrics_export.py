@@ -216,6 +216,24 @@ def export_identity(conn: sqlite3.Connection) -> dict:
             if v >= 1.0:
                 pearson_hist[-1] += 1
 
+    # ── Identity resolution over time (one point per session) ──────────────
+    id_over_time = _safe_query(conn, """
+        SELECT
+            vs.session_id,
+            vs.start_dt,
+            COUNT(DISTINCT CASE WHEN rr.match_method = 'kinetic'    THEN rct.real_id END) AS kinetic,
+            COUNT(DISTINCT CASE WHEN rr.match_method LIKE 'cosine%' THEN rct.real_id END) AS cosine,
+            COUNT(DISTINCT CASE WHEN rr.match_method = 'manual'     THEN rct.real_id END) AS manual,
+            COUNT(DISTINCT CASE WHEN rct.real_id IS NULL            THEN rct.temp_id END) AS unresolved
+        FROM video_sessions vs
+        LEFT JOIN resolved_cow_timeline rct ON rct.session_id = vs.session_id
+        LEFT JOIN reid_registry rr          ON rr.real_id     = rct.real_id
+        GROUP BY vs.session_id, vs.start_dt
+        ORDER BY vs.start_dt
+    """)
+    for r in id_over_time:
+        r["start_dt"] = _ts(r.get("start_dt"))
+
     return {
         "by_method":       by_method,
         "unresolved":      unresolved_count,
@@ -224,6 +242,7 @@ def export_identity(conn: sqlite3.Connection) -> dict:
         "modality_masks":  mask_rows,
         "pearson_hist":    pearson_hist,
         "pearson_bins":    ["0–0.2","0.2–0.4","0.4–0.6","0.6–0.7","0.7–0.8","0.8–0.9","0.9–1.0"],
+        "id_over_time":    id_over_time,
     }
 
 

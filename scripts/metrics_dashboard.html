@@ -169,6 +169,19 @@ input[type=range]{flex:1;accent-color:#2a78d6}
     <div class="ctitle">Fraction of resolved_cow_timeline rows with each modality bit set</div>
     <div id="modality-bars"></div>
   </div>
+
+  <div class="section">Match method — over time</div>
+  <div class="card">
+    <div class="ctitle">Identities confirmed per session — one point per processed video, cumulative</div>
+    <div class="chart-wrap" style="height:200px"><canvas id="match-over-time" role="img" aria-label="Match method over time"></canvas></div>
+    <div class="legend-row" id="match-legend"></div>
+  </div>
+
+  <div class="section">Unresolved temp_ids — over time</div>
+  <div class="card">
+    <div class="ctitle">Unresolved temp_ids per session — should trend toward zero as the gallery matures</div>
+    <div class="chart-wrap" style="height:160px"><canvas id="unresolved-over-time" role="img" aria-label="Unresolved temp_ids over time"></canvas></div>
+  </div>
 </div>
 
 <!-- ── SENSOR ─────────────────────────────────────────────────── -->
@@ -448,6 +461,9 @@ function renderIdentity(){
     </div>`;
   }
 
+  // Match-over-time charts
+  renderMatchOverTime();
+
   // Modality mask bars
   const masks=id.modality_masks||[];
   const totalMask=masks.reduce((s,r)=>s+r.n,0)||1;
@@ -466,6 +482,129 @@ function renderIdentity(){
       return barRow(m.label,pct,m.color,n?n.toLocaleString():'—');
     }).join('')+
     (!masks.length?'<p class="empty" style="margin-top:8px">Populated once resolved_cow_timeline has rows.</p>':'');
+}
+
+// ── Identity over time charts ─────────────────────────────────────────────────
+function renderMatchOverTime(){
+  const id = DATA.identity || {};
+  const pts = id.id_over_time || [];
+
+  // Build labels from session start dates
+  const labels = pts.map(p => {
+    if (!p.start_dt) return p.session_id || '?';
+    const d = new Date(p.start_dt);
+    return d.getDate() + ' ' + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
+  });
+
+  const series = [
+    { key: 'kinetic',    label: 'Kinetic',  color: '#2a78d6' },
+    { key: 'cosine',     label: 'Cosine',   color: '#1baf7a' },
+    { key: 'manual',     label: 'Manual',   color: '#eda100' },
+  ];
+
+  // ── Chart 1: match methods ──────────────────────────────────────────────
+  if (CHARTS.matchTime) CHARTS.matchTime.destroy();
+  const ctx1 = document.getElementById('match-over-time');
+  if (ctx1) {
+    CHARTS.matchTime = new Chart(ctx1, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: series.map(s => ({
+          label:       s.label,
+          data:        pts.map(p => p[s.key] || 0),
+          borderColor: s.color,
+          backgroundColor: s.color + '18',
+          borderWidth: 2,
+          pointRadius: pts.length <= 20 ? 4 : 2,
+          pointHoverRadius: 6,
+          tension: 0.3,
+          fill: false,
+        }))
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: items => {
+                const p = pts[items[0].dataIndex];
+                return (p.session_id || labels[items[0].dataIndex]);
+              }
+            }
+          }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 10 }, color: '#898781', maxTicksLimit: 12 } },
+          y: { grid: { color: 'rgba(128,128,128,.12)' }, ticks: { font: { size: 10 }, color: '#898781' },
+               beginAtZero: true, title: { display: true, text: 'IDs confirmed', font: { size: 10 }, color: '#898781' } }
+        }
+      }
+    });
+
+    document.getElementById('match-legend').innerHTML = series.map(s =>
+      `<div class="l-item"><span class="l-sq" style="background:${s.color}"></span>${s.label}</div>`
+    ).join('');
+  }
+
+  // ── Chart 2: unresolved ─────────────────────────────────────────────────
+  if (CHARTS.unresolvedTime) CHARTS.unresolvedTime.destroy();
+  const ctx2 = document.getElementById('unresolved-over-time');
+  if (ctx2) {
+    CHARTS.unresolvedTime = new Chart(ctx2, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Unresolved',
+          data: pts.map(p => p.unresolved || 0),
+          borderColor: '#d03b3b',
+          backgroundColor: 'rgba(208,59,59,.10)',
+          borderWidth: 2,
+          pointRadius: pts.length <= 20 ? 4 : 2,
+          pointHoverRadius: 6,
+          tension: 0.3,
+          fill: true,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              title: items => {
+                const p = pts[items[0].dataIndex];
+                return (p.session_id || labels[items[0].dataIndex]);
+              }
+            }
+          }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 10 }, color: '#898781', maxTicksLimit: 12 } },
+          y: { grid: { color: 'rgba(128,128,128,.12)' }, ticks: { font: { size: 10 }, color: '#898781' },
+               beginAtZero: true, title: { display: true, text: 'Unresolved temp_ids', font: { size: 10 }, color: '#898781' } }
+        }
+      }
+    });
+  }
+
+  // Show empty hint if no sessions yet
+  if (!pts.length) {
+    ['match-over-time','unresolved-over-time'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        const p = document.createElement('p');
+        p.className = 'empty';
+        p.style.padding = '2rem 0';
+        p.textContent = 'Populated after first reconcile run.';
+        el.parentNode.insertBefore(p, el);
+        el.style.display = 'none';
+      }
+    });
+  }
 }
 
 // ── Sensor ───────────────────────────────────────────────────────────────────
