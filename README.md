@@ -710,9 +710,37 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 
 - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
   When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
-- [ ] resolve session id logic
+- [ ] resolve session id logic (video name, time, etc...)
 - [ ] regenerate tracks with higher frame rate (< 0.5[sec])
 - [ ] filter out temp ids with less then epsilon instances
 - [ ] what to do about bbox overpopulation?
 - [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
+- [ ] Carry a provenance tag through Steps A.5→B→A.6
+- [ ] drop camera_id restriction in TempPoseGallery
+- [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
+- [ ] Cross-camera identity tracking (continuation of the point above)
+- [ ] Reset the tracker between videos in batch mode.
+- [ ] Collapse match_identity.py and reconcile's inline correlation logic into one implementation.
+- [ ] Move vision-feature constants into the config file, including CLI plumbing.
+- [ ] Move from strict hierarchical override to a fused confidence score once ≥3–4 matching signals exist, keeping manual as a hard override.
+- [ ] Short-gap tracklet stitching before Step C — position-extrapolation-based merge of brief tracker dropouts, independent of detector type.
+- [ ] Minimum-occurrence-count filter
+- [ ] Config file for constants/thresholds, migrated incrementally.
+- [ ] Configurable ID-matching hierarchy (e.g. manual > kinetic = cosine > ocr) with tie-break rules.
+- [ ] Persist per-session cosine drift and populate embed_mean (computes how similar this session's embedding is to the cow's previous gallery embedding)
+
+---
+- [ ] retrain pose estimator
+- [ ] decide what to do with clumping
+---
+- [ ] **convert yolo detector with yolo segmentor**
+  - [ ] Tracker mask-IoU
+  - [ ] SAM-assisted labeling workflow needed for training data — cheap for isolated cows, expensive (point-prompt per animal) specifically for clumped scenes.
+    - [ ] 800–1,500 frames for segmentation training 
+      - [ ] 150–300 clump-heavy
+      - [ ] 500–800 with no clump
+      - [ ] 100–200-frame held-out eval set specifically for clump-splitting quality
+  - [ ] Coat-pattern fingerprinting
+  - [ ] fp16/explicit-device optimization?
+
