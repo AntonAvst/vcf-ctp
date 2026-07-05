@@ -688,13 +688,6 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 
 ---
 
-## ToDo
-
-- [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
-  When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
-
----
-
 ## Milestone Schedule
 | Milestone | Target | Status |
 |---|---|---|
@@ -711,11 +704,15 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 | Research Paper | October 30, 2026 | — |
 | Thesis Document | November 30, 2026 | — |
 
+---
 
-## TODO:
-1.  resolve session id logic
-2.  regenerate tracks with higher frame rate (< 0.5[sec])
-3.  filter out temp ids with less then epsilon instances
-4.  what to do about bbox overpopulation?
-5.  OCR?
-6.  change day-night logic to grayscale vs rgb
+## ToDo
+
+- [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
+  When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
+- [ ] resolve session id logic
+- [ ] regenerate tracks with higher frame rate (< 0.5[sec])
+- [ ] filter out temp ids with less then epsilon instances
+- [ ] what to do about bbox overpopulation?
+- [ ] OCR?
+- [ ] change day-night logic to grayscale vs rgb
