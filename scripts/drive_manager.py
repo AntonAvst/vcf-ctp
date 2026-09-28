@@ -339,6 +339,10 @@ def _rclone_download(drive_src: str, local_path: Path,
       ok        — True if download succeeded
       not_found — True if the file simply doesn't exist on Drive yet
                   (vs a real connectivity/auth failure)
+    On failure that isn't a clean "not found", the real rclone stderr is
+    logged immediately — never silently discarded — so the actual cause
+    (quota, permissions, API/version incompatibility, etc.) is visible
+    right away instead of surfacing only as a generic "Drive unavailable".
     """
     local_path.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
@@ -353,7 +357,12 @@ def _rclone_download(drive_src: str, local_path: Path,
     not_found = any(phrase in err for phrase in (
         "object not found", "no such file", "not found", "no objects found",
         "couldn't find", "directory not found",
+        "source doesn't exist",  # older rclone: same "missing source" case,
+                                  # worded differently when dest already exists locally
     ))
+    if not not_found:
+        _log(f"rclone copyto failed (exit {r.returncode}) for {drive_src}:")
+        _log(f"  {(r.stderr or '(no stderr captured)').strip()}")
     return False, not_found
 
 

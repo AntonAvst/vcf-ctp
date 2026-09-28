@@ -720,7 +720,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] drop camera_id restriction in TempPoseGallery
 - [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
 - [ ] Cross-camera identity tracking (continuation of the point above)
-- [ ] Reset the tracker between videos in batch mode.
+- [x] Reset the tracker between videos in batch mode.
 - [ ] Collapse match_identity.py and reconcile's inline correlation logic into one implementation.
 - [ ] Move vision-feature constants into the config file, including CLI plumbing.
 - [ ] Move from strict hierarchical override to a fused confidence score once ≥3–4 matching signals exist, keeping manual as a hard override.

@@ -165,6 +165,29 @@ def crops_from_bboxes(frame, bboxes, margin=0.1):
         used.append((xx1, yy1, xx2, yy2))
     return crops, used
 
+def masked_crops_from_polys(frame, used_boxes, mask_polys, fallback_crops):
+    """Background-zeroed crops for the EMBEDDER only, built from segmentation
+    polygons (r.masks.xy). Falls back to raw bbox crops per-instance if a
+    polygon is missing/degenerate (e.g. plain detection model, no masks at all,
+    or a poly with <3 points) — never raises, never drops a detection.
+    Does NOT affect pose-model input or saved crop JPEGs; those stay on raw
+    bbox crops so pose model input distribution is unchanged.
+    """
+    H, W = frame.shape[:2]
+    out = []
+    for i, (xx1, yy1, xx2, yy2) in enumerate(used_boxes):
+        poly = mask_polys[i] if mask_polys is not None and i < len(mask_polys) else None
+        if poly is None or len(poly) < 3:
+            out.append(fallback_crops[i])
+            continue
+        mask_full = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask_full, [poly.astype(np.int32)], 1)
+        m_crop = mask_full[yy1:yy2, xx1:xx2]
+        crop_img = frame[yy1:yy2, xx1:xx2].copy()
+        crop_img[m_crop == 0] = 0
+        out.append(crop_img)
+    return out
+
 def flat_kps_xyv(kps_xyv):
     out = []
     for (x, y, v) in kps_xyv:
@@ -281,6 +304,8 @@ class EmbedWriter:
         # Split into sub-batches that respect the part boundary.
         start = 0
         while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
             remaining_in_part = self.rows_per_part - self._part_rows
             chunk = rows[start : start + remaining_in_part]
             emb_arr = np.stack([r["embed"] for r in chunk])
@@ -295,8 +320,6 @@ class EmbedWriter:
             self._part_rows += len(chunk)
             self.total      += len(chunk)
             start           += len(chunk)
-            if self._part_rows >= self.rows_per_part and start < len(rows):
-                self._roll()
 
     def close(self) -> None:
         self._writer.close()
@@ -337,6 +360,8 @@ class KpsWriter:
             return
         start = 0
         while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
             remaining_in_part = self.rows_per_part - self._part_rows
             chunk     = rows[start : start + remaining_in_part]
             kps_arr   = np.stack([r["kps"]       for r in chunk])
@@ -354,8 +379,6 @@ class KpsWriter:
             self._part_rows += len(chunk)
             self.total      += len(chunk)
             start           += len(chunk)
-            if self._part_rows >= self.rows_per_part and start < len(rows):
-                self._roll()
 
     def close(self) -> None:
         self._writer.close()
@@ -463,6 +486,22 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     crops_dir = ensure_dir(outdir / "crops") if args.save_crops else None
     # Parquet writers use the session outdir; part files are named automatically.
     # embed_pq_path / kps_pq_path are gone — use embed_writer._parts / kps_writer._parts.
+
+    # ── Reset tracker state before starting this video ────────────────────────
+    # det_model is loaded once and reused across every video in the batch. With
+    # persist=True (below), Ultralytics keeps the tracker's internal state —
+    # active tracks, Kalman filters, next-id counter — alive on that model
+    # object across .track() calls. Without an explicit reset here, this video
+    # would start with tracker state left over from the end of the *previous*
+    # video, producing spurious ID switches right at frame 0 that have nothing
+    # to do with this video's actual motion or occlusion. Dropping the
+    # predictor makes Ultralytics lazily rebuild a fresh one (and fresh
+    # trackers) on the next .track() call, so every video starts clean —
+    # identical to running it as a standalone single-video invocation.
+    if getattr(det_model, "predictor", None) is not None:
+        det_model.predictor.trackers = []
+        det_model.predictor = None
+    log("  tracker      : reset (fresh state for this video)")
 
     dm.mark_dirty("parquet", session_id=session_id)
     dm.mark_dirty("db",      session_id=session_id)
@@ -615,15 +654,32 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                  else np.zeros(len(xyxy), dtype=np.float32))
         tids  = r.boxes.id.cpu().numpy().astype(int)
 
+        # Segmentation polygons, if the loaded model is a -seg model.
+        # r.masks.xy is a list of (Ni,2) arrays in ORIGINAL frame pixel coords,
+        # aligned index-for-index with r.boxes (same underlying detections).
+        # None for a plain detection model — everything downstream falls
+        # back to raw bbox crops in that case.
+        mask_polys = None
+        if getattr(r, "masks", None) is not None and r.masks.xy is not None:
+            mask_polys = r.masks.xy
+
         is_sample = (frame_idx % _save_every == 0)
 
         if is_sample:
             crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
 
-            embed_vecs = [None] * len(crops)
-            if crops:
+            # Embedder gets background-removed crops when masks are available
+            # (segmentation model) — pose model and saved crop JPEGs below
+            # deliberately keep using raw `crops` / frame slices unchanged.
+            embed_crops = (
+                masked_crops_from_polys(frame, used_boxes, mask_polys, crops)
+                if mask_polys is not None else crops
+            )
+
+            embed_vecs = [None] * len(embed_crops)
+            if embed_crops:
                 X = torch.from_numpy(
-                    np.stack([to_tensor_bchw(c) for c in crops])
+                    np.stack([to_tensor_bchw(c) for c in embed_crops])
                 ).to(device)
                 with torch.no_grad():
                     Z = embedder(X).cpu().numpy()
@@ -847,6 +903,10 @@ def main():
     log(f"  detector     : {args.model}")
     device    = "cuda" if torch.cuda.is_available() else "cpu"
     det_model = YOLO(args.model); det_model.fuse()
+    is_seg_model = getattr(det_model, "task", None) == "segment"
+    log(f"  det. task    : {getattr(det_model, 'task', 'unknown')}"
+        + ("  (masks -> masked embedder crops)" if is_seg_model
+           else "  (no masks — embedder uses raw bbox crops)"))
     embedder  = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
     pose_model = None
     if args.pose_model:
@@ -926,13 +986,14 @@ if __name__ == "__main__":
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Paths
-# DET=~/thesis_workspace/vcf-ctp/models/cow_detector/best.pt
+# SEG=~/thesis_workspace/vcf-ctp/models/cow_seg/run14/weights/best.pt
 # POSE=~/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
+# VID=~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts
 #
 # ── Single video ─────────────────────────────────────────────────────────────
 # python3 track_and_dump.py \
-#   --model      "$DET" \
-#   --source     ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts \
+#   --model      "$SEG" \
+#   --source     "$VID" \
 #   --pose_model "$POSE" \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
 #   --pose_imgsz 384 --pose_conf 0.25 \
@@ -940,7 +1001,7 @@ if __name__ == "__main__":
 #
 # ── Batch — all videos in a directory ────────────────────────────────────────
 # python3 track_and_dump.py \
-#   --model      "$DET" \
+#   --model      "$SEG" \
 #   --source     ~/thesis_workspace/raw_data/calving/ \
 #   --pose_model "$POSE" \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
