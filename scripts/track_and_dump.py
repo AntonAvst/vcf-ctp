@@ -117,6 +117,14 @@ def parse_args():
                          "Note: counts sample frames (i.e. every save_every frames), "
                          "not raw video frames.")
     ap.add_argument("--min_crop_wh", type=int, nargs=2, metavar=("W","H"), default=(0,0))
+    ap.add_argument("--save_masks", action="store_true",
+                    help="Save segmentation mask polygons (when using a -seg model) to a "
+                         "separate local-only Parquet file, purely for visualization/QA — "
+                         "e.g. overlaying masks in display_tracks.py. Written to "
+                         "outputs/<session_id>/qa_masks/ and NEVER uploaded to Drive, "
+                         "never touches raw_tracks/embeds.parquet/kps.parquet, and has no "
+                         "effect on the main pipeline. No-op if the loaded model has no "
+                         "segmentation head (plain detector).")
     ap.add_argument("--embed_size", type=int, default=128)
     ap.add_argument("--pose_model", default="", help="YOLO-Pose .pt (optional)")
     ap.add_argument("--pose_imgsz", type=int,   default=384)
@@ -265,6 +273,17 @@ KPS_SCHEMA = pa.schema([
     pa.field("kps_kconf",   pa.list_(pa.float32(), 19)),
 ])
 
+# QA-only — deliberately NOT part of the canonical outputs (raw_tracks / embeds /
+# kps). Polygons vary in point count per instance, so stored as a JSON string
+# rather than a fixed-size array. See MaskWriter below: written to its own
+# subdirectory and never uploaded to Drive.
+MASK_SCHEMA = pa.schema([
+    pa.field("session_id",     pa.string()),
+    pa.field("frame_index",    pa.int32()),
+    pa.field("temp_id",        pa.int32()),
+    pa.field("mask_poly_json", pa.string()),
+])
+
 
 class EmbedWriter:
     """Rolling multi-part Parquet writer.
@@ -387,6 +406,68 @@ class KpsWriter:
         log(f"kps     → {len(self._parts)} part(s), {self.total} rows, "
             f"{total_mb:.1f} MB total  [{self.outdir.name}]")
 
+
+class MaskWriter:
+    """QA-only rolling Parquet writer for segmentation mask polygons.
+
+    Mirrors EmbedWriter/KpsWriter's rollover logic exactly, but writes to a
+    separate 'qa_masks/' subdirectory of the session outdir, with its own
+    filename prefix (masks_part*.parquet). This keeps it structurally
+    isolated from the canonical embeds_part*/kps_part*.parquet files: the
+    end-of-video Drive upload loop globs `outdir` directly (not subdirs) for
+    those two prefixes only, so files here are never matched and never
+    uploaded — visualization/QA data only, local disk, never touches Drive,
+    raw_tracks, or any other pipeline stage.
+    """
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir / "qa_masks"
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0
+        self.total         = 0
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"masks_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           MASK_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        self._writer.close()
+        self._part += 1
+        self._open_part()
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        start = 0
+        while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk = rows[start : start + remaining_in_part]
+            tbl = pa.table({
+                "session_id":     pa.array([r["session_id"]     for r in chunk], pa.string()),
+                "frame_index":    pa.array([r["frame_index"]    for r in chunk], pa.int32()),
+                "temp_id":        pa.array([r["temp_id"]        for r in chunk], pa.int32()),
+                "mask_poly_json": pa.array([r["mask_poly_json"] for r in chunk], pa.string()),
+            }, schema=MASK_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+
+    def close(self) -> None:
+        self._writer.close()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"qa_masks→ {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [QA only, local, NOT uploaded — {self.outdir}]")
 
 
 def _log_to_batch_log(dm, video_path: "Path", session_id: str,
@@ -550,9 +631,11 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     db_batch:   list = []
     embed_rows: list = []
     kps_rows:   list = []
+    mask_rows:  list = []
 
     embed_writer = EmbedWriter(outdir)
     kps_writer   = KpsWriter(outdir)
+    mask_writer  = MaskWriter(outdir) if args.save_masks else None
 
     crop_occurrence    = defaultdict(int)
     warned_kp_mismatch = False
@@ -600,6 +683,13 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                     "kps_kconf":   det["kconf_arr"],
                 })
                 kps_row_counter += 1
+            if mask_writer is not None and det.get("mask_poly_json") is not None:
+                mask_rows.append({
+                    "session_id":     session_id,
+                    "frame_index":    det["frame_index"],
+                    "temp_id":        tid,
+                    "mask_poly_json": det["mask_poly_json"],
+                })
             db_batch.append((
                 session_id, det["frame_index"], det["t_sec"], det["frame_datetime"],
                 tid, det["conf"],
@@ -616,6 +706,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             conn.commit()
             embed_writer.flush(embed_rows); embed_rows.clear()
             kps_writer.flush(kps_rows);     kps_rows.clear()
+            if mask_writer is not None:
+                mask_writer.flush(mask_rows); mask_rows.clear()
             pbar.set_postfix(frames=frame_idx,
                              fps=f"{frame_idx/max(time()-t_start,1e-6):.1f}")
             windows_since_flush = 0
@@ -725,6 +817,11 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                     kps_mean  = kps_mean_list[j]
                     kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
                     kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
+                mask_poly_json = None
+                if mask_writer is not None and mask_polys is not None and j < len(mask_polys):
+                    poly = mask_polys[j]
+                    if poly is not None and len(poly) >= 3:
+                        mask_poly_json = json.dumps(np.asarray(poly).round(1).tolist())
                 _window_latest[int(tid)] = {
                     "frame_index":    frame_idx,
                     "t_sec":          round(t_sec, 3),
@@ -738,6 +835,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                     "embed":     embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None,
                     "kps_arr":   kps_arr,
                     "kconf_arr": kconf_arr,
+                    "mask_poly_json": mask_poly_json,
                 }
 
                 if crops_dir is not None:
@@ -795,6 +893,9 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     kps_writer.flush(kps_rows);     kps_rows.clear()
     embed_writer.close()
     kps_writer.close()
+    if mask_writer is not None:
+        mask_writer.flush(mask_rows); mask_rows.clear()
+        mask_writer.close()
 
     t_total = time() - t_start
     log(f"Done. {frame_idx} frames in {t_total:.1f}s "
@@ -907,6 +1008,10 @@ def main():
     log(f"  det. task    : {getattr(det_model, 'task', 'unknown')}"
         + ("  (masks -> masked embedder crops)" if is_seg_model
            else "  (no masks — embedder uses raw bbox crops)"))
+    if args.save_masks and not is_seg_model:
+        log("  save_masks   : requested but model has no segmentation head — no-op")
+    elif args.save_masks:
+        log("  save_masks   : ON (QA-only, local disk, never uploaded to Drive)")
     embedder  = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
     pose_model = None
     if args.pose_model:
@@ -1013,6 +1118,10 @@ if __name__ == "__main__":
 #   --save_crops --crop_every 300 --min_crop_wh 100 100 --crop_tags
 #   # add --crops_local to skip uploading crops to Drive
 #
+# ── With masks ───────────────────────────────────────────────────────────────
+# --save_masks
+
+
 # ── Re-run reconcile manually on an existing session ─────────────────────────
 # SESSION=refet_33_20241221070000   # auto-derived from filename _S<timestamp>
 # python3 reconcile.py \

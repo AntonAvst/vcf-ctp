@@ -66,6 +66,7 @@ class _State:
         self.show_kp        = True
         self.show_pose      = True
         self.show_direction = True
+        self.show_mask      = True
 
     def toggle_pause(self):
         with self._lock:
@@ -100,6 +101,7 @@ class _State:
                         show_bbox=self.show_bbox, show_id=self.show_id,
                         show_kp=self.show_kp, show_pose=self.show_pose,
                         show_direction=self.show_direction,
+                        show_mask=self.show_mask,
                         current_dt=self.current_dt.isoformat()
                         if self.current_dt else None)
 
@@ -161,6 +163,27 @@ def classify_frame_features(d: dict) -> dict | None:
         return {"posture": posture_str, "facing": facing_str}
     except Exception:
         return None
+
+
+def draw_mask_overlay(img, poly_pts, color, alpha=0.35, outline_thickness=1):
+    """
+    Fill a segmentation mask polygon with a translucent color, plus a thin
+    outline. QA/visualization only — poly_pts is a list of [x,y] pixel
+    coordinates in original-frame space (from track_and_dump.py's
+    qa_masks/masks_part*.parquet, decoded from JSON).
+
+    Drawn as a separate alpha-blended layer so it never fully occludes the
+    frame underneath, and so draw_box()'s outline/label pills (called after
+    this) render cleanly on top.
+    """
+    if not poly_pts or len(poly_pts) < 3:
+        return
+    pts = np.array(poly_pts, dtype=np.int32).reshape(-1, 1, 2)
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [pts], color)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
+    cv2.polylines(img, [pts], isClosed=True, color=color,
+                  thickness=outline_thickness, lineType=cv2.LINE_AA)
 
 
 def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None,
@@ -260,7 +283,8 @@ def draw_pose(img, kps_xyv, color, kps_conf=None, kp_radius=3, sk_thickness=2,
 # ═══════════════════════════════════════════════════════════════════════════════
 # SQLite track stream  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
-def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parquet_path=""):
+def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parquet_path="",
+                  want_masks=False, masks_parquet_path=""):
     import pandas as pd
     from datetime import datetime as _dt
 
@@ -283,6 +307,25 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
             log(f"kps parquet loaded: {len(part_files)} part(s), {len(kps_df)} rows for session")
         else:
             log(f"WARNING: no kps parquet files found in {kps_dir}")
+
+    masks_df = None
+    if want_masks and masks_parquet_path:
+        masks_dir = Path(masks_parquet_path).parent
+        # QA-only files, written by track_and_dump.py --save_masks to qa_masks/
+        # (local disk only — never on Drive, never in the main DB).
+        part_files = sorted(masks_dir.glob("masks_part*.parquet"))
+        if not part_files and Path(masks_parquet_path).exists():
+            part_files = [Path(masks_parquet_path)]
+        if part_files:
+            masks_df = pd.concat([pd.read_parquet(str(p)) for p in part_files], ignore_index=True)
+            masks_df = masks_df[masks_df["session_id"]==session_id].copy()
+            masks_df["frame_index"] = masks_df["frame_index"].astype(int)
+            masks_df["temp_id"]     = masks_df["temp_id"].astype(int)
+            masks_df = masks_df.set_index(["frame_index","temp_id"])
+            log(f"masks parquet loaded: {len(part_files)} part(s), {len(masks_df)} rows for session")
+        else:
+            log(f"--draw_masks set but no qa_masks/masks_part*.parquet found in {masks_dir} "
+                f"(re-run track_and_dump.py with --save_masks to generate it)")
     try:
         rows = conn.execute("""
             SELECT frame_index,frame_datetime,temp_id,det_conf,x1,y1,x2,y2,kps_conf,kps_parquet_row
@@ -317,6 +360,13 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
                 if len(flat)%3==0:
                     d["kps"]=[(flat[i],flat[i+1],flat[i+2]) for i in range(0,len(flat),3)]
                     d["kps_conf"]=list(krow["kps_kconf"])
+            except: pass
+        if want_masks and masks_df is not None:
+            try:
+                mrow = masks_df.loc[(fi, row["temp_id"])]
+                poly_json = mrow["mask_poly_json"]
+                if poly_json:
+                    d["mask_poly"] = json.loads(poly_json)
             except: pass
         bucket.append(d)
     if bucket: yield cur_fi,cur_fdt,bucket
@@ -561,6 +611,7 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
   <button id="t_kp"        class="active" onclick="toggleFeature('kp')">• Keypoints</button>
   <button id="t_pose"      class="active" onclick="toggleFeature('pose')">🦴 Pose</button>
   <button id="t_direction" class="active" onclick="toggleFeature('direction')">🧭 Direction</button>
+  <button id="t_mask"      class="active" onclick="toggleFeature('mask')">🎭 Mask</button>
   <button id="qbtn" onclick="doQuit()">⏹ Quit</button>
   <span id="clock"></span>
   <span id="status"></span>
@@ -602,7 +653,7 @@ function refreshSensor(){
 
 // ── status polling ───────────────────────────────────────────────────────────
 let paused=false;
-const FEATURES = ['bbox','id','kp','pose','direction'];
+const FEATURES = ['bbox','id','kp','pose','direction','mask'];
 setInterval(()=>{
   fetch('/api/status').then(r=>r.json()).then(s=>{
     paused = s.paused;
@@ -692,7 +743,8 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 
     vid = Path(args.video)
     db = Path(db_path)   # always supplied by main() — no CLI fallback (no --db arg exists)
-    kps_pq = str(db.parent / "outputs" / args.session_id / "kps.parquet")
+    kps_pq   = str(db.parent / "outputs" / args.session_id / "kps.parquet")
+    masks_pq = str(db.parent / "outputs" / args.session_id / "qa_masks" / "masks.parquet")
 
     cap = cv2.VideoCapture(str(vid))
     if not cap.isOpened():
@@ -706,7 +758,9 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
     row_stream = stream_sqlite(str(db), args.session_id,
                                start_frame=args.start,
                                want_pose=args.draw_pose,
-                               kps_parquet_path=kps_pq)
+                               kps_parquet_path=kps_pq,
+                               want_masks=args.draw_masks,
+                               masks_parquet_path=masks_pq)
     try:
         next_fi, next_fdt, next_rows = next(row_stream)
         log(f"First track frame_index: {next_fi}  rows: {len(next_rows)}")
@@ -744,6 +798,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         _show_kp        = _snap["show_kp"]
         _show_pose      = _snap["show_pose"]
         _show_direction = _snap["show_direction"]
+        _show_mask      = _snap["show_mask"]
 
         ok, frame = cap.read()
         if not ok:
@@ -799,6 +854,9 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
             if _feats is None and _aid is not None:
                 _feats = get_features_for(vision_index or {}, _aid, current_fdt)
 
+            if args.draw_masks and _show_mask and d.get("mask_poly"):
+                draw_mask_overlay(frame, d["mask_poly"],
+                                  color=id_color(int(d["temp_id"])))
             draw_box(frame, d["x1"], d["y1"], d["x2"], d["y2"],
                      d["temp_id"], d["conf"],
                      animal_id=_aid, features=_feats,
@@ -863,6 +921,12 @@ def parse_args():
     ap.add_argument("--limit",      type=int,   default=0)
     ap.add_argument("--port",       type=int,   default=5000)
     ap.add_argument("--draw_pose",  action="store_true")
+    ap.add_argument("--draw_masks", action="store_true",
+                     help="Overlay segmentation mask polygons (QA/visualization only). "
+                          "Reads outputs/<session_id>/qa_masks/masks_part*.parquet, written "
+                          "by track_and_dump.py --save_masks. No-op (with a log warning) if "
+                          "that file doesn't exist — re-run track_and_dump.py with "
+                          "--save_masks first to generate it.")
     ap.add_argument("--kp_radius",  type=int,   default=3)
     ap.add_argument("--sk_thickness",type=int,  default=2)
     ap.add_argument("--kp_thresh",  type=float, default=0.0)
