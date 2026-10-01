@@ -89,6 +89,11 @@ python3 drive_manager.py clear-flag      db|parquet|gallery   # emergency manual
 
 All blocked scripts accept `--bypass_upload_check` to skip the flag check and proceed with whatever is currently on Drive (logs a warning, flag stays dirty).
 
+**Pull failure classification (`_rclone_download`):**
+- Distinguishes "file doesn't exist on Drive yet" (first run — proceeds, creates local) from a genuine connectivity/auth failure (`allow_stale` governs whether to proceed with a stale local copy or raise `DriveUnavailableError`), by pattern-matching rclone's `stderr`
+- Known "not found" phrasings include both directory-style (`"directory not found"`) and file-style (`"source doesn't exist"`) wording — different rclone versions phrase the same missing-source condition differently depending on whether the local destination already exists
+- Any failure that doesn't match a known "not found" phrase is logged with the **full raw rclone stderr** via `_log()` — never silently discarded — so a genuine new failure mode (quota, permissions, version incompatibility, etc.) is diagnosable from the log immediately rather than surfacing only as a generic "Drive unavailable"
+
 **Failure buffer:**
 - Failed uploads are copied to `.buffer/pending/` with a `.meta.json` sidecar (dest, caller, size, attempt count)
 - Max 5 attempts across sessions; after that the file is marked `abandoned` and requires manual intervention
@@ -99,12 +104,17 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 
 ### `track_and_dump.py`
 - Runs YOLO detection + ByteTrack/BoT-SORT tracking + YOLOv8-Pose (19 kp) + Embedder128 (MobileNetV3 → 128D L2-norm)
+- **Detector accepts either a plain detection model or a YOLO-seg (instance segmentation) model** — same `--model` flag, auto-detected via `det_model.task` at load time (logged at startup: `det. task : detect|segment`)
+  - **Segmentation model loaded** → `r.masks.xy` polygons are extracted per detection (same index order as `r.boxes`) and used to build **background-removed crops for the embedder only** (`masked_crops_from_polys()`), fixing background contamination in ReID embeddings. Pose-model input and saved crop JPEGs (`--save_crops`) deliberately keep using raw bbox crops — unaffected, so the existing pose model's input distribution doesn't shift.
+  - **Plain detection model loaded** → behavior unchanged from before segmentation support; embedder uses raw bbox crops.
+  - Tracker association (ByteTrack/BoT-SORT) stays **box-IoU only** regardless of model type — mask-IoU association is a separate, not-yet-implemented upgrade (see ToDo).
 - **Batch mode:** `--source` accepts either a single video file or a directory — processes all video files in the directory sequentially
 - Supported video extensions: `.mp4`, `.ts`, `.avi`, `.mov`, `.mkv`
 - Models loaded **once** at startup and reused across all videos in a batch
 - DB pulled from Drive **once** at startup and reused across all videos
 - Outputs to Drive via `drive_manager` per session: `calving_project.db` (SQLite), `embeds.parquet`, `kps.parquet`, optional `crops/`
 - Arrays (embed[128], kps[19×3], kps_kconf[19]) stored in Parquet — **never in SQLite**
+- **QA-only mask persistence (`--save_masks`):** when enabled with a segmentation model, mask polygons are additionally written to `outputs/<session_id>/qa_masks/masks_part*.parquet` (own schema, own filename prefix) — purely for visualization in `display_tracks.py --draw_masks`. Structurally isolated from the canonical outputs: separate subdirectory, separate file prefix, **never uploaded to Drive** (the end-of-video upload loop globs `embeds_part*`/`kps_part*` directly in `outdir`, non-recursive — `qa_masks/` is invisible to it by directory and by filename pattern), never touches `raw_tracks` or any other pipeline stage. No-op with a log line if the loaded model has no segmentation head.
 - Parses wall-clock start time from filename token `_S<YYYYMMDDHHmmss>`
 - Collar CSVs auto-discovered from Drive by matching session time window — no `--kinetics` needed
 - **Calls `reconcile.py` automatically** after each video finishes
@@ -118,7 +128,7 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--model` | required | Detector `.pt` |
+| `--model` | required | Detector `.pt` — plain detection or YOLO-seg, auto-detected |
 | `--source` | required | Single video file or directory of videos (local only) |
 | `--tracker` | `bytetrack.yaml` | Tracker config |
 | `--imgsz` | 960 | Detector image size |
@@ -134,6 +144,7 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 | `--min_crop_wh` | 0 0 | Min crop width/height |
 | `--crop_tags` | off | Append `_<posture>_<facing>` to crop filenames (requires `--pose_model` and `vision_features/`) |
 | `--crops_local` | off | Keep crops on local disk only — do not upload to Drive |
+| `--save_masks` | off | QA-only: save mask polygons to `qa_masks/` (local disk, never uploaded). No-op without a segmentation model |
 | `--save_every` | 10 | Sampling window: keep latest detection per temp_id per N frames |
 | `--flush_every` | 5 | Flush to SQLite + Parquet every M windows (i.e. every N×M frames) |
 | `--kinetics` | *(auto)* | Manual kinetics CSV override; if omitted, auto-discovered from Drive |
@@ -236,7 +247,8 @@ vision_features/
 - Pulls canonical DB from Drive via `drive_manager` at startup; checks `db` dirty flag
 - Imports `match_identity` for live kinetic matching; draws score table overlay (temp_id × AnimalId)
 - Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
-- Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s
+- **`--draw_masks` (QA/visualization only):** overlays segmentation mask polygons as a translucent fill + outline, drawn beneath the bbox/label pills so text stays legible. Reads `outputs/<session_id>/qa_masks/masks_part*.parquet` — the file `track_and_dump.py --save_masks` produces. No-op with a log warning if that file doesn't exist for the session (re-run `track_and_dump.py` with `--save_masks` first). Toggleable live in-browser ("🎭 Mask" button), same generic toggle mechanism as Bbox/Pose/Direction — flips `STATE.show_mask` via `POST /api/control {action: "toggle_mask"}`.
+- Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s; feature toggles: Bbox, ID, Keypoints, Pose, Direction, Mask
 - Accepts `--bypass_upload_check` to proceed when DB flag is dirty
 - Requires: `pip install flask`
 
@@ -645,6 +657,8 @@ python3 drive_manager.py retry-buffer
       embeds.parquet
       kps.parquet
       crops/                                # optional — local only if --crops_local
+      qa_masks/                             # optional — only if --save_masks; QA/visualization
+        masks_part*.parquet                 #   only, NEVER uploaded to Drive, read by display_tracks.py --draw_masks
     reid_gallery/                           # pulled from Drive before reconcile
     collar_data/                            # local copies of auto-discovered collar CSVs
   .buffer/                                  # LOCAL only — never uploaded
@@ -665,6 +679,7 @@ thesis_google_drive:vcf_ctp_data/           # Google Drive (source of truth)
     embeds.parquet
     kps.parquet
     crops/                                  # uploaded unless --crops_local
+    # qa_masks/ is intentionally NEVER here — local-only QA artifact, see track_and_dump.py
   reid_gallery/
     gallery_day.npy
     gallery_night.npy
@@ -731,16 +746,15 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] Persist per-session cosine drift and populate embed_mean (computes how similar this session's embedding is to the cow's previous gallery embedding)
 
 ---
-- [ ] retrain pose estimator
-- [ ] decide what to do with clumping
+- [ ] retrain pose estimator (open question: masked crops vs. raw crops as input — masked-crop training would be an out-of-distribution shift for the current pose model; not yet decided)
+- [ ] decide what to do with clumping — **blocked on evaluation**, see below
 ---
-- [ ] **convert yolo detector with yolo segmentor**
-  - [ ] Tracker mask-IoU
-  - [ ] SAM-assisted labeling workflow needed for training data — cheap for isolated cows, expensive (point-prompt per animal) specifically for clumped scenes.
-    - [ ] 800–1,500 frames for segmentation training 
-      - [ ] 150–300 clump-heavy
-      - [ ] 500–800 with no clump
-      - [ ] 100–200-frame held-out eval set specifically for clump-splitting quality
+- [x] **convert yolo detector with yolo segmentor**
+  - [x] Labeled ~858 images via Roboflow (autolabeling / Smart Polygon, SAM-assisted), pre-split train/valid/test by Roboflow export
+  - [x] Trained YOLOv8n-seg locally via Ultralytics (not Roboflow-hosted training — avoids version-pinning/export-format uncertainty; see training notes). Validation mask mAP50 ≈ 0.93, mAP50-95 ≈ 0.75 on the general val split
+  - [x] Integrated into `track_and_dump.py` — segmentation masks build background-removed crops for the **embedder only** (Problem A: background contamination); pose input and saved crops unaffected
+  - [x] QA/visualization path added: `--save_masks` (track_and_dump.py, local-only, never on Drive) + `--draw_masks` (display_tracks.py, toggleable overlay)
+  - [ ] **No dedicated held-out clumped/touching-cow eval set was built** (explicit decision, not an oversight) — the standard random `test` split (~86 images) is the only current signal on clumping performance, and it may under-represent clumped frames since they're rare in the data. **Clumping-fix quality is therefore still unverified** — this is the open item blocking "decide what to do with clumping" above
+  - [ ] Tracker mask-IoU — still box-IoU only (ByteTrack/BoT-SORT default); only worth escalating if ID-switch rate is still bad after the segmentation swap, per original plan
   - [ ] Coat-pattern fingerprinting
   - [ ] fp16/explicit-device optimization?
-
