@@ -757,6 +757,46 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
         is_sample = (frame_idx % _save_every == 0)
 
+        # ── cheap per-frame update (every frame, not just the sampled one) ──
+        # The tracker runs — and tracks correctly — on every frame; this used
+        # to only be recorded on the 1-in-save_every frame where
+        # `frame_idx % save_every == 0`, silently discarding the other
+        # (save_every-1) frames' worth of valid tracking. A cow that was
+        # clearly, continuously tracked but happened to be mid-occlusion at
+        # that one exact sampled instant contributed nothing to the window —
+        # even though it was fully visible a few frames earlier or later.
+        # In a crowded cluster the odds that several cows are simultaneously
+        # unobstructed at that one precise instant get worse the more cows
+        # are in frame, which is exactly the "tracks collapsing as cows
+        # cluster" pattern this bug produced.
+        #
+        # Rich per-detection fields (embed / kps / mask polygon) are still
+        # only computed on the sampled frame below, to keep save_every's
+        # actual cost-saving purpose intact — they get merged into these
+        # same entries rather than recomputed every frame. Until a tid's
+        # first sampled frame arrives, those fields stay None; after that,
+        # cheap frame-to-frame position updates carry the most recent
+        # sampled rich data forward rather than clobbering it.
+        for box, tid, conf_j in zip(xyxy, tids, confs):
+            x1, y1, x2, y2 = box.tolist()
+            tid_i = int(tid)
+            prev  = _window_latest.get(tid_i)
+            _window_latest[tid_i] = {
+                "frame_index":    frame_idx,
+                "t_sec":          round(t_sec, 3),
+                "frame_datetime": frame_datetime_str,
+                "conf":           float(conf_j),
+                "x1": float(x1), "y1": float(y1),
+                "x2": float(x2), "y2": float(y2),
+                "cx": float((x1 + x2) / 2.0), "cy": float((y1 + y2) / 2.0),
+                "w":  float(x2 - x1),         "h":  float(y2 - y1),
+                "kps_mean":       prev["kps_mean"]       if prev else None,
+                "embed":          prev["embed"]          if prev else None,
+                "kps_arr":        prev["kps_arr"]        if prev else None,
+                "kconf_arr":      prev["kconf_arr"]      if prev else None,
+                "mask_poly_json": prev["mask_poly_json"] if prev else None,
+            }
+
         if is_sample:
             crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
 
@@ -810,8 +850,6 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
             for j, (box, tid, conf_j) in enumerate(zip(xyxy, tids, confs)):
                 x1,y1,x2,y2 = box.tolist()
-                cx_j = (x1+x2)/2.0; cy_j = (y1+y2)/2.0
-                w_j  = x2-x1;       h_j  = y2-y1
                 kps_mean = None; kps_arr = None; kconf_arr = None
                 if kps_flat_list[j] is not None:
                     kps_mean  = kps_mean_list[j]
@@ -822,21 +860,16 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                     poly = mask_polys[j]
                     if poly is not None and len(poly) >= 3:
                         mask_poly_json = json.dumps(np.asarray(poly).round(1).tolist())
-                _window_latest[int(tid)] = {
-                    "frame_index":    frame_idx,
-                    "t_sec":          round(t_sec, 3),
-                    "frame_datetime": frame_datetime_str,
-                    "conf":           float(conf_j),
-                    "x1": float(x1), "y1": float(y1),
-                    "x2": float(x2), "y2": float(y2),
-                    "cx": float(cx_j), "cy": float(cy_j),
-                    "w":  float(w_j),  "h":  float(h_j),
-                    "kps_mean":  kps_mean,
-                    "embed":     embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None,
-                    "kps_arr":   kps_arr,
-                    "kconf_arr": kconf_arr,
-                    "mask_poly_json": mask_poly_json,
-                }
+                # Position/conf/time for this exact frame were already set by
+                # the cheap per-frame update above (every tid present this
+                # frame has an entry) — just attach this sample's rich
+                # (embed/kps/mask) fields onto it rather than rebuilding it.
+                entry = _window_latest[int(tid)]
+                entry["kps_mean"]  = kps_mean
+                entry["embed"]     = embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None
+                entry["kps_arr"]   = kps_arr
+                entry["kconf_arr"] = kconf_arr
+                entry["mask_poly_json"] = mask_poly_json
 
                 if crops_dir is not None:
                     tid_i = int(tid)
@@ -1100,9 +1133,9 @@ if __name__ == "__main__":
 #   --model      "$SEG" \
 #   --source     "$VID" \
 #   --pose_model "$POSE" \
-#   --imgsz 960 --conf 0.30 --iou 0.60 \
+#   --imgsz 960 --conf 0.30 --iou 0.45 \
 #   --pose_imgsz 384 --pose_conf 0.25 \
-#   --save_every 10 --flush_every 5
+#   --save_every 5 --flush_every 10
 #
 # ── Batch — all videos in a directory ────────────────────────────────────────
 # python3 track_and_dump.py \

@@ -8,7 +8,7 @@ new_track_thresh: 0.6
 
 # Association / lifecycle
 match_thresh: 0.8
-track_buffer: 30
+track_buffer: 130
 max_age: 45
 min_hits: 3
 

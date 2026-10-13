@@ -162,7 +162,28 @@ def load_kps_for_session(
                         "x1", "y1", "x2", "y2", "kps_flat", "kps_kconf"]].copy()
 
     # ── SQLite fallback ────────────────────────────────────────────────────────
-    log("kps parquet not found — loading from raw_tracks (SQLite)...")
+    # NOTE: track_and_dump.py's raw_tracks only ever stores kps_conf (scalar)
+    # + kps_parquet_row (an integer pointer into kps_part*.parquet) — it never
+    # writes kps/kps_kconf inline. So this fallback can only work against a
+    # raw_tracks table that was created with an (incompatible) inline-array
+    # schema; against the real production schema, those columns never exist.
+    # If we get here, the kps parquet for this session is genuinely missing
+    # (not just a path-resolution bug — check that first), and there is no
+    # valid full-fidelity fallback: fail soft rather than crash the run.
+    log("kps parquet not found — checking for an inline-kps raw_tracks fallback...")
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(raw_tracks)").fetchall()}
+    except Exception:
+        cols = set()
+    if not {"kps", "kps_kconf"} <= cols:
+        log("  raw_tracks has no inline kps/kps_kconf columns in this DB "
+            "(expected — kps data lives only in kps_part*.parquet for this "
+            "pipeline). No fallback is possible for this session.")
+        log("  Vision features will be NULL for this session. If the parquet "
+            "should exist, check the session's output directory / Drive sync "
+            "before re-running.")
+        return pd.DataFrame()
+
     rdf = pd.read_sql(
         """
         SELECT frame_index, frame_datetime, temp_id, det_conf,
@@ -301,6 +322,7 @@ def run_vision_features(
     min_slot_conf:     float      = 0.30,
     dry_run:           bool       = False,
     bin_minutes:       int        = 15,
+    merge_map:         dict | None = None,   # {loser_tid -> winner_tid} from Step A.6
 ) -> pd.DataFrame:
     """
     Stage 2-B: Vision Feature Extraction.
@@ -340,6 +362,20 @@ def run_vision_features(
     if kps_df.empty:
         log("No kps data available — vision columns will remain NULL.")
         return timeline_df
+
+    # Step A.6 (resolve_duplicate_assignments) deletes loser temp_ids from
+    # `assignment` — it only keeps {winner_tid: real_id}. kps_df still has
+    # the losers' rows under their original temp_id, so without this remap
+    # `kps_df["temp_id"].map(assignment)` below would silently classify every
+    # merged-but-losing fragment as unresolved (NaN real_id), dropping it from
+    # the timeline/gallery even though Step A.6 already decided it belongs to
+    # the same animal. Mirrors the equivalent embed_df remap in reconcile.py.
+    if merge_map:
+        n_remapped = int(kps_df["temp_id"].isin(merge_map.keys()).sum())
+        if n_remapped:
+            log(f"  Remapping {n_remapped} rows from {len(merge_map)} "
+                f"merged (loser→winner) temp_id(s) before identity lookup")
+            kps_df["temp_id"] = kps_df["temp_id"].replace(merge_map)
 
     # ── Per-frame extraction (all temp_ids — no identity filter yet) ─────────
     log(f"Running per-frame extractors on all {len(kps_df)} rows "
@@ -434,6 +470,7 @@ def run_vision_features(
             ema_alpha    = ema_alpha,
             min_slot_conf= min_slot_conf,
             dry_run      = dry_run,
+            merge_map    = merge_map,
         )
     else:
         log("No embed_parquet provided or no parts found — pose gallery update skipped.")
@@ -456,6 +493,7 @@ def _update_pose_gallery(
     ema_alpha:     float,
     min_slot_conf: float,
     dry_run:       bool,
+    merge_map:     dict | None = None,   # {loser_tid -> winner_tid} from Step A.6
 ) -> None:
     """
     Update both pose galleries after feature extraction:
@@ -485,6 +523,16 @@ def _update_pose_gallery(
         edf["embed"] = edf["embed"].apply(
             lambda v: np.array(v, dtype=np.float32)
         )
+
+    # edf is loaded fresh from the embed parquet here and still has RAW
+    # (pre-merge) temp_id values. kps_df, passed in by the caller, has
+    # already been remapped via merge_map. Without remapping edf the same
+    # way, the frame_index+temp_id join below would silently drop every
+    # merged-loser frame (edf says e.g. 313, kps_df says 1 for the same
+    # frame_index — no match), so none of that pooled data would reach the
+    # slot-embedding/gallery update.
+    if merge_map:
+        edf["temp_id"] = edf["temp_id"].replace(merge_map)
 
     # ── Merge embeds with per-frame labels ────────────────────────────────────
     merged = edf.merge(
@@ -542,7 +590,12 @@ def _update_pose_gallery(
     log(f"  TempPoseGallery: {temp_updates} slot updates")
 
     # ── Delete resolved temp_ids from TempPoseGallery ─────────────────────────
+    # Include merge_map's losers (e.g. t313, t263...), not just the winner
+    # (t1) that remains as assignment's key — they graduated into the same
+    # real_id and their raw-keyed TempPoseGallery entries are now stale.
     resolved_tids = set(int(t) for t in assignment.keys())
+    if merge_map:
+        resolved_tids |= set(int(t) for t in merge_map.keys())
     deleted = temp_gallery.delete_resolved(session_id, resolved_tids)
     if deleted:
         log(f"  TempPoseGallery: deleted {len(deleted)} resolved entries: "

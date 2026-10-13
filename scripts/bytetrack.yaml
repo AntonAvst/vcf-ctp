@@ -8,7 +8,7 @@ new_track_thresh: 0.6         # threshold to start a brand new track
 
 # Association / lifecycle
 match_thresh: 0.8             # IoU gating for matching
-track_buffer: 30              # REQUIRED: max frames to keep a lost track (≈ 2–3s @ 10–15 FPS)
+track_buffer: 130              # REQUIRED: max frames to keep a lost track (≈ 2–3s @ 10–15 FPS)
 max_age: 45                   # hard cap on how long to keep lost tentative tracks
 min_hits: 3                   # frames to confirm a track
 

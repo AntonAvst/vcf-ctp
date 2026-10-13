@@ -800,35 +800,48 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         _show_direction = _snap["show_direction"]
         _show_mask      = _snap["show_mask"]
 
-        ok, frame = cap.read()
-        if not ok:
-            log("End of video."); break
-
+        # ── advance past any fast-forwarded frames FIRST, then read the one
+        # frame we are actually going to display. Previously cap.read() ran
+        # before this loop, so `frame` held an old image while `frame_idx`
+        # kept climbing underneath it — every ff grab desynced the overlay
+        # from the picture by up to (ff_speed-1) frames. ──────────────────
         if ff_speed > 1:
             for _ in range(ff_speed-1):
                 if not cap.grab(): break
                 frame_idx+=1; n_frames+=1
-                if not stream_done:
-                    while next_fi < frame_idx:
-                        try: next_fi,next_fdt,next_rows = next(row_stream)
-                        except StopIteration:
-                            stream_done=True; next_rows=[]; next_fi=frame_idx; break
                 if args.limit>0 and n_frames>=args.limit: break
 
-        if not stream_done:
-            while next_fi < frame_idx:
-                try: next_fi,next_fdt,next_rows = next(row_stream)
-                except StopIteration:
-                    stream_done=True; next_rows=[]; next_fi=frame_idx; break
+        ok, frame = cap.read()
+        if not ok:
+            log("End of video."); break
 
-        if next_fi==frame_idx:
-            dets=next_rows
-            if next_fdt is not None: current_fdt=next_fdt
-            if not stream_done:
-                try: next_fi,next_fdt,next_rows = next(row_stream)
+        # ── catch the track stream up to (at most) frame_idx, keeping the
+        # MOST RECENT sample seen along the way. The old code required
+        # next_fi == frame_idx exactly to ever touch det_cache — any sample
+        # whose frame_index didn't land exactly on frame_idx (guaranteed
+        # whenever ff_speed>1, since frame_idx then jumps in steps of
+        # ff_speed, and also possible at 1x since samples are spaced by
+        # --save_every and aren't guaranteed to align) was fetched from
+        # row_stream and then silently thrown away. That's why boxes froze
+        # (cache never refreshed) and then appeared to "taper off" — a much
+        # later sample would eventually land exactly on frame_idx and wipe
+        # out every tid not present in that single late sample at once. ──
+        got_fresh  = False
+        fresh_rows = None
+        fresh_fdt  = None
+        if not stream_done:
+            while next_fi <= frame_idx:
+                fresh_rows, fresh_fdt, got_fresh = next_rows, next_fdt, True
+                try:
+                    next_fi, next_fdt, next_rows = next(row_stream)
                 except StopIteration:
-                    stream_done=True; next_rows=[]; next_fi=10**12
-            # update det_cache with fresh data for this sampled frame
+                    stream_done = True
+                    break
+
+        if got_fresh:
+            dets = fresh_rows
+            if fresh_fdt is not None: current_fdt = fresh_fdt
+            # update det_cache with fresh data for this sample
             # evict tids that are no longer present in this sample
             active_tids = {int(d["temp_id"]) for d in dets}
             for tid in list(det_cache.keys()):
@@ -837,7 +850,8 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
             for d in dets:
                 det_cache[int(d["temp_id"])] = d
         else:
-            # non-sampled frame — use cached detections so nothing flickers
+            # no new sample since the last one — reuse cached detections so
+            # nothing flickers between sample windows
             dets = list(det_cache.values())
 
         if session_start_dt is not None:

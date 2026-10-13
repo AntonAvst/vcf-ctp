@@ -638,6 +638,16 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def _tid_frame_spans(tracks_df: pd.DataFrame) -> dict:
+    """{temp_id -> (min_frame_index, max_frame_index)} for overlap checks."""
+    g = tracks_df.groupby("temp_id")["frame_index"].agg(["min", "max"])
+    return {int(tid): (int(r["min"]), int(r["max"])) for tid, r in g.iterrows()}
+
+
+def _spans_overlap(a: tuple, b: tuple) -> bool:
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
 def step_c_cosine_resolver(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
@@ -694,7 +704,24 @@ def step_c_cosine_resolver(
     temp_gallery = TempPoseGallery.load(gallery_dir, modality)
 
     cosine_assignment = {}
-    assigned_aids     = set(kinetic_assignment.values())
+
+    # aid -> list of (tid, frame_span) that currently hold this real_id.
+    # Seeded from kinetic_assignment so we know which spans are already
+    # "occupied" before any cosine matching runs.
+    tid_spans = _tid_frame_spans(tracks_df)
+    aid_claims: dict = {}
+    for k_tid, k_aid in kinetic_assignment.items():
+        aid_claims.setdefault(k_aid, []).append(tid_spans.get(k_tid, (-1, -1)))
+
+    def _aid_blocked_for(tid: int, aid) -> bool:
+        """An aid is only off-limits to `tid` if a temp_id that ALREADY holds
+        it was simultaneously on screen with `tid` — i.e. they're genuinely
+        two different animals. If every existing claim's span ends before
+        (or starts after) `tid`'s own span, this is a track-ID switch on the
+        same animal and re-using the aid is exactly what we want, so Step
+        A.6 (resolve_duplicate_assignments) can merge the fragments."""
+        my_span = tid_spans.get(tid, (-1, -1))
+        return any(_spans_overlap(my_span, s) for s in aid_claims.get(aid, []))
 
     for tid in queryable_tids:
         tid_embeds = embed_df[embed_df["temp_id"] == tid]
@@ -703,7 +730,7 @@ def step_c_cosine_resolver(
         # ── Step 1: flat real_id gallery ─────────────────────────────────────
         best_aid, best_sim = None, -1.0
         for aid, gvec in gallery.items():
-            if aid in assigned_aids:
+            if _aid_blocked_for(tid, aid):
                 continue
             sim = cosine_sim(query_vec, gvec)
             if sim > best_sim:
@@ -711,7 +738,7 @@ def step_c_cosine_resolver(
 
         if best_aid is not None and best_sim >= args.cosine_threshold:
             cosine_assignment[tid] = best_aid
-            assigned_aids.add(best_aid)
+            aid_claims.setdefault(best_aid, []).append(tid_spans.get(tid, (-1, -1)))
             log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
             continue
 
@@ -719,9 +746,9 @@ def step_c_cosine_resolver(
         p_id, p_cos, _ = pose_gallery.query(
             query_vec, posture=None, facing=None, threshold=args.cosine_threshold
         )
-        if p_id is not None and p_id not in assigned_aids:
+        if p_id is not None and not _aid_blocked_for(tid, p_id):
             cosine_assignment[tid] = p_id
-            assigned_aids.add(p_id)
+            aid_claims.setdefault(p_id, []).append(tid_spans.get(tid, (-1, -1)))
             log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
             continue
 
@@ -744,10 +771,10 @@ def step_c_cosine_resolver(
                 if existing_row:
                     matched_sid = existing_row.get("real_id")
 
-            if matched_sid is not None and matched_sid not in assigned_aids:
+            if matched_sid is not None and not _aid_blocked_for(tid, matched_sid):
                 # Inherit the same synthetic id
                 cosine_assignment[tid] = matched_sid
-                assigned_aids.add(matched_sid)
+                aid_claims.setdefault(matched_sid, []).append(tid_spans.get(tid, (-1, -1)))
                 log(f"  t{tid} → synthetic_id {matched_sid}  "
                     f"(temp cosine={t_cos:.3f}, matched {match_key})")
             else:
@@ -755,7 +782,7 @@ def step_c_cosine_resolver(
                 new_synth = mint_synthetic_id(gallery_dir)
                 cosine_assignment[tid]              = new_synth
                 cosine_assignment[match_key.temp_id] = new_synth
-                assigned_aids.add(new_synth)
+                aid_claims.setdefault(new_synth, []).append(tid_spans.get(tid, (-1, -1)))
                 # Register synthetic id in reid_registry
                 if not dry_run:
                     ts = pd.Timestamp.now().isoformat()
@@ -826,23 +853,17 @@ def step_c_cosine_resolver(
             all_assignments[tid] = confirmed
             pose_gallery.save(gallery_dir, modality)
 
-    # ── Switch healing ────────────────────────────────────────────────────────
-    aid_to_tids: dict[int, list] = {}
-    for tid, aid in all_assignments.items():
-        aid_to_tids.setdefault(aid, []).append(tid)
-
-    for aid, tids in aid_to_tids.items():
-        if len(tids) > 1:
-            log(f"  [switch] id {aid} ← temp_ids {tids} — keeping most frames")
-            frame_counts = {tid: (tracks_df["temp_id"] == tid).sum() for tid in tids}
-            keep_tid  = max(frame_counts, key=frame_counts.get)
-            drop_tids = [t for t in tids if t != keep_tid]
-            for d in drop_tids:
-                if d in cosine_assignment:
-                    del cosine_assignment[d]
-                elif d in kinetic_assignment:
-                    log(f"    WARNING: kinetically-assigned t{d} conflicts — review")
-
+    # NOTE: duplicate real_id resolution (multiple temp_ids matched to the same
+    # AnimalId — expected now that assigned_aids has been replaced with the
+    # temporal-overlap check above) is intentionally NOT done here. A prior
+    # "switch healing" pass used to pre-merge duplicates using only raw frame
+    # count, with no manual-assignment priority and no audit trail — it ran
+    # before resolve_duplicate_assignments (Step A.6) and silently deleted
+    # every duplicate but the single largest fragment, so Step A.6 (which has
+    # the correct manual > cosine > kinetic priority, proper tiebreaking, and
+    # writes temp_id_merges for traceability) only ever saw what that pass
+    # left behind. Step A.6 is the single authoritative merge step — leave
+    # every raw match intact here and let it do that job once, correctly.
     merged = {**kinetic_assignment, **cosine_assignment}
     n_real    = sum(1 for v in merged.values() if not is_synthetic(v))
     n_synth   = sum(1 for v in merged.values() if is_synthetic(v))
@@ -1383,6 +1404,16 @@ def run(args) -> None:
     # ── update known_temp_ids ─────────────────────────────────────────────────
     update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
 
+    # Step A.6 deletes loser temp_ids from full_assignment (keeps only
+    # {winner_tid: real_id}) — tracks_df still carries the losers' rows under
+    # their original temp_id. Without this remap, step_d_sensor_sequencer's
+    # per-row assignment.get(temp_id) lookup would silently treat every
+    # merged-but-losing fragment as unassigned, even though Step A.6 already
+    # decided it's the same animal. Mirrors the embed_df remap above.
+    if merge_map:
+        tracks_df = tracks_df.copy()
+        tracks_df["temp_id"] = tracks_df["temp_id"].replace(merge_map)
+
     # ── Step D — sensor sequencer + Vision feature extractor ─────────────────────────────────────────────
     timeline_df = step_d_sensor_sequencer(
         tracks_df   = tracks_df,
@@ -1403,12 +1434,19 @@ def run(args) -> None:
             assignment    = full_assignment,
             is_night      = is_night,
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
-            kps_parquet   = str(dm.get_parquet_path(args.session, "kps")),
+            # kps is written as multi-part files (kps_part000.parquet, ...) by
+            # track_and_dump.py's KpsWriter, same as embeds — pass the session
+            # directory so extractor.py's glob-based loader can find them.
+            # (dm.get_parquet_path(session, "kps") returns a single hardcoded
+            # "kps.parquet" filename that never actually exists — see embeds
+            # a few lines up for the correct pattern.)
+            kps_parquet   = str(dm.get_session_dir(args.session)),
             embed_parquet = embed_parquet_path,
             gallery_dir   = gallery_dir,
             ema_alpha     = args.ema_alpha,
             dry_run       = args.dry_run,
             bin_minutes   = args.bin_minutes,
+            merge_map     = merge_map,
         )
 
     # ── Step E — write to DB ──────────────────────────────────────────────────

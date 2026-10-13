@@ -437,7 +437,7 @@ if __name__ == "__main__":
 #
 # # 2. Assign identities and run reconcile:
 # python3 assign_identity.py \
-#   --session    refet33_20241221 \
+#   --session    $SES \
 #   --assign     2:7507  1:6366  71:7513 \
 #   --note       "manual — no kinetics coverage for Dec 21" \
 #   --run_reconcile
