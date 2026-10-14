@@ -638,14 +638,96 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def _tid_frame_spans(tracks_df: pd.DataFrame) -> dict:
-    """{temp_id -> (min_frame_index, max_frame_index)} for overlap checks."""
-    g = tracks_df.groupby("temp_id")["frame_index"].agg(["min", "max"])
-    return {int(tid): (int(r["min"]), int(r["max"])) for tid, r in g.iterrows()}
+def _tid_frame_arrays(tracks_df: pd.DataFrame) -> dict:
+    """{temp_id -> sorted np.ndarray of frame_index values actually recorded
+    for that tid} — used for real frame-level co-occurrence checks, not just
+    an outer [min,max] interval (see _frames_cooccur)."""
+    out = {}
+    for tid, g in tracks_df.groupby("temp_id"):
+        out[int(tid)] = np.sort(g["frame_index"].to_numpy())
+    return out
 
 
-def _spans_overlap(a: tuple, b: tuple) -> bool:
-    return a[0] <= b[1] and b[0] <= a[1]
+def _tid_frame_boxes(tracks_df: pd.DataFrame) -> dict:
+    """{temp_id -> DataFrame[frame_index, x1, y1, x2, y2] sorted by
+    frame_index} — lets a frame-level co-occurrence hit be checked
+    spatially too: same frame in different parts of the pen is two
+    different animals; same frame in the same spot is one animal whose
+    box briefly got two temp_ids (an ID-handoff artifact)."""
+    cols = ["frame_index", "x1", "y1", "x2", "y2"]
+    out = {}
+    for tid, g in tracks_df.groupby("temp_id"):
+        out[int(tid)] = g[cols].sort_values("frame_index").reset_index(drop=True)
+    return out
+
+
+def _iou(box_a: tuple, box_b: tuple) -> float:
+    """Standard IoU for two (x1,y1,x2,y2) boxes. 0 if either is degenerate
+    or they don't overlap at all."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _nearest_box(frame_boxes: pd.DataFrame, target_frame: int):
+    """Row (as a plain (x1,y1,x2,y2) tuple) whose frame_index is closest to
+    target_frame. None if frame_boxes is empty."""
+    if frame_boxes.empty:
+        return None
+    idx = (frame_boxes["frame_index"] - target_frame).abs().idxmin()
+    row = frame_boxes.loc[idx]
+    return (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
+
+
+def _estimate_frame_tolerance(tracks_df: pd.DataFrame, default: int = 20) -> int:
+    """Approximate the per-tid sampling cadence (roughly save_every from
+    track_and_dump.py) directly from the data, so co-occurrence tolerance
+    isn't a guessed constant. Uses the median consecutive-frame gap of
+    whichever temp_id has the most rows (most likely to be continuously
+    tracked, giving a clean estimate of the commit cadence)."""
+    counts = tracks_df["temp_id"].value_counts()
+    if counts.empty:
+        return default
+    densest_tid = counts.idxmax()
+    fr = np.sort(tracks_df.loc[tracks_df["temp_id"] == densest_tid, "frame_index"].to_numpy())
+    if len(fr) < 2:
+        return default
+    gaps = np.diff(fr)
+    gaps = gaps[gaps > 0]
+    if len(gaps) == 0:
+        return default
+    # 2x safety margin for jitter in exactly which frame within a window
+    # ends up being the one committed.
+    return max(int(2 * np.median(gaps)), default)
+
+
+def _min_frame_dist(arr_a: np.ndarray, arr_b: np.ndarray) -> float:
+    """Smallest gap between any recorded frame of arr_a and any recorded
+    frame of arr_b. inf if either is empty."""
+    if len(arr_a) == 0 or len(arr_b) == 0:
+        return float("inf")
+    idx = np.searchsorted(arr_b, arr_a)
+    idx_lo = np.clip(idx - 1, 0, len(arr_b) - 1)
+    idx_hi = np.clip(idx, 0, len(arr_b) - 1)
+    nearest_dist = np.minimum(np.abs(arr_a - arr_b[idx_lo]), np.abs(arr_a - arr_b[idx_hi]))
+    return float(nearest_dist.min())
+
+
+def _frames_cooccur(arr_a: np.ndarray, arr_b: np.ndarray, tol: int) -> bool:
+    """True if any recorded frame of arr_a is within `tol` frames of any
+    recorded frame of arr_b — i.e. the two temp_ids were actually on screen
+    at close to the same moment, not just somewhere within each other's
+    overall active-duration interval."""
+    return _min_frame_dist(arr_a, arr_b) <= tol
 
 
 def step_c_cosine_resolver(
@@ -705,23 +787,89 @@ def step_c_cosine_resolver(
 
     cosine_assignment = {}
 
-    # aid -> list of (tid, frame_span) that currently hold this real_id.
-    # Seeded from kinetic_assignment so we know which spans are already
-    # "occupied" before any cosine matching runs.
-    tid_spans = _tid_frame_spans(tracks_df)
+    # aid -> list of (claim_tid, frame_array) that currently hold this
+    # real_id. Seeded from kinetic_assignment so we know which tids are
+    # already "occupied" before any cosine matching runs. Keeping claim_tid
+    # (not just the frame array) lets a blocked match be diagnosed: which
+    # specific already-claimed tid caused the block, and by how many frames.
+    tid_frames   = _tid_frame_arrays(tracks_df)
+    tid_boxes    = _tid_frame_boxes(tracks_df)
+    cooccur_tol  = _estimate_frame_tolerance(tracks_df)
+    IOU_SAME_ANIMAL = 0.3   # above this, same screen location -> handoff artifact, not a real conflict
     aid_claims: dict = {}
     for k_tid, k_aid in kinetic_assignment.items():
-        aid_claims.setdefault(k_aid, []).append(tid_spans.get(k_tid, (-1, -1)))
+        aid_claims.setdefault(k_aid, []).append((k_tid, tid_frames.get(k_tid, np.array([]))))
+
+    def _aid_block_reason(tid: int, aid):
+        """Returns (blocked: bool, blocking_tid: int|None, min_dist: float|None,
+        iou: float|None).
+        An aid is only off-limits to `tid` if a temp_id that ALREADY holds it
+        was actually on screen at close to the same moment as `tid` AND in a
+        different part of the frame (temporal co-occurrence within
+        cooccur_tol, spatial IoU below IOU_SAME_ANIMAL) — i.e. they're
+        genuinely two different animals. Temporal co-occurrence alone isn't
+        enough to conclude that: an ID-handoff (the old track dying and a new
+        one starting for the SAME animal) commonly leaves 1-2 frames where
+        both ids are recorded, but at essentially the SAME location — that's
+        one animal, not two, and should NOT block. Two co-occurring ids in
+        DIFFERENT parts of the pen are genuinely different animals and
+        SHOULD block. A coarse [min,max] interval check was tried before this
+        and over-blocked badly: when one animal dominates most of a session,
+        its already-claimed fragments' combined intervals end up covering
+        most of the timeline, so any further genuine fragment of the SAME
+        animal would get flagged as 'overlapping' even without ever
+        literally coinciding with another track in any single frame. If a
+        high-cosine candidate still gets blocked here, inspect the reported
+        blocking_tid, min_dist and iou directly against raw_tracks rather
+        than assuming it's a true conflict."""
+        my_frames = tid_frames.get(tid, np.array([]))
+        my_boxes  = tid_boxes.get(tid)
+        best_block_tid, best_dist, best_other_frames = None, float("inf"), None
+        for claim_tid, other in aid_claims.get(aid, []):
+            d = _min_frame_dist(my_frames, other)
+            if d < best_dist:
+                best_dist, best_block_tid, best_other_frames = d, claim_tid, other
+
+        if best_dist > cooccur_tol or best_block_tid is None:
+            return False, None, None, None
+
+        # Temporally co-occurring — now check WHERE in the frame, to tell a
+        # real conflict (different location) apart from an ID-handoff
+        # artifact (same location, briefly two ids for the same box).
+        # Must find the EXACT (my_frame, other_frame) pair that achieved
+        # best_dist above -- symmetric nearest-neighbor (check both idx-1
+        # and idx on both sides), not just the insertion point, or this can
+        # pick a worse-matching pair and pull boxes from moments further
+        # apart than best_dist implies, understating IoU for genuine
+        # same-spot handoffs.
+        best_iou = 0.0
+        other_boxes = tid_boxes.get(best_block_tid)
+        if (my_boxes is not None and len(my_boxes)
+                and other_boxes is not None and len(other_boxes)
+                and best_other_frames is not None and len(best_other_frames)):
+            idx    = np.searchsorted(best_other_frames, my_frames)
+            idx_lo = np.clip(idx - 1, 0, len(best_other_frames) - 1)
+            idx_hi = np.clip(idx,     0, len(best_other_frames) - 1)
+            dist_lo = np.abs(my_frames - best_other_frames[idx_lo])
+            dist_hi = np.abs(my_frames - best_other_frames[idx_hi])
+            use_lo  = dist_lo <= dist_hi
+            chosen_other_frame = np.where(use_lo, best_other_frames[idx_lo], best_other_frames[idx_hi])
+            chosen_dist         = np.where(use_lo, dist_lo, dist_hi)
+            best_i = int(np.argmin(chosen_dist))
+            my_frame_at_best    = int(my_frames[best_i])
+            other_frame_at_best = int(chosen_other_frame[best_i])
+            box_a = _nearest_box(my_boxes, my_frame_at_best)
+            box_b = _nearest_box(other_boxes, other_frame_at_best)
+            best_iou = _iou(box_a, box_b) if box_a and box_b else 0.0
+
+        if best_iou >= IOU_SAME_ANIMAL:
+            # Same spot, same moment -> one animal, handoff artifact.
+            # Not a real conflict, don't block.
+            return False, best_block_tid, best_dist, best_iou
+        return True, best_block_tid, best_dist, best_iou
 
     def _aid_blocked_for(tid: int, aid) -> bool:
-        """An aid is only off-limits to `tid` if a temp_id that ALREADY holds
-        it was simultaneously on screen with `tid` — i.e. they're genuinely
-        two different animals. If every existing claim's span ends before
-        (or starts after) `tid`'s own span, this is a track-ID switch on the
-        same animal and re-using the aid is exactly what we want, so Step
-        A.6 (resolve_duplicate_assignments) can merge the fragments."""
-        my_span = tid_spans.get(tid, (-1, -1))
-        return any(_spans_overlap(my_span, s) for s in aid_claims.get(aid, []))
+        return _aid_block_reason(tid, aid)[0]
 
     for tid in queryable_tids:
         tid_embeds = embed_df[embed_df["temp_id"] == tid]
@@ -738,17 +886,24 @@ def step_c_cosine_resolver(
 
         if best_aid is not None and best_sim >= args.cosine_threshold:
             cosine_assignment[tid] = best_aid
-            aid_claims.setdefault(best_aid, []).append(tid_spans.get(tid, (-1, -1)))
+            aid_claims.setdefault(best_aid, []).append((tid, tid_frames.get(tid, np.array([]))))
             log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
             continue
+
+        # Best score seen so far across steps, for near-miss reporting if
+        # this tid ends up unresolved (Step 1's best_sim is always a real
+        # number regardless of whether it cleared the threshold).
+        near_miss = [("flat", best_aid, best_sim)]
 
         # ── Step 2: pose-conditioned real_id gallery ─────────────────────────
         p_id, p_cos, _ = pose_gallery.query(
             query_vec, posture=None, facing=None, threshold=args.cosine_threshold
         )
+        if p_cos is not None:
+            near_miss.append(("pose-slot", p_id, p_cos))
         if p_id is not None and not _aid_blocked_for(tid, p_id):
             cosine_assignment[tid] = p_id
-            aid_claims.setdefault(p_id, []).append(tid_spans.get(tid, (-1, -1)))
+            aid_claims.setdefault(p_id, []).append((tid, tid_frames.get(tid, np.array([]))))
             log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
             continue
 
@@ -761,6 +916,8 @@ def step_c_cosine_resolver(
             threshold       = args.cosine_threshold,
             exclude_session = session_id,   # don't match against self
         )
+        if t_cos is not None:
+            near_miss.append(("temp-key", match_key, t_cos))
 
         if match_key is not None:
             # The matched temp_id may already have a synthetic id assigned
@@ -774,7 +931,7 @@ def step_c_cosine_resolver(
             if matched_sid is not None and not _aid_blocked_for(tid, matched_sid):
                 # Inherit the same synthetic id
                 cosine_assignment[tid] = matched_sid
-                aid_claims.setdefault(matched_sid, []).append(tid_spans.get(tid, (-1, -1)))
+                aid_claims.setdefault(matched_sid, []).append((tid, tid_frames.get(tid, np.array([]))))
                 log(f"  t{tid} → synthetic_id {matched_sid}  "
                     f"(temp cosine={t_cos:.3f}, matched {match_key})")
             else:
@@ -782,7 +939,7 @@ def step_c_cosine_resolver(
                 new_synth = mint_synthetic_id(gallery_dir)
                 cosine_assignment[tid]              = new_synth
                 cosine_assignment[match_key.temp_id] = new_synth
-                aid_claims.setdefault(new_synth, []).append(tid_spans.get(tid, (-1, -1)))
+                aid_claims.setdefault(new_synth, []).append((tid, tid_frames.get(tid, np.array([]))))
                 # Register synthetic id in reid_registry
                 if not dry_run:
                     ts = pd.Timestamp.now().isoformat()
@@ -797,7 +954,31 @@ def step_c_cosine_resolver(
                 log(f"  t{tid} + {match_key} → NEW synthetic_id {new_synth}  "
                     f"(temp cosine={t_cos:.3f})")
         else:
-            log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved")
+            source, candidate, score = max(near_miss, key=lambda x: x[2])
+            if candidate is None:
+                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                    f"(closest: {source} @ {score:.3f}, no candidate id)")
+            elif score >= args.cosine_threshold and source in ("flat", "pose-slot"):
+                # Cleared the cosine threshold but still ended up unresolved
+                # -> it was blocked by the overlap check, not by similarity.
+                # Report exactly what blocked it so a real conflict can be
+                # told apart from an overlap-check false positive (see the
+                # NOTE in _aid_block_reason).
+                blocked, block_tid, block_dist, block_iou = _aid_block_reason(tid, candidate)
+                if blocked:
+                    log(f"  t{tid}: scored {score:.3f} ({source}) on real_id {candidate} "
+                        f"— BLOCKED: {block_dist:.0f} frames + IoU={block_iou:.2f} vs "
+                        f"already-claimed t{block_tid} (tolerance={cooccur_tol}, "
+                        f"same-animal IoU≥{IOU_SAME_ANIMAL}). Low IoU here means a different "
+                        f"part of the pen -> likely a genuinely different animal.")
+                else:
+                    # Shouldn't normally happen (if not blocked it should have
+                    # been accepted above) — log plainly rather than guess why.
+                    log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                        f"(closest: {source} candidate {candidate} @ {score:.3f})")
+            else:
+                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                    f"(closest: {source} candidate {candidate} @ {score:.3f})")
 
     if not cosine_assignment:
         log("  No cosine matches found.")
