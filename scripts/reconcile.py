@@ -1,125 +1,253 @@
 #!/usr/bin/env python3
 """
-reconcile.py — Post-processing pipeline for identity resolution and feature extraction.
+track_and_dump.py — detector + tracker (+ pose + appearance embedding)
 
-Runs after track_and_dump.py. Reads raw_tracks + collar_signals from SQLite, resolves
-real_id for every temp_id in a session, and writes to resolved_cow_timeline.
+Outputs:
 
-Steps (in order):
-  A. Kinetic matcher    — bbox centroid speed ↔ ΔKineticsCountR (Pearson r)
-  B. Gallery builder    — group embeds by confirmed AnimalId → EMA mean → day/night galleries
-  C. Cosine resolver    — heal temp_id switches, cross-video continuity
-  D. Sensor sequencer   — forward-fill behavior/kinetics to video time grid
-  E. Write output       — resolved_cow_timeline rows
+No CSV or JSONL output. Arrays never stored in SQLite.
+embed_parquet_row / kps_parquet_row columns are integer pointers into the parquets.
 
-Usage:
-    python3 reconcile.py \\
-        --session   session_001 \\
-        [--corr_threshold 0.7] \\
-        [--min_active_bins 3] \\
-        [--cosine_threshold 0.75] \\
-        [--ema_alpha 0.15] \\
-        [--dry_run]
-
-Note: --db, --kinetics, --gallery_dir, and --embed_parquet are NOT arguments.
-All data paths (DB, collar CSVs, gallery, parquet) are resolved exclusively
-through drive_manager.py, keyed off --session. This guarantees every run
-reads/writes the same canonical Drive-backed data regardless of who runs it
-or from which machine.
-
-Requirements: pip install pandas numpy scipy pyarrow
+WSL-friendly, no GUI required.
 """
 
-import argparse
-import json
-import sqlite3
-import sys
+import argparse, json, re, signal, sqlite3
 from pathlib import Path
+from datetime import datetime, timedelta
+from time import time
+from collections import defaultdict
 
+import cv2
 import numpy as np
-import pandas as pd
-from scipy.stats import pearsonr
-from itertools import product
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
+from ultralytics import YOLO
 
-from vision_features import run_vision_features, migrate_timeline_schema
-from vision_features.gallery import (
-    TempPoseGallery, TempKey, PoseGallery,
-    mint_synthetic_id, is_synthetic, backpropagate_resolution,
-)
+import torch
+import torch.nn as nn
+import torchvision.models as tv
 
 # Drive I/O layer
-from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
+from drive_manager import DriveManager, DriveUnavailableError
 
+# Vision classifiers for crop tagging — optional (graceful fallback if absent)
+_VISION_IMPORT_ERROR = None
+try:
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from vision_features.features.posture import extract_posture
+    from vision_features.features.facing  import extract_facing
+    from vision_features.schema import Posture, Facing, POSTURE_NAMES, FACING_NAMES
+    _VISION_AVAILABLE = True
+except Exception as _e:
+    _VISION_AVAILABLE = False
+    _VISION_IMPORT_ERROR = _e
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+EXPECTED_KP = 19
+DRIVE_BATCH_LOG = "processing_log.csv"   # append-only log on Drive
+VIDEO_EXTENSIONS = {".mp4", ".ts", ".avi", ".mov", ".mkv"}
+
+# Cameras monitoring the enclosure. Mirrored from vision_features.schema.
+# CAMERA_IDS (same convention as EXPECTED_KP above mirroring schema.KP) so
+# this file keeps working even when the optional vision_features import
+# below fails. Keep both lists in sync when a camera is added/renamed/removed.
+KNOWN_CAMERA_IDS = ["רפת 26", "רפת 33", "רפת 38"]
+
+# Filenames look like:
+#   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
+# e.g. "רפת 26_24_S20260616090000_E20260616110000.mp4"
+# <segment> is an arbitrary clip/chunk number — it is NOT part of the camera
+# identity and must be stripped, or every clip would be treated as a distinct
+# "camera" (e.g. "רפת 26_24" vs "רפת 26_17"), silently fragmenting per-camera
+# matching and galleries.
+_TS_RE = re.compile(r'_S(?P<start>\d{14})(?:_E(?P<end>\d{14}))?')
+_TRAILING_SEGMENT_RE = re.compile(r'_\d+$')
+
+def parse_filename(video_path: str):
+    """Extract (camera_id, start_dt, end_dt) from filename.
+    Format: <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
+    Returns (camera_id: str, start_dt: datetime|None, end_dt: datetime|None).
+
+    The camera name is resolved in two steps:
+      1. Exact match (or exact match + "_<segment>") against KNOWN_CAMERA_IDS
+         — the reliable path for every camera we actually operate.
+      2. Fallback for an unrecognized camera: strip a trailing "_<digits>"
+         token (the segment/chunk number) from whatever precedes "_S...".
+         Logged, since it's a best-effort guess rather than a verified name.
+    """
+    stem = Path(video_path).stem
+
+    ts_match = _TS_RE.search(stem)
+    if not ts_match:
+        # No recognizable timestamp — can't reliably locate the camera/segment
+        # boundary at all, so fall back to returning the whole stem.
+        log(f"parse_filename: no _S<timestamp> found in '{stem}' — "
+            f"using full stem as camera_id")
+        return stem, None, None
+
+    prefix = stem[:ts_match.start()].rstrip("_")
+
+    camera_id = None
+    for known in KNOWN_CAMERA_IDS:
+        if prefix == known or prefix.startswith(known + "_"):
+            camera_id = known
+            break
+
+    if camera_id is None:
+        stripped = _TRAILING_SEGMENT_RE.sub("", prefix)
+        camera_id = stripped if stripped else prefix
+        log(f"parse_filename: '{prefix}' didn't match any KNOWN_CAMERA_IDS "
+            f"{KNOWN_CAMERA_IDS} — guessed camera_id='{camera_id}' by "
+            f"stripping a trailing segment number. Verify this is correct "
+            f"(and add it to KNOWN_CAMERA_IDS / vision_features.schema."
+            f"CAMERA_IDS if it's a real camera).")
+
+    try:
+        start_dt = datetime.strptime(ts_match.group("start"), "%Y%m%d%H%M%S")
+    except (ValueError, TypeError):
+        start_dt = None
+    try:
+        end_dt = (datetime.strptime(ts_match.group("end"), "%Y%m%d%H%M%S")
+                  if ts_match.group("end") else None)
+    except (ValueError, TypeError):
+        end_dt = None
+    return camera_id, start_dt, end_dt
 
 def log(msg: str) -> None:
-    print(f"[reconcile] {msg}", flush=True)
+    print(f"[track] {msg}", flush=True)
 
 
-def section(title: str) -> None:
-    print(f"\n{'─'*60}", flush=True)
-    print(f"  {title}", flush=True)
-    print(f"{'─'*60}", flush=True)
+# ── Embedding backbone ────────────────────────────────────────────────────────
+class Embedder128(nn.Module):
+    def __init__(self, pretrained=True, out_dim=128):
+        super().__init__()
+        m = tv.mobilenet_v3_small(
+            weights=tv.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        )
+        self.backbone = m.features
+        self.pool     = nn.AdaptiveAvgPool2d((1, 1))
+        self.proj     = nn.Linear(576, out_dim)
+
+    def forward(self, x):
+        f = self.backbone(x)
+        f = self.pool(f).flatten(1)
+        z = self.proj(f)
+        return z / (z.norm(dim=1, keepdim=True) + 1e-8)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Post-processing: kinetic match → gallery update → cosine resolve → timeline write"
-    )
-
-    # --- required ---
-    ap.add_argument("--session",  required=True, help="session_id to process (from video_sessions)")
-    # NOTE: --db, --kinetics, --gallery_dir, --embed_parquet are intentionally
-    # NOT arguments. Every data path is resolved through drive_manager.py,
-    # keyed off --session, so there is exactly one source of truth (Drive).
-
-    # --- step A: kinetic matching ---
-    ap.add_argument("--corr_threshold",   type=float, default=0.7,
-                    help="Min Pearson r for kinetic match (default: 0.7)")
-    ap.add_argument("--min_active_bins",  type=int,   default=3,
-                    help="Min active kinetics bins required (default: 3)")
-    ap.add_argument("--min_temp_id_frames", type=float, default=0.10,
-                    help="Min fraction of frames a temp_id must appear in (default: 0.10)")
-    ap.add_argument("--activity_pct",     type=float, default=0.25,
-                    help="Percentile threshold for 'active' kinetics bins (default: 0.25)")
-    ap.add_argument("--bin_minutes",      type=int,   default=15,
-                    help="Kinetics bin width in minutes (default: 15)")
-
-    # --- step B: gallery builder ---
-    ap.add_argument("--ema_alpha",       type=float, default=0.15,
-                    help="EMA decay for gallery update — α for kinetic-confirmed, α/2 for cosine-only (default: 0.15)")
-    ap.add_argument("--min_embeds_gallery", type=int, default=10,
-                    help="Min embed rows per temp_id to contribute to gallery (default: 10)")
-
-    # --- step C: cosine resolver ---
-    ap.add_argument("--cosine_threshold",    type=float, default=0.75,
-                    help="Min cosine similarity for cross-video / switch-healing match (default: 0.75)")
-    ap.add_argument("--cosine_min_embeds",   type=int,   default=5,
-                    help="Min embed rows for a temp_id to be queried via cosine (default: 5)")
-
-    # --- misc ---
-    ap.add_argument("--dry_run", action="store_true",
-                    help="Run all steps but do not write to the database")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Print extra diagnostic output")
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model",      required=True, help="Detector .pt")
+    ap.add_argument("--source",     required=True,
+                    help="Path to a single video file OR a directory of video files. "
+                         "Supported extensions: .mp4 .ts .avi .mov .mkv. "
+                         "Videos are local only — never uploaded to Drive.")
+    # session_id and camera_id are now derived from the filename automatically
+    ap.add_argument("--tracker",    default="bytetrack.yaml")
+    ap.add_argument("--imgsz",      type=int,   default=960)
+    ap.add_argument("--conf",       type=float, default=0.25)
+    ap.add_argument("--iou",        type=float, default=0.45)
+    ap.add_argument("--save_crops", action="store_true")
+    ap.add_argument("--crops_local", action="store_true",
+                    help="Keep crops on local disk only — do not upload to Drive. "
+                         "Has no effect unless --save_crops is also set.")
+    ap.add_argument("--crop_tags", action="store_true",
+                    help="Append posture (standing/lying) and facing (left/right/toward/away) "
+                         "tags to crop filenames. Requires --pose_model and vision_features/. "
+                         "Falls back to 'unk' tags if classifiers are unavailable.")
+    ap.add_argument("--crop_every", type=int, default=1,
+                    help="Save crop every N-th sample frame per track ID (default: 1). "
+                         "Note: counts sample frames (i.e. every save_every frames), "
+                         "not raw video frames.")
+    ap.add_argument("--min_crop_wh", type=int, nargs=2, metavar=("W","H"), default=(0,0))
+    ap.add_argument("--save_masks", action="store_true",
+                    help="Save segmentation mask polygons (when using a -seg model) to a "
+                         "separate local-only Parquet file, purely for visualization/QA — "
+                         "e.g. overlaying masks in display_tracks.py. Written to "
+                         "outputs/<session_id>/qa_masks/ and NEVER uploaded to Drive, "
+                         "never touches raw_tracks/embeds.parquet/kps.parquet, and has no "
+                         "effect on the main pipeline. No-op if the loaded model has no "
+                         "segmentation head (plain detector).")
+    ap.add_argument("--embed_size", type=int, default=128)
+    ap.add_argument("--pose_model", default="", help="YOLO-Pose .pt (optional)")
+    ap.add_argument("--pose_imgsz", type=int,   default=384)
+    ap.add_argument("--pose_conf",  type=float, default=0.25)
+    ap.add_argument("--pose_kp_conf_thresh", type=float, default=0.30,
+                    help="Keypoint conf: >=thresh v=2, <thresh v=1 (default: 0.30)")
+    ap.add_argument("--save_every", type=int, default=10,
+                    help="Sample interval: keep only the most recent detection per "
+                         "temp_id within each N-frame window (default: 10). "
+                         "Higher = sparser data.")
+    ap.add_argument("--flush_every", type=int, default=5,
+                    help="Flush to SQLite + Parquet every M windows, i.e. every "
+                         "save_every * flush_every frames (default: 5).")
+    # ── reconcile.py integration ──────────────────────────────────────────────
+    # NOTE: kinetics and gallery_dir are NOT arguments — reconcile.py (called
+    # automatically below) resolves both via drive_manager, keyed off session_id.
+    ap.add_argument("--corr_threshold",   type=float, default=0.7)
+    ap.add_argument("--cosine_threshold", type=float, default=0.75)
+    ap.add_argument("--ema_alpha",        type=float, default=0.15)
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
-
     return ap.parse_args()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Database helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
+def to_tensor_bchw(img_bgr, size=224):
+    x    = cv2.resize(img_bgr, (size, size), interpolation=cv2.INTER_LINEAR)
+    x    = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return ((x - mean) / std).transpose(2, 0, 1)
+
+def crops_from_bboxes(frame, bboxes, margin=0.1):
+    H, W = frame.shape[:2]
+    crops, used = [], []
+    for (x1, y1, x2, y2) in bboxes:
+        mx  = int(round((x2-x1)*margin));  my  = int(round((y2-y1)*margin))
+        xx1 = max(0,     int(x1)-mx);      yy1 = max(0,     int(y1)-my)
+        xx2 = min(W-1,   int(x2)+mx);      yy2 = min(H-1,   int(y2)+my)
+        crops.append(frame[yy1:yy2, xx1:xx2].copy())
+        used.append((xx1, yy1, xx2, yy2))
+    return crops, used
+
+def masked_crops_from_polys(frame, used_boxes, mask_polys, fallback_crops):
+    """Background-zeroed crops for the EMBEDDER only, built from segmentation
+    polygons (r.masks.xy). Falls back to raw bbox crops per-instance if a
+    polygon is missing/degenerate (e.g. plain detection model, no masks at all,
+    or a poly with <3 points) — never raises, never drops a detection.
+    Does NOT affect pose-model input or saved crop JPEGs; those stay on raw
+    bbox crops so pose model input distribution is unchanged.
+    """
+    H, W = frame.shape[:2]
+    out = []
+    for i, (xx1, yy1, xx2, yy2) in enumerate(used_boxes):
+        poly = mask_polys[i] if mask_polys is not None and i < len(mask_polys) else None
+        if poly is None or len(poly) < 3:
+            out.append(fallback_crops[i])
+            continue
+        mask_full = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(mask_full, [poly.astype(np.int32)], 1)
+        m_crop = mask_full[yy1:yy2, xx1:xx2]
+        crop_img = frame[yy1:yy2, xx1:xx2].copy()
+        crop_img[m_crop == 0] = 0
+        out.append(crop_img)
+    return out
+
+def flat_kps_xyv(kps_xyv):
+    out = []
+    for (x, y, v) in kps_xyv:
+        out.extend([float(round(x,3)), float(round(y,3)), int(v)])
+    return out
+
+
+# ── SQLite schema ─────────────────────────────────────────────────────────────
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS video_sessions (
     session_id      TEXT PRIMARY KEY,
@@ -128,1585 +256,963 @@ CREATE TABLE IF NOT EXISTS video_sessions (
     start_dt        TEXT,
     end_dt          TEXT,
     collar_csv_path TEXT,
-    is_night        INTEGER DEFAULT 0   -- 0=day, 1=night (auto-detected)
-);
-
-CREATE TABLE IF NOT EXISTS cow_registry (
-    real_id          INTEGER PRIMARY KEY,
-    breed            TEXT,
-    parity           INTEGER,
-    pen_id           TEXT,
-    collar_id        TEXT,
-    baseline_window  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS collar_signals (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    animal_id   INTEGER,
-    datetime    TEXT,
-    signal_type TEXT,   -- 'behavior' | 'kinetic'
-    f_1_2       REAL,
-    f_2_3       REAL,
-    v           REAL,
-    kin_x       REAL,
-    kin_y       REAL,
-    kin_z       REAL,
-    kin_r       REAL
+    is_night        INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS raw_tracks (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id     TEXT,
-    frame_index    INTEGER,
-    frame_datetime TEXT,
-    temp_id        INTEGER,
-    det_conf       REAL,
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         TEXT    NOT NULL,
+    frame_index        INTEGER NOT NULL,
+    frame_time_sec     REAL,
+    frame_datetime     TEXT,
+    temp_id            INTEGER,
+    det_conf           REAL,
     x1 REAL, y1 REAL, x2 REAL, y2 REAL,
     cx REAL, cy REAL,
-    embed          TEXT,   -- JSON list[128] or NULL
-    kps            TEXT,   -- JSON flat list[57] or NULL
-    kps_norm       TEXT,
-    kps_conf       REAL,
-    kps_kconf      TEXT
+    w  REAL, h  REAL,
+    kps_conf           REAL,
+    embed_parquet_row  INTEGER,
+    kps_parquet_row    INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS reid_registry (
-    real_id               INTEGER PRIMARY KEY,
-    gallery_embed_day     TEXT,   -- JSON list[128] or NULL
-    gallery_embed_night   TEXT,
-    gallery_n_day         INTEGER DEFAULT 0,
-    gallery_n_night       INTEGER DEFAULT 0,
-    gallery_conf_day      REAL    DEFAULT 0.0,
-    gallery_conf_night    REAL    DEFAULT 0.0,
-    last_updated_day_dt   TEXT,
-    last_updated_night_dt TEXT,
-    known_temp_ids        TEXT,   -- JSON list of {session_id, temp_id} objects
-    first_seen_dt         TEXT,
-    match_method          TEXT    -- 'kinetic' | 'cosine_day' | 'cosine_night'
-);
-
-CREATE TABLE IF NOT EXISTS resolved_cow_timeline (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    real_id         INTEGER,
-    session_id      TEXT,
-    window_start_dt TEXT,
-    modality_mask   INTEGER DEFAULT 0,  -- bitmask: 1=sensor_ok, 2=vision_ok, 4=reid_ok
-    -- sensor features (forward-filled)
-    d_f12   REAL, d_f23   REAL, d_v    REAL,
-    d_kin_x REAL, d_kin_y REAL, d_kin_z REAL, d_kin_r REAL,
-    -- vision features (from pose)
-    spine_angle     REAL,
-    pelvic_tilt     REAL,
-    tail_elevation  REAL,
-    limb_symmetry   REAL,
-    head_drop       REAL,
-    lying_flag      INTEGER,
-    restlessness    REAL,
-    kps_coverage    REAL,
-    embed_mean      TEXT    -- JSON list[128] mean-pooled over window
-);
-
-CREATE TABLE IF NOT EXISTS calving_ledger (
-    event_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    real_id     INTEGER,
-    calving_dt  TEXT,
-    outcome     TEXT    -- 'Unassisted'|'Assisted'|'Twin'|'Veterinarian-assisted'
-);
-
-CREATE TABLE IF NOT EXISTS manual_assignments (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT    NOT NULL,
-    temp_id     INTEGER NOT NULL,
-    real_id     INTEGER NOT NULL,
-    assigned_by TEXT    DEFAULT 'manual',
-    assigned_dt TEXT,
-    note        TEXT,
-    UNIQUE(session_id, temp_id)
-);
-
-CREATE TABLE IF NOT EXISTS temp_id_merges (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id    TEXT    NOT NULL,
-    winner_tid    INTEGER NOT NULL,   -- temp_id that survives
-    loser_tid     INTEGER NOT NULL,   -- temp_id that was remapped to winner
-    real_id       INTEGER NOT NULL,   -- the shared AnimalId
-    winner_reason TEXT,               -- 'manual' | 'more_frames' | 'kinetic'
-    loser_reason  TEXT,               -- why the loser was assigned this animal
-    merged_dt     TEXT,
-    UNIQUE(session_id, loser_tid)     -- a loser can only be merged once per session
-);
+CREATE INDEX IF NOT EXISTS idx_raw_tracks_session_frame
+    ON raw_tracks (session_id, frame_index);
 """
 
-
-def init_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+def init_db(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
     conn.executescript(SCHEMA_SQL)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.commit()
-    log(f"Database ready: {db_path}")
     return conn
 
-
-def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM video_sessions WHERE session_id = ?", (session_id,)
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def upsert_session(conn: sqlite3.Connection, session_id: str,
-                   tracks_path: str, is_night: bool) -> None:
-    """Register session if it doesn't exist yet (minimal fields)."""
-    conn.execute("""
-        INSERT OR IGNORE INTO video_sessions (session_id, video_path, is_night)
-        VALUES (?, ?, ?)
-    """, (session_id, tracks_path, int(is_night)))
-    conn.commit()
-
-
-def get_reid_row(conn: sqlite3.Connection, real_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM reid_registry WHERE real_id = ?", (real_id,)
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def upsert_reid(conn: sqlite3.Connection, real_id: int, updates: dict) -> None:
-    existing = get_reid_row(conn, real_id)
-    if existing is None:
-        cols = ["real_id"] + list(updates.keys())
-        vals = [real_id] + list(updates.values())
-        ph = ", ".join("?" * len(vals))
-        conn.execute(
-            f"INSERT INTO reid_registry ({', '.join(cols)}) VALUES ({ph})", vals
-        )
-    else:
-        sets = ", ".join(f"{k} = ?" for k in updates)
-        conn.execute(
-            f"UPDATE reid_registry SET {sets} WHERE real_id = ?",
-            list(updates.values()) + [real_id]
-        )
-    conn.commit()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Detect is_night from tracks.csv (no video needed)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
-    """
-    Heuristic: night/IR footage has near-zero variance between colour channels.
-    Since we don't have pixel data here, fall back to time-of-day from frame_datetime.
-    Night = any session where >50% of frames fall between 20:00 and 06:00 local.
-    (Proper version uses per-channel variance on sampled frames — see architecture doc.)
-    """
-    if "frame_datetime" not in tracks_df.columns:
-        return False
-    dt_col = pd.to_datetime(tracks_df["frame_datetime"], errors="coerce").dropna()
-    if dt_col.empty:
-        return False
-    hours = dt_col.dt.hour
-    night_mask = (hours >= 20) | (hours < 6)
-    return bool(night_mask.mean() > 0.5)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step A — Kinetic Matcher (wraps match_identity.py logic inline)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _camera_displacement_per_bin(tracks: pd.DataFrame,
-                                  bins: pd.DatetimeIndex) -> pd.DataFrame:
-    df = tracks.sort_values(["temp_id", "frame_datetime"])
-    df["bin"] = pd.cut(df["frame_datetime"], bins=bins, right=False, labels=bins[:-1])
-    df = df.dropna(subset=["bin"])
-    # cast Categorical bin labels → Timestamp so merge with kin_delta works
-    df["bin"] = df["bin"].astype("datetime64[ns]")
-    rows = []
-    for (tid, b), grp in df.groupby(["temp_id", "bin"], observed=True):
-        grp = grp.sort_values("frame_datetime")
-        dx = grp["cx"].diff().abs()
-        dy = grp["cy"].diff().abs()
-        disp = np.sqrt(dx**2 + dy**2).sum()
-        rows.append({"bin": b, "temp_id": tid, "displacement": disp})
-    return pd.DataFrame(rows)
-
-
-def _kinetics_delta_per_bin(kinetics: pd.DataFrame,
-                             bins: pd.DatetimeIndex) -> pd.DataFrame:
-    rows = []
-    for aid, grp in kinetics.groupby("AnimalId"):
-        grp = grp.sort_values("datetime")
-        for i in range(len(bins) - 1):
-            t0, t1 = bins[i], bins[i + 1]
-            before = grp[grp["datetime"] < t0]["KineticsCountR"]
-            after  = grp[grp["datetime"] < t1]["KineticsCountR"]
-            if before.empty or after.empty:
-                continue
-            delta = after.iloc[-1] - before.iloc[-1]
-            if delta < 0:
-                delta = 0
-            rows.append({"bin": t0, "AnimalId": aid, "delta": delta})
-    return pd.DataFrame(rows)
-
-
-def _compute_scores(cam_disp: pd.DataFrame, kin_delta: pd.DataFrame,
-                    activity_pct: float, min_active_bins: int) -> pd.DataFrame:
-    results = []
-    for tid, aid in product(cam_disp["temp_id"].unique(), kin_delta["AnimalId"].unique()):
-        cam = cam_disp[cam_disp["temp_id"] == tid][["bin", "displacement"]]
-        kin = kin_delta[kin_delta["AnimalId"] == aid][["bin", "delta"]]
-        merged = cam.merge(kin, on="bin", how="inner")
-        if merged.empty:
-            continue
-        thresh = merged["delta"].quantile(activity_pct)
-        active = merged[merged["delta"] >= thresh]
-        n = len(active)
-        if n < max(min_active_bins, 2):
-            results.append({"temp_id": tid, "AnimalId": aid,
-                             "correlation": np.nan, "n_bins": n,
-                             "p_value": np.nan, "note": f"only {n} active bins"})
-            continue
-        if active["displacement"].std() == 0 or active["delta"].std() == 0:
-            results.append({"temp_id": tid, "AnimalId": aid,
-                             "correlation": np.nan, "n_bins": n,
-                             "p_value": np.nan, "note": "zero variance"})
-            continue
-        r, p = pearsonr(active["displacement"], active["delta"])
-        results.append({"temp_id": tid, "AnimalId": aid,
-                         "correlation": round(r, 4), "n_bins": n,
-                         "p_value": round(p, 4), "note": "ok"})
-    return pd.DataFrame(results)
-
-
-def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
-    assignment = {}
-    used_animals, used_tids = set(), set()
-    valid = scores[scores["correlation"] >= corr_threshold].sort_values(
-        "correlation", ascending=False)
-    for _, row in valid.iterrows():
-        tid, aid = row["temp_id"], row["AnimalId"]
-        if tid in used_tids or aid in used_animals:
-            continue
-        assignment[tid] = aid
-        used_tids.add(tid)
-        used_animals.add(aid)
-    return assignment
-
-
-def step_a_kinetic_match(tracks_df: pd.DataFrame,
-                          kinetics_df: pd.DataFrame,
-                          args: argparse.Namespace) -> dict:
-    """
-    Returns assignment dict: {temp_id (int) -> AnimalId (int)}
-    """
-    section("Step A — Kinetic Matcher")
-
-    total_frames = tracks_df["frame_index"].nunique()
-    tid_counts = tracks_df.groupby("temp_id")["frame_index"].nunique()
-    stable_tids = tid_counts[
-        tid_counts / total_frames >= args.min_temp_id_frames
-    ].index.tolist()
-    log(f"Stable temp_ids (≥{args.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
-
-    tracks_filt = tracks_df[tracks_df["temp_id"].isin(stable_tids)].copy()
-
-    t_start = tracks_filt["frame_datetime"].min().floor(f"{args.bin_minutes}min")
-    t_end   = tracks_filt["frame_datetime"].max().ceil(f"{args.bin_minutes}min")
-    bins    = pd.date_range(start=t_start, end=t_end, freq=f"{args.bin_minutes}min")
-    log(f"Time bins: {len(bins)-1} × {args.bin_minutes}-min from {t_start} to {t_end}")
-
-    if len(bins) < 3:
-        log("WARNING: fewer than 2 complete bins — correlation will be unreliable.")
-
-    cam_disp  = _camera_displacement_per_bin(tracks_filt, bins)
-    kin_delta = _kinetics_delta_per_bin(kinetics_df, bins)
-
-    if cam_disp.empty or kin_delta.empty:
-        log("WARNING: empty displacement or kinetics signal — no matches possible.")
-        return {}
-
-    scores = _compute_scores(cam_disp, kin_delta, args.activity_pct, args.min_active_bins)
-
-    # print correlation matrix
-    if not scores.empty:
-        pivot = scores.pivot_table(index="temp_id", columns="AnimalId",
-                                   values="correlation", aggfunc="first")
-        print("\nCorrelation matrix (temp_id × AnimalId):")
-        print(pivot.to_string())
-        print()
-
-    assignment = _greedy_assign(scores, args.corr_threshold)
-
-    if assignment:
-        for tid, aid in sorted(assignment.items()):
-            row = scores[(scores["temp_id"] == tid) & (scores["AnimalId"] == aid)].iloc[0]
-            log(f"  temp_id {tid:>3}  →  AnimalId {aid}  "
-                f"(r={row['correlation']:.3f}, n_bins={int(row['n_bins'])})")
-    else:
-        log("  No confident kinetic matches. "
-            "Try lowering --corr_threshold or using a longer video.")
-
-    unmatched = set(stable_tids) - set(assignment.keys())
-    if unmatched:
-        log(f"  Unmatched temp_ids after kinetics: {sorted(unmatched)}")
-
-    return assignment
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Embed helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_embeds_for_session(tracks_df: pd.DataFrame,
-                             embed_parquet: str,
-                             session_id: str) -> pd.DataFrame:
-    """
-    Returns DataFrame with columns [temp_id, embed_array (np.ndarray shape 128)].
-    Tries parquet first, falls back to 'embed' column in tracks_df.
-    """
-    if embed_parquet:
-        ep = Path(embed_parquet)
-        # Accept either a session directory (multi-part) or a single legacy file.
-        if ep.is_dir():
-            parts = sorted(ep.glob("embeds_part*.parquet"))
-        elif ep.exists():
-            parts = [ep]
-        else:
-            parts = []
-        if parts:
-            log(f"Loading embeddings from {len(parts)} parquet part(s): {ep}")
-            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-            if "session_id" in df.columns:
-                df = df[df["session_id"] == session_id]
-            if "embed" in df.columns and isinstance(df["embed"].iloc[0], np.ndarray):
-                return df[["temp_id", "embed"]].copy()
-            elif "embed" in df.columns:
-                df["embed"] = df["embed"].apply(
-                    lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
-                )
-                return df[["temp_id", "embed"]].copy()
-
-    # fall back to 'embed' column in tracks CSV
-    if "embed" not in tracks_df.columns:
-        log("WARNING: no 'embed' column in tracks and no parquet — gallery step will be skipped.")
-        return pd.DataFrame(columns=["temp_id", "embed"])
-
-    rows = []
-    for _, row in tracks_df[tracks_df["embed"].notna()].iterrows():
-        raw = row["embed"]
-        if not raw or raw == "[]":
-            continue
-        try:
-            arr = np.array(json.loads(raw), dtype=np.float32)
-            if arr.shape == (128,):
-                rows.append({"temp_id": row["temp_id"], "embed": arr})
-        except Exception:
-            pass
-
-    if not rows:
-        log("WARNING: no valid embeds found in tracks CSV — gallery step will be skipped.")
-        return pd.DataFrame(columns=["temp_id", "embed"])
-
-    log(f"Loaded {len(rows)} embed rows from tracks CSV.")
-    return pd.DataFrame(rows)
-
-
-def compute_mean_embed(embed_rows: pd.DataFrame) -> np.ndarray:
-    """Stack and mean-pool all embed arrays, return L2-normalised 128D vector."""
-    stack = np.stack(embed_rows["embed"].values)     # (N, 128)
-    mean  = stack.mean(axis=0)
-    norm  = np.linalg.norm(mean)
-    return (mean / norm) if norm > 1e-8 else mean
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Gallery I/O
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_gallery(gallery_dir: str, modality: str) -> dict:
-    """
-    Load gallery_{modality}.npy → dict {real_id (int): np.ndarray shape (128,)}.
-    modality: 'day' | 'night'
-    Returns empty dict if file doesn't exist.
-    """
-    path = Path(gallery_dir) / f"gallery_{modality}.npy"
-    if not path.exists():
-        return {}
-    data = np.load(str(path), allow_pickle=True).item()
-    return {int(k): v.astype(np.float32) for k, v in data.items()}
-
-
-def save_gallery(gallery_dir: str, modality: str, gallery: dict) -> None:
-    """Save gallery dict to gallery_{modality}.npy. Creates directory if needed."""
-    Path(gallery_dir).mkdir(parents=True, exist_ok=True)
-    path = Path(gallery_dir) / f"gallery_{modality}.npy"
-    np.save(str(path), gallery)
-    log(f"Gallery saved: {path}  ({len(gallery)} entries)")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step B — Gallery Builder
-# ─────────────────────────────────────────────────────────────────────────────
-
-def step_b_gallery_builder(
-    tracks_df: pd.DataFrame,
-    embed_df: pd.DataFrame,
-    kinetic_assignment: dict,       # {temp_id -> AnimalId}
-    is_night: bool,
-    conn: sqlite3.Connection,
-    args: argparse.Namespace,
-    gallery_dir: str,
-    dry_run: bool = False,
-) -> dict:
-    """
-    For each kinetically-confirmed (temp_id → AnimalId) pair:
-      1. Pool all embeds for that temp_id into a session mean vector
-      2. EMA-blend with existing gallery entry (α = ema_alpha)
-      3. Write updated gallery to .npy and to reid_registry in SQLite
-
-    Returns updated gallery dict {real_id: np.ndarray}.
-    """
-    section("Step B — Gallery Builder")
-
-    modality = "night" if is_night else "day"
-    gallery = load_gallery(gallery_dir, modality)
-    log(f"Loaded {modality} gallery: {len(gallery)} existing entries")
-
-    if embed_df.empty:
-        log("No embeds available — skipping gallery update.")
-        return gallery
-
-    updates = 0
-    alpha = args.ema_alpha
-
-    for tid, aid in kinetic_assignment.items():
-        tid_embeds = embed_df[embed_df["temp_id"] == tid]
-        if len(tid_embeds) < args.min_embeds_gallery:
-            log(f"  temp_id {tid}: only {len(tid_embeds)} embeds (< {args.min_embeds_gallery}) — skip")
-            continue
-
-        session_mean = compute_mean_embed(tid_embeds)
-
-        if aid in gallery:
-            old_vec     = gallery[aid]
-            updated_vec = alpha * session_mean + (1 - alpha) * old_vec
-            norm        = np.linalg.norm(updated_vec)
-            gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
-            log(f"  AnimalId {aid} (t{tid}): EMA update  α={alpha}  "
-                f"cosine(old,new)={float(np.dot(old_vec, session_mean)):.3f}")
-        else:
-            gallery[aid] = session_mean
-            log(f"  AnimalId {aid} (t{tid}): new gallery entry from {len(tid_embeds)} embeds")
-
-        updates += 1
-
-        # update reid_registry in SQLite
-        if not dry_run:
-            col_emb   = f"gallery_embed_{modality}"
-            col_n     = f"gallery_n_{modality}"
-            col_upd   = f"last_updated_{modality}_dt"
-            ts        = pd.Timestamp.now().isoformat()
-            emb_json  = json.dumps(gallery[aid].tolist())
-
-            existing  = get_reid_row(conn, aid)
-            old_n     = (existing or {}).get(col_n, 0) or 0
-
-            upsert_reid(conn, aid, {
-                col_emb: emb_json,
-                col_n:   old_n + 1,
-                col_upd: ts,
-                "match_method": "kinetic",
-            })
-
-    log(f"Gallery updated: {updates} entries  modality={modality}")
-
-    if not dry_run and updates > 0:
-        save_gallery(gallery_dir, modality, gallery)
-
-    return gallery
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step C — Cosine Resolver
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na < 1e-8 or nb < 1e-8:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
-
-
-def _tid_frame_arrays(tracks_df: pd.DataFrame) -> dict:
-    """{temp_id -> sorted np.ndarray of frame_index values actually recorded
-    for that tid} — used for real frame-level co-occurrence checks, not just
-    an outer [min,max] interval (see _frames_cooccur)."""
-    out = {}
-    for tid, g in tracks_df.groupby("temp_id"):
-        out[int(tid)] = np.sort(g["frame_index"].to_numpy())
-    return out
-
-
-def _tid_frame_boxes(tracks_df: pd.DataFrame) -> dict:
-    """{temp_id -> DataFrame[frame_index, x1, y1, x2, y2] sorted by
-    frame_index} — lets a frame-level co-occurrence hit be checked
-    spatially too: same frame in different parts of the pen is two
-    different animals; same frame in the same spot is one animal whose
-    box briefly got two temp_ids (an ID-handoff artifact)."""
-    cols = ["frame_index", "x1", "y1", "x2", "y2"]
-    out = {}
-    for tid, g in tracks_df.groupby("temp_id"):
-        out[int(tid)] = g[cols].sort_values("frame_index").reset_index(drop=True)
-    return out
-
-
-def _iou(box_a: tuple, box_b: tuple) -> float:
-    """Standard IoU for two (x1,y1,x2,y2) boxes. 0 if either is degenerate
-    or they don't overlap at all."""
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter
-    return float(inter / union) if union > 0 else 0.0
-
-
-def _nearest_box(frame_boxes: pd.DataFrame, target_frame: int):
-    """Row (as a plain (x1,y1,x2,y2) tuple) whose frame_index is closest to
-    target_frame. None if frame_boxes is empty."""
-    if frame_boxes.empty:
-        return None
-    idx = (frame_boxes["frame_index"] - target_frame).abs().idxmin()
-    row = frame_boxes.loc[idx]
-    return (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
-
-
-def _estimate_frame_tolerance(tracks_df: pd.DataFrame, default: int = 20) -> int:
-    """Approximate the per-tid sampling cadence (roughly save_every from
-    track_and_dump.py) directly from the data, so co-occurrence tolerance
-    isn't a guessed constant. Uses the median consecutive-frame gap of
-    whichever temp_id has the most rows (most likely to be continuously
-    tracked, giving a clean estimate of the commit cadence)."""
-    counts = tracks_df["temp_id"].value_counts()
-    if counts.empty:
-        return default
-    densest_tid = counts.idxmax()
-    fr = np.sort(tracks_df.loc[tracks_df["temp_id"] == densest_tid, "frame_index"].to_numpy())
-    if len(fr) < 2:
-        return default
-    gaps = np.diff(fr)
-    gaps = gaps[gaps > 0]
-    if len(gaps) == 0:
-        return default
-    # 2x safety margin for jitter in exactly which frame within a window
-    # ends up being the one committed.
-    return max(int(2 * np.median(gaps)), default)
-
-
-def _min_frame_dist(arr_a: np.ndarray, arr_b: np.ndarray) -> float:
-    """Smallest gap between any recorded frame of arr_a and any recorded
-    frame of arr_b. inf if either is empty."""
-    if len(arr_a) == 0 or len(arr_b) == 0:
-        return float("inf")
-    idx = np.searchsorted(arr_b, arr_a)
-    idx_lo = np.clip(idx - 1, 0, len(arr_b) - 1)
-    idx_hi = np.clip(idx, 0, len(arr_b) - 1)
-    nearest_dist = np.minimum(np.abs(arr_a - arr_b[idx_lo]), np.abs(arr_a - arr_b[idx_hi]))
-    return float(nearest_dist.min())
-
-
-def _frames_cooccur(arr_a: np.ndarray, arr_b: np.ndarray, tol: int) -> bool:
-    """True if any recorded frame of arr_a is within `tol` frames of any
-    recorded frame of arr_b — i.e. the two temp_ids were actually on screen
-    at close to the same moment, not just somewhere within each other's
-    overall active-duration interval."""
-    return _min_frame_dist(arr_a, arr_b) <= tol
-
-
-def step_c_cosine_resolver(
-    tracks_df: pd.DataFrame,
-    embed_df: pd.DataFrame,
-    kinetic_assignment: dict,       # {temp_id -> AnimalId} — already confirmed
-    gallery: dict,                  # {real_id: np.ndarray} flat gallery from step B
-    is_night: bool,
-    conn: sqlite3.Connection,
-    args: argparse.Namespace,
-    gallery_dir: str,
-    session_id: str,
-    camera_id: str = "cam0",
-    dry_run: bool = False,
-) -> dict:
-    """
-    Resolve unconfirmed temp_ids via cosine similarity.
-
-    Query order per unresolved temp_id:
-      1. Flat real_id gallery        — confirmed identities across all sessions
-      2. Pose-conditioned real_id gallery — slot-aware, higher discrimination
-      3. TempPoseGallery (same camera, other sessions) — cross-session temp matching
-
-    If a temp_id matches a real_id (steps 1/2) → assign that real_id.
-    If a temp_id matches another temp_id (step 3) that already has a synthetic id
-      → assign the same synthetic id.
-    If a temp_id matches another temp_id with no identity yet → mint a new
-      synthetic id and assign it to both.
-    If no match → leave unresolved.
-
-    Also runs backpropagation: if any confirmed real_id in this session was
-    previously a synthetic id, all timeline rows are updated.
-    """
-    section("Step C — Cosine Resolver")
-
-    modality = "night" if is_night else "day"
-
-    already_resolved = set(kinetic_assignment.keys())
-    all_tids = set(tracks_df["temp_id"].unique())
-    unresolved_tids = all_tids - already_resolved
-
-    if embed_df.empty:
-        log("No embeds available — cosine resolver skipped.")
-        return dict(kinetic_assignment)
-
-    embed_counts   = embed_df.groupby("temp_id").size()
-    queryable_tids = [
-        tid for tid in unresolved_tids
-        if embed_counts.get(tid, 0) >= args.cosine_min_embeds
-    ]
-    log(f"Unresolved temp_ids: {len(unresolved_tids)}  "
-        f"Queryable (≥{args.cosine_min_embeds} embeds): {len(queryable_tids)}")
-
-    # Load pose galleries
-    pose_gallery = PoseGallery.load(gallery_dir, modality)
-    temp_gallery = TempPoseGallery.load(gallery_dir, modality)
-
-    cosine_assignment = {}
-
-    # aid -> list of (claim_tid, frame_array) that currently hold this
-    # real_id. Seeded from kinetic_assignment so we know which tids are
-    # already "occupied" before any cosine matching runs. Keeping claim_tid
-    # (not just the frame array) lets a blocked match be diagnosed: which
-    # specific already-claimed tid caused the block, and by how many frames.
-    tid_frames   = _tid_frame_arrays(tracks_df)
-    tid_boxes    = _tid_frame_boxes(tracks_df)
-    cooccur_tol  = _estimate_frame_tolerance(tracks_df)
-    IOU_SAME_ANIMAL = 0.3   # above this, same screen location -> handoff artifact, not a real conflict
-    aid_claims: dict = {}
-    for k_tid, k_aid in kinetic_assignment.items():
-        aid_claims.setdefault(k_aid, []).append((k_tid, tid_frames.get(k_tid, np.array([]))))
-
-    def _aid_block_reason(tid: int, aid):
-        """Returns (blocked: bool, blocking_tid: int|None, min_dist: float|None,
-        iou: float|None).
-        An aid is only off-limits to `tid` if a temp_id that ALREADY holds it
-        was actually on screen at close to the same moment as `tid` AND in a
-        different part of the frame (temporal co-occurrence within
-        cooccur_tol, spatial IoU below IOU_SAME_ANIMAL) — i.e. they're
-        genuinely two different animals. Temporal co-occurrence alone isn't
-        enough to conclude that: an ID-handoff (the old track dying and a new
-        one starting for the SAME animal) commonly leaves 1-2 frames where
-        both ids are recorded, but at essentially the SAME location — that's
-        one animal, not two, and should NOT block. Two co-occurring ids in
-        DIFFERENT parts of the pen are genuinely different animals and
-        SHOULD block. A coarse [min,max] interval check was tried before this
-        and over-blocked badly: when one animal dominates most of a session,
-        its already-claimed fragments' combined intervals end up covering
-        most of the timeline, so any further genuine fragment of the SAME
-        animal would get flagged as 'overlapping' even without ever
-        literally coinciding with another track in any single frame. If a
-        high-cosine candidate still gets blocked here, inspect the reported
-        blocking_tid, min_dist and iou directly against raw_tracks rather
-        than assuming it's a true conflict."""
-        my_frames = tid_frames.get(tid, np.array([]))
-        my_boxes  = tid_boxes.get(tid)
-        best_block_tid, best_dist, best_other_frames = None, float("inf"), None
-        for claim_tid, other in aid_claims.get(aid, []):
-            d = _min_frame_dist(my_frames, other)
-            if d < best_dist:
-                best_dist, best_block_tid, best_other_frames = d, claim_tid, other
-
-        if best_dist > cooccur_tol or best_block_tid is None:
-            return False, None, None, None
-
-        # Temporally co-occurring — now check WHERE in the frame, to tell a
-        # real conflict (different location) apart from an ID-handoff
-        # artifact (same location, briefly two ids for the same box).
-        # Must find the EXACT (my_frame, other_frame) pair that achieved
-        # best_dist above -- symmetric nearest-neighbor (check both idx-1
-        # and idx on both sides), not just the insertion point, or this can
-        # pick a worse-matching pair and pull boxes from moments further
-        # apart than best_dist implies, understating IoU for genuine
-        # same-spot handoffs.
-        best_iou = 0.0
-        other_boxes = tid_boxes.get(best_block_tid)
-        if (my_boxes is not None and len(my_boxes)
-                and other_boxes is not None and len(other_boxes)
-                and best_other_frames is not None and len(best_other_frames)):
-            idx    = np.searchsorted(best_other_frames, my_frames)
-            idx_lo = np.clip(idx - 1, 0, len(best_other_frames) - 1)
-            idx_hi = np.clip(idx,     0, len(best_other_frames) - 1)
-            dist_lo = np.abs(my_frames - best_other_frames[idx_lo])
-            dist_hi = np.abs(my_frames - best_other_frames[idx_hi])
-            use_lo  = dist_lo <= dist_hi
-            chosen_other_frame = np.where(use_lo, best_other_frames[idx_lo], best_other_frames[idx_hi])
-            chosen_dist         = np.where(use_lo, dist_lo, dist_hi)
-            best_i = int(np.argmin(chosen_dist))
-            my_frame_at_best    = int(my_frames[best_i])
-            other_frame_at_best = int(chosen_other_frame[best_i])
-            box_a = _nearest_box(my_boxes, my_frame_at_best)
-            box_b = _nearest_box(other_boxes, other_frame_at_best)
-            best_iou = _iou(box_a, box_b) if box_a and box_b else 0.0
-
-        if best_iou >= IOU_SAME_ANIMAL:
-            # Same spot, same moment -> one animal, handoff artifact.
-            # Not a real conflict, don't block.
-            return False, best_block_tid, best_dist, best_iou
-        return True, best_block_tid, best_dist, best_iou
-
-    def _aid_blocked_for(tid: int, aid) -> bool:
-        return _aid_block_reason(tid, aid)[0]
-
-    for tid in queryable_tids:
-        tid_embeds = embed_df[embed_df["temp_id"] == tid]
-        query_vec  = compute_mean_embed(tid_embeds)
-
-        # ── Step 1: flat real_id gallery ─────────────────────────────────────
-        best_aid, best_sim = None, -1.0
-        for aid, gvec in gallery.items():
-            if _aid_blocked_for(tid, aid):
-                continue
-            sim = cosine_sim(query_vec, gvec)
-            if sim > best_sim:
-                best_sim, best_aid = sim, aid
-
-        if best_aid is not None and best_sim >= args.cosine_threshold:
-            cosine_assignment[tid] = best_aid
-            aid_claims.setdefault(best_aid, []).append((tid, tid_frames.get(tid, np.array([]))))
-            log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
-            continue
-
-        # Best score seen so far across steps, for near-miss reporting if
-        # this tid ends up unresolved (Step 1's best_sim is always a real
-        # number regardless of whether it cleared the threshold).
-        near_miss = [("flat", best_aid, best_sim)]
-
-        # ── Step 2: pose-conditioned real_id gallery ─────────────────────────
-        p_id, p_cos, _ = pose_gallery.query(
-            query_vec, posture=None, facing=None, threshold=args.cosine_threshold
-        )
-        if p_cos is not None:
-            near_miss.append(("pose-slot", p_id, p_cos))
-        if p_id is not None and not _aid_blocked_for(tid, p_id):
-            cosine_assignment[tid] = p_id
-            aid_claims.setdefault(p_id, []).append((tid, tid_frames.get(tid, np.array([]))))
-            log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
-            continue
-
-        # ── Step 3: TempPoseGallery — cross-session same camera ──────────────
-        match_key, t_cos, _ = temp_gallery.query_for_camera(
-            camera_id       = camera_id,
-            query_embed     = query_vec,
-            posture         = None,
-            facing          = None,
-            threshold       = args.cosine_threshold,
-            exclude_session = session_id,   # don't match against self
-        )
-        if t_cos is not None:
-            near_miss.append(("temp-key", match_key, t_cos))
-
-        if match_key is not None:
-            # The matched temp_id may already have a synthetic id assigned
-            matched_sid = cosine_assignment.get(match_key.temp_id)
-            if matched_sid is None:
-                # check reid_registry for an existing assignment
-                existing_row = get_reid_row(conn, match_key.temp_id)
-                if existing_row:
-                    matched_sid = existing_row.get("real_id")
-
-            if matched_sid is not None and not _aid_blocked_for(tid, matched_sid):
-                # Inherit the same synthetic id
-                cosine_assignment[tid] = matched_sid
-                aid_claims.setdefault(matched_sid, []).append((tid, tid_frames.get(tid, np.array([]))))
-                log(f"  t{tid} → synthetic_id {matched_sid}  "
-                    f"(temp cosine={t_cos:.3f}, matched {match_key})")
-            else:
-                # Mint a new synthetic id for this pair
-                new_synth = mint_synthetic_id(gallery_dir)
-                cosine_assignment[tid]              = new_synth
-                cosine_assignment[match_key.temp_id] = new_synth
-                aid_claims.setdefault(new_synth, []).append((tid, tid_frames.get(tid, np.array([]))))
-                # Register synthetic id in reid_registry
-                if not dry_run:
-                    ts = pd.Timestamp.now().isoformat()
-                    upsert_reid(conn, new_synth, {
-                        "match_method":  "synthetic",
-                        "first_seen_dt": ts,
-                        "known_temp_ids": json.dumps([
-                            {"session_id": session_id,       "temp_id": int(tid)},
-                            {"session_id": match_key.session_id, "temp_id": match_key.temp_id},
-                        ]),
-                    })
-                log(f"  t{tid} + {match_key} → NEW synthetic_id {new_synth}  "
-                    f"(temp cosine={t_cos:.3f})")
-        else:
-            source, candidate, score = max(near_miss, key=lambda x: x[2])
-            if candidate is None:
-                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
-                    f"(closest: {source} @ {score:.3f}, no candidate id)")
-            elif score >= args.cosine_threshold and source in ("flat", "pose-slot"):
-                # Cleared the cosine threshold but still ended up unresolved
-                # -> it was blocked by the overlap check, not by similarity.
-                # Report exactly what blocked it so a real conflict can be
-                # told apart from an overlap-check false positive (see the
-                # NOTE in _aid_block_reason).
-                blocked, block_tid, block_dist, block_iou = _aid_block_reason(tid, candidate)
-                if blocked:
-                    log(f"  t{tid}: scored {score:.3f} ({source}) on real_id {candidate} "
-                        f"— BLOCKED: {block_dist:.0f} frames + IoU={block_iou:.2f} vs "
-                        f"already-claimed t{block_tid} (tolerance={cooccur_tol}, "
-                        f"same-animal IoU≥{IOU_SAME_ANIMAL}). Low IoU here means a different "
-                        f"part of the pen -> likely a genuinely different animal.")
-                else:
-                    # Shouldn't normally happen (if not blocked it should have
-                    # been accepted above) — log plainly rather than guess why.
-                    log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
-                        f"(closest: {source} candidate {candidate} @ {score:.3f})")
-            else:
-                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
-                    f"(closest: {source} candidate {candidate} @ {score:.3f})")
-
-    if not cosine_assignment:
-        log("  No cosine matches found.")
-
-    # ── Soft gallery update for real_id cosine matches (α/2) ─────────────────
-    if not dry_run:
-        alpha_half = args.ema_alpha / 2
-        for tid, aid in cosine_assignment.items():
-            if is_synthetic(aid):
-                continue   # don't update real_id gallery with unconfirmed embeddings
-            tid_embeds = embed_df[embed_df["temp_id"] == tid]
-            if len(tid_embeds) < args.min_embeds_gallery:
-                continue
-            session_mean = compute_mean_embed(tid_embeds)
-            if aid in gallery:
-                updated = gallery[aid] * (1 - alpha_half) + session_mean * alpha_half
-                norm = np.linalg.norm(updated)
-                gallery[aid] = updated / norm if norm > 1e-8 else updated
-            else:
-                gallery[aid] = session_mean
-            ts      = pd.Timestamp.now().isoformat()
-            col_emb = f"gallery_embed_{modality}"
-            col_n   = f"gallery_n_{modality}"
-            existing = get_reid_row(conn, aid)
-            old_n    = (existing or {}).get(col_n, 0) or 0
-            upsert_reid(conn, aid, {
-                col_emb: json.dumps(gallery[aid].tolist()),
-                col_n:   old_n + 1,
-                f"last_updated_{modality}_dt": ts,
-                "match_method": f"cosine_{modality}",
-            })
-        save_gallery(gallery_dir, modality, gallery)
-
-    # ── Backpropagate: if any confirmed real_id was previously synthetic ──────
-    all_assignments = {**kinetic_assignment, **cosine_assignment}
-    for tid, aid in list(all_assignments.items()):
-        if not is_synthetic(aid):
-            continue
-        # This temp_id now has a confirmed real_id via kinetics or manual?
-        confirmed = kinetic_assignment.get(tid)
-        if confirmed and not is_synthetic(confirmed):
-            rows = backpropagate_resolution(
-                synthetic_id = aid,
-                real_id      = confirmed,
-                conn         = conn,
-                pose_gallery = pose_gallery,
-                gallery_dir  = gallery_dir,
-                modality     = modality,
-                dry_run      = dry_run,
-            )
-            log(f"  Backpropagated synthetic_id {aid} → real_id {confirmed} "
-                f"({rows} timeline rows updated)")
-            all_assignments[tid] = confirmed
-            pose_gallery.save(gallery_dir, modality)
-
-    # NOTE: duplicate real_id resolution (multiple temp_ids matched to the same
-    # AnimalId — expected now that assigned_aids has been replaced with the
-    # temporal-overlap check above) is intentionally NOT done here. A prior
-    # "switch healing" pass used to pre-merge duplicates using only raw frame
-    # count, with no manual-assignment priority and no audit trail — it ran
-    # before resolve_duplicate_assignments (Step A.6) and silently deleted
-    # every duplicate but the single largest fragment, so Step A.6 (which has
-    # the correct manual > cosine > kinetic priority, proper tiebreaking, and
-    # writes temp_id_merges for traceability) only ever saw what that pass
-    # left behind. Step A.6 is the single authoritative merge step — leave
-    # every raw match intact here and let it do that job once, correctly.
-    merged = {**kinetic_assignment, **cosine_assignment}
-    n_real    = sum(1 for v in merged.values() if not is_synthetic(v))
-    n_synth   = sum(1 for v in merged.values() if is_synthetic(v))
-    log(f"Final assignment: {len(merged)} temp_ids resolved  "
-        f"({len(kinetic_assignment)} kinetic, {len(cosine_assignment)} cosine  "
-        f"[{n_real} real_id, {n_synth} synthetic])")
-    return merged
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step D — Sensor Sequencer (forward-fill to video time grid)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def step_d_sensor_sequencer(
-    tracks_df: pd.DataFrame,
-    kinetics_df: pd.DataFrame,
-    behavior_df: pd.DataFrame | None,
-    assignment: dict,
-    bin_minutes: int = 15,
-) -> pd.DataFrame:
-    """
-    Forward-fill behavior (~90s) and kinetics (~15min) signals onto the video time grid.
-
-    For each resolved (temp_id → AnimalId) pair:
-      - Build a time grid from the video bins
-      - Join and forward-fill kinetics deltas and behavior features
-      - Return one row per (real_id, window_start_dt) suitable for resolved_cow_timeline
-
-    Returns DataFrame with columns aligned to resolved_cow_timeline schema.
-    """
-    section("Step D — Sensor Sequencer")
-
-    if assignment is None or len(assignment) == 0:
-        log("No assignments — sensor sequencer skipped.")
-        return pd.DataFrame()
-
-    rows = []
-
-    for tid, aid in assignment.items():
-        tid_tracks = tracks_df[tracks_df["temp_id"] == tid].copy()
-        if tid_tracks.empty:
-            continue
-
-        t_start = tid_tracks["frame_datetime"].min().floor(f"{bin_minutes}min")
-        t_end   = tid_tracks["frame_datetime"].max().ceil(f"{bin_minutes}min")
-        bins    = pd.date_range(start=t_start, end=t_end, freq=f"{bin_minutes}min")
-
-        # ---- kinetics deltas ----
-        kin_animal = kinetics_df[kinetics_df["AnimalId"] == aid].sort_values("datetime")
-
-        kin_bins = []
-        for i in range(len(bins) - 1):
-            t0, t1 = bins[i], bins[i + 1]
-            before = kin_animal[kin_animal["datetime"] < t0]
-            after  = kin_animal[kin_animal["datetime"] < t1]
-            if before.empty or after.empty:
-                kin_bins.append({
-                    "window_start_dt": t0,
-                    "d_kin_x": np.nan, "d_kin_y": np.nan,
-                    "d_kin_z": np.nan, "d_kin_r": np.nan,
-                })
-                continue
-            deltas = {
-                "window_start_dt": t0,
-                "d_kin_x": max(0, after.iloc[-1]["KineticsCountX"] - before.iloc[-1]["KineticsCountX"]),
-                "d_kin_y": max(0, after.iloc[-1]["KineticsCountY"] - before.iloc[-1]["KineticsCountY"]),
-                "d_kin_z": max(0, after.iloc[-1]["KineticsCountZ"] - before.iloc[-1]["KineticsCountZ"]),
-                "d_kin_r": max(0, after.iloc[-1]["KineticsCountR"] - before.iloc[-1]["KineticsCountR"]),
-            }
-            kin_bins.append(deltas)
-
-        kin_grid = pd.DataFrame(kin_bins).set_index("window_start_dt")
-        # forward-fill any NaN gaps (sensor dropouts)
-        kin_grid = kin_grid.ffill()
-
-        # ---- behavior features (forward-fill from ~90s intervals) ----
-        beh_cols = ["d_f12", "d_f23", "d_v"]
-        beh_grid = pd.DataFrame(index=bins[:-1], columns=beh_cols, dtype=float)
-        beh_grid.index.name = "window_start_dt"
-
-        if behavior_df is not None and not behavior_df.empty:
-            beh_animal = behavior_df[behavior_df["AnimalId"] == aid].sort_values("datetime")
-            if not beh_animal.empty:
-                # assign each behavior row to nearest bin, then mean-aggregate
-                beh_animal = beh_animal.copy()
-                beh_animal["bin"] = pd.cut(
-                    beh_animal["datetime"], bins=bins, right=False, labels=bins[:-1]
-                )
-                beh_animal = beh_animal.dropna(subset=["bin"])
-                for b, grp in beh_animal.groupby("bin", observed=True):
-                    # compute deltas of each feature over this bin
-                    beh_grid.loc[b, "d_f12"] = grp["f_1_2"].diff().abs().sum() if len(grp) > 1 else grp["f_1_2"].iloc[0]
-                    beh_grid.loc[b, "d_f23"] = grp["f_2_3"].diff().abs().sum() if len(grp) > 1 else grp["f_2_3"].iloc[0]
-                    beh_grid.loc[b, "d_v"]   = grp["v"].diff().abs().sum()      if len(grp) > 1 else grp["v"].iloc[0]
-                beh_grid = beh_grid.ffill()
-
-        # ---- merge into one row per bin ----
-        for t0 in bins[:-1]:
-            krow = kin_grid.loc[t0] if t0 in kin_grid.index else pd.Series(dtype=float)
-            brow = beh_grid.loc[t0] if t0 in beh_grid.index else pd.Series(dtype=float)
-
-            sensor_ok = not (krow.isna().all() and brow.isna().all())
-            modality_mask = 1 if sensor_ok else 0  # bit 0 = sensor_ok
-
-            rows.append({
-                "real_id":         int(aid),
-                "window_start_dt": t0.isoformat(),
-                "modality_mask":   modality_mask,
-                "d_f12":   float(brow.get("d_f12",   np.nan)),
-                "d_f23":   float(brow.get("d_f23",   np.nan)),
-                "d_v":     float(brow.get("d_v",     np.nan)),
-                "d_kin_x": float(krow.get("d_kin_x", np.nan)),
-                "d_kin_y": float(krow.get("d_kin_y", np.nan)),
-                "d_kin_z": float(krow.get("d_kin_z", np.nan)),
-                "d_kin_r": float(krow.get("d_kin_r", np.nan)),
-                # vision features filled by future pose extractor (step E)
-                "spine_angle": None, "pelvic_tilt": None, "tail_elevation": None,
-                "limb_symmetry": None, "head_drop": None, "lying_flag": None,
-                "restlessness": None, "kps_coverage": None, "embed_mean": None,
-            })
-
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        log(f"Sensor grid: {len(result)} rows for {result['real_id'].nunique()} animals")
-    else:
-        log("Sensor grid empty.")
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step E — Write resolved_cow_timeline
-# ─────────────────────────────────────────────────────────────────────────────
-
-def step_e_write_timeline(
-    timeline_df: pd.DataFrame,
-    session_id: str,
-    conn: sqlite3.Connection,
-    dry_run: bool = False,
-) -> None:
-    section("Step E — Write resolved_cow_timeline")
-
-    if timeline_df.empty:
-        log("Nothing to write.")
-        return
-
-    timeline_df = timeline_df.copy()
-    timeline_df["session_id"] = session_id
-
-    # Convert NaN embed_mean to None so SQLite stores NULL
-    if "embed_mean" in timeline_df.columns:
-        timeline_df["embed_mean"] = timeline_df["embed_mean"].where(
-            timeline_df["embed_mean"].notna(), None
-        )
-
-    if dry_run:
-        log(f"[dry_run] Would insert {len(timeline_df)} rows into resolved_cow_timeline")
-        print(timeline_df.head(5).to_string())
-        return
-
-    cols = [
-        "real_id", "session_id", "window_start_dt", "modality_mask",
-        "d_f12", "d_f23", "d_v",
-        "d_kin_x", "d_kin_y", "d_kin_z", "d_kin_r",
-        "spine_angle", "pelvic_tilt", "tail_elevation",
-        "limb_symmetry", "head_drop", "lying_flag",
-        "restlessness", "kps_coverage", "embed_mean",
-        # vision feature extractor columns (added by migrate_timeline_schema)
-        "lying_fraction", "posture_transitions", "facing_dominant", "facing_entropy",
-    ]
-    # only include columns that exist in the df
-    cols = [c for c in cols if c in timeline_df.columns]
-
-    ph  = ", ".join("?" * len(cols))
-    sql = f"INSERT INTO resolved_cow_timeline ({', '.join(cols)}) VALUES ({ph})"
-
-    def _to_sqlite(v):
-        """Coerce a value to a SQLite-safe type."""
-        import pandas as _pd
-        if v is None:
-            return None
-        if isinstance(v, float) and np.isnan(v):
-            return None
-        if isinstance(v, _pd.Timestamp):
-            return v.isoformat()
-        if hasattr(v, "item"):          # numpy scalar → python scalar
-            return v.item()
-        return v
-
-    inserted = 0
-    for _, row in timeline_df.iterrows():
-        vals = [_to_sqlite(row.get(c)) for c in cols]
-        conn.execute(sql, vals)
-        inserted += 1
-
-    conn.commit()
-    log(f"Inserted {inserted} rows into resolved_cow_timeline for session '{session_id}'")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Update known_temp_ids in reid_registry
-# ─────────────────────────────────────────────────────────────────────────────
-
-def update_known_temp_ids(conn: sqlite3.Connection,
-                           assignment: dict,
-                           session_id: str,
-                           dry_run: bool = False) -> None:
-    """Append {session_id, temp_id} entries to reid_registry.known_temp_ids."""
-    if dry_run:
-        return
-    for tid, aid in assignment.items():
-        existing = get_reid_row(conn, aid)
-        if existing is None:
-            continue
-        raw = existing.get("known_temp_ids") or "[]"
-        try:
-            known = json.loads(raw)
-        except Exception:
-            known = []
-        entry = {"session_id": session_id, "temp_id": int(tid)}
-        if entry not in known:
-            known.append(entry)
-        upsert_reid(conn, aid, {"known_temp_ids": json.dumps(known)})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step A.6 — Duplicate assignment resolver
-# ─────────────────────────────────────────────────────────────────────────────
-
-def resolve_duplicate_assignments(
-    assignment: dict,               # {temp_id -> real_id}  — may contain duplicates
-    manual_tids: set,               # temp_ids that came from manual assignments
-    kinetic_tids: set,              # temp_ids that came from kinetic matching
-    tracks_df: pd.DataFrame,        # for frame-count lookup
-    conn: sqlite3.Connection,
-    session_id: str,
-    dry_run: bool = False,
-) -> dict:
-    """
-    Detect AnimalIds assigned to multiple temp_ids and resolve by merging.
-
-    Winner hierarchy (highest priority first):
-      1. Manual assignment
-      2. More frames in raw_tracks
-      3. Kinetic assignment (lower temp_id breaks ties)
-
-    The loser temp_id is remapped to the winner temp_id in the returned dict.
-    A record is written to temp_id_merges for traceability.
-
-    Returns a cleaned assignment dict where every real_id appears exactly once,
-    plus a merge_map {loser_tid -> winner_tid} for downstream steps to use
-    when pooling embed/track rows.
-    """
-    # group by real_id → find duplicates
-    from collections import defaultdict
-    aid_to_tids = defaultdict(list)
-    for tid, aid in assignment.items():
-        aid_to_tids[aid].append(tid)
-
-    duplicates = {aid: tids for aid, tids in aid_to_tids.items() if len(tids) > 1}
-    if not duplicates:
-        return assignment, {}
-
-    section("Step A.6 — Duplicate Assignment Resolver")
-
-    # frame counts for all temp_ids in this session
-    frame_counts = (
-        tracks_df.groupby("temp_id")["frame_index"]
-        .nunique()
-        .to_dict()
+def register_session(conn, session_id, video_path, camera_id, start_dt, end_dt=""):
+    # Delete any existing data for this session so a re-run is a clean overwrite.
+    conn.execute("DELETE FROM raw_tracks WHERE session_id = ?", (session_id,))
+    conn.execute(
+        "INSERT OR REPLACE INTO video_sessions "
+        "(session_id,video_path,camera_id,start_dt,end_dt) VALUES (?,?,?,?,?)",
+        (session_id, video_path, camera_id, start_dt, end_dt)
     )
-
-    def priority(tid, aid):
-        """Lower number = higher priority (wins).
-        Hierarchy: manual(0) > cosine(1) > kinetic(2)
-        Tiebreak within same tier: more frames wins, then lower temp_id.
-        """
-        if tid in manual_tids:
-            return (0, -frame_counts.get(tid, 0), tid)   # manual — highest
-        if tid not in kinetic_tids:
-            return (1, -frame_counts.get(tid, 0), tid)   # cosine — second
-        return (2, -frame_counts.get(tid, 0), tid)       # kinetic — lowest
-
-    def reason(tid):
-        if tid in manual_tids:   return "manual"
-        if tid in kinetic_tids:  return "kinetic"
-        return "cosine"
-
-    merge_map = {}   # {loser_tid -> winner_tid}
-    clean = dict(assignment)
-    ts = pd.Timestamp.now().isoformat()
-
-    for aid, tids in sorted(duplicates.items()):
-        ranked = sorted(tids, key=lambda t: priority(t, aid))
-        winner = ranked[0]
-        losers = ranked[1:]
-
-        log(f"  AnimalId {aid} → duplicate temp_ids {sorted(tids)}")
-        log(f"    winner: temp_id {winner} ({reason(winner)}, "
-            f"{frame_counts.get(winner,0)} frames)")
-
-        for loser in losers:
-            log(f"    merge:  temp_id {loser} ({reason(loser)}, "
-                f"{frame_counts.get(loser,0)} frames) → remapped to temp_id {winner}")
-            merge_map[loser] = winner
-            del clean[loser]
-
-            if not dry_run:
-                conn.execute("""
-                    INSERT INTO temp_id_merges
-                        (session_id, winner_tid, loser_tid, real_id,
-                         winner_reason, loser_reason, merged_dt)
-                    VALUES (?,?,?,?,?,?,?)
-                    ON CONFLICT(session_id, loser_tid) DO UPDATE SET
-                        winner_tid    = excluded.winner_tid,
-                        real_id       = excluded.real_id,
-                        winner_reason = excluded.winner_reason,
-                        loser_reason  = excluded.loser_reason,
-                        merged_dt     = excluded.merged_dt
-                """, (session_id, winner, loser, aid,
-                      reason(winner), reason(loser), ts))
-
-    if not dry_run and merge_map:
-        conn.commit()
-
-    log(f"  Resolved {len(merge_map)} duplicate(s) → "
-        f"{len(clean)} unique assignments")
-    return clean, merge_map
+    conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Step A.5 — Manual assignment loader
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Incremental Parquet writers ───────────────────────────────────────────────
+# Open the file before the loop; flush one row-group per commit_every interval.
+# Memory stays bounded to one batch at a time rather than the full run.
 
-def load_manual_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
+EMBED_SCHEMA = pa.schema([
+    pa.field("session_id",  pa.string()),
+    pa.field("frame_index", pa.int32()),
+    pa.field("temp_id",     pa.int32()),
+    pa.field("embed",       pa.list_(pa.float32(), 128)),
+])
+
+KPS_SCHEMA = pa.schema([
+    pa.field("session_id",  pa.string()),
+    pa.field("frame_index", pa.int32()),
+    pa.field("temp_id",     pa.int32()),
+    pa.field("kps",         pa.list_(pa.float32(), 57)),
+    pa.field("kps_kconf",   pa.list_(pa.float32(), 19)),
+])
+
+# QA-only — deliberately NOT part of the canonical outputs (raw_tracks / embeds /
+# kps). Polygons vary in point count per instance, so stored as a JSON string
+# rather than a fixed-size array. See MaskWriter below: written to its own
+# subdirectory and never uploaded to Drive.
+MASK_SCHEMA = pa.schema([
+    pa.field("session_id",     pa.string()),
+    pa.field("frame_index",    pa.int32()),
+    pa.field("temp_id",        pa.int32()),
+    pa.field("mask_poly_json", pa.string()),
+])
+
+
+class EmbedWriter:
+    """Rolling multi-part Parquet writer.
+
+    Produces embeds_part000.parquet, embeds_part001.parquet, …
+    A new part file is opened whenever the current part would exceed
+    `rows_per_part` rows.  Each rollover releases the Arrow memory pool
+    so WSL doesn't accumulate a high-water mark across the whole session.
     """
-    Load manual identity assignments for a session from manual_assignments table.
-    Returns {temp_id (int) -> real_id (int)}.
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0   # rows written to the current part
+        self.total         = 0   # rows written across all parts
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"embeds_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           EMBED_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        self._writer.close()
+        # pa.default_cpu_memory_pool().release_unused()
+        self._part += 1
+        self._open_part()
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        # Split into sub-batches that respect the part boundary.
+        start = 0
+        while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk = rows[start : start + remaining_in_part]
+            emb_arr = np.stack([r["embed"] for r in chunk])
+            tbl = pa.table({
+                "session_id":  pa.array([r["session_id"]  for r in chunk], pa.string()),
+                "frame_index": pa.array([r["frame_index"] for r in chunk], pa.int32()),
+                "temp_id":     pa.array([r["temp_id"]     for r in chunk], pa.int32()),
+                "embed": pa.FixedSizeListArray.from_arrays(
+                    pa.array(emb_arr.ravel().tolist(), pa.float32()), 128),
+            }, schema=EMBED_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+
+    def close(self) -> None:
+        self._writer.close()
+        # pa.default_cpu_memory_pool().release_unused()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"embeds  → {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [{self.outdir.name}]")
+
+
+class KpsWriter:
+    """Rolling multi-part Parquet writer — mirrors EmbedWriter logic."""
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0
+        self.total         = 0
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"kps_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           KPS_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        # self._writer.close()
+        # pa.default_cpu_memory_pool().release_unused()
+        self._part += 1
+        self._open_part()
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        start = 0
+        while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk     = rows[start : start + remaining_in_part]
+            kps_arr   = np.stack([r["kps"]       for r in chunk])
+            kconf_arr = np.stack([r["kps_kconf"] for r in chunk])
+            tbl = pa.table({
+                "session_id":  pa.array([r["session_id"]  for r in chunk], pa.string()),
+                "frame_index": pa.array([r["frame_index"] for r in chunk], pa.int32()),
+                "temp_id":     pa.array([r["temp_id"]     for r in chunk], pa.int32()),
+                "kps": pa.FixedSizeListArray.from_arrays(
+                    pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
+                "kps_kconf": pa.FixedSizeListArray.from_arrays(
+                    pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
+            }, schema=KPS_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+
+    def close(self) -> None:
+        self._writer.close()
+        # pa.default_cpu_memory_pool().release_unused()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"kps     → {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [{self.outdir.name}]")
+
+
+class MaskWriter:
+    """QA-only rolling Parquet writer for segmentation mask polygons.
+
+    Mirrors EmbedWriter/KpsWriter's rollover logic exactly, but writes to a
+    separate 'qa_masks/' subdirectory of the session outdir, with its own
+    filename prefix (masks_part*.parquet). This keeps it structurally
+    isolated from the canonical embeds_part*/kps_part*.parquet files: the
+    end-of-video Drive upload loop globs `outdir` directly (not subdirs) for
+    those two prefixes only, so files here are never matched and never
+    uploaded — visualization/QA data only, local disk, never touches Drive,
+    raw_tracks, or any other pipeline stage.
     """
-    rows = conn.execute(
-        "SELECT temp_id, real_id FROM manual_assignments WHERE session_id = ?",
-        (session_id,)
-    ).fetchall()
-    if not rows:
-        return {}
-    result = {int(r[0]): int(r[1]) for r in rows}
-    log(f"Manual assignments loaded: {len(result)} "
-        f"({', '.join(f't{t}→{a}' for t,a in sorted(result.items()))})")
+    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+        self.outdir        = outdir / "qa_masks"
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        self.rows_per_part = rows_per_part
+        self._part         = 0
+        self._part_rows    = 0
+        self.total         = 0
+        self._writer       = None
+        self._current_path: Path | None = None
+        self._parts: list[Path] = []
+        self._open_part()
+
+    def _open_part(self) -> None:
+        self._current_path = self.outdir / f"masks_part{self._part:03d}.parquet"
+        self._parts.append(self._current_path)
+        self._writer    = pq.ParquetWriter(str(self._current_path),
+                                           MASK_SCHEMA, compression="snappy")
+        self._part_rows = 0
+
+    def _roll(self) -> None:
+        self._writer.close()
+        self._part += 1
+        self._open_part()
+
+    def flush(self, rows: list) -> None:
+        if not rows:
+            return
+        start = 0
+        while start < len(rows):
+            if self._part_rows >= self.rows_per_part:   # part full → open a new one first
+                self._roll()
+            remaining_in_part = self.rows_per_part - self._part_rows
+            chunk = rows[start : start + remaining_in_part]
+            tbl = pa.table({
+                "session_id":     pa.array([r["session_id"]     for r in chunk], pa.string()),
+                "frame_index":    pa.array([r["frame_index"]    for r in chunk], pa.int32()),
+                "temp_id":        pa.array([r["temp_id"]        for r in chunk], pa.int32()),
+                "mask_poly_json": pa.array([r["mask_poly_json"] for r in chunk], pa.string()),
+            }, schema=MASK_SCHEMA)
+            self._writer.write_table(tbl)
+            self._part_rows += len(chunk)
+            self.total      += len(chunk)
+            start           += len(chunk)
+
+    def close(self) -> None:
+        self._writer.close()
+        total_mb = sum(p.stat().st_size for p in self._parts if p.exists()) / 1e6
+        log(f"qa_masks→ {len(self._parts)} part(s), {self.total} rows, "
+            f"{total_mb:.1f} MB total  [QA only, local, NOT uploaded — {self.outdir}]")
+
+
+def _log_to_batch_log(dm, video_path: "Path", session_id: str,
+                       status: str, frames: int, duration_s: float,
+                       error: str = "") -> None:
+    """Append one row to processing_log.csv on Drive (batch-mode, single flush)."""
+    from drive_manager import LOCAL_UPLOAD_LOG, _flush_upload_log, BUFFER_DIR
+    import drive_manager as _dm_mod
+
+    BUFFER_DIR.mkdir(parents=True, exist_ok=True)
+    local_log = BUFFER_DIR / "_batch_log_staging.csv"
+    header_needed = not local_log.exists() or local_log.stat().st_size == 0
+    ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fps_proc = f"{frames/max(duration_s,1e-6):.1f}" if frames else "0"
+    row = (f"{ts},{session_id},{video_path.name},{status},"
+           f"{frames},{duration_s:.1f},{fps_proc},{error}\n")
+    with open(local_log, "a") as f:
+        if header_needed:
+            f.write("timestamp,session_id,filename,status,"
+                    "frames,duration_s,fps_processed,error\n")
+        f.write(row)
+
+
+def _flush_batch_log(dm) -> None:
+    """Push the local batch log staging file to Drive (one round-trip)."""
+    import subprocess, drive_manager as _dm_mod
+    from drive_manager import BUFFER_DIR, DRIVE_ROOT
+
+    local_staging = BUFFER_DIR / "_batch_log_staging.csv"
+    if not local_staging.exists() or local_staging.stat().st_size == 0:
+        return
+
+    drive_dest    = f"{DRIVE_ROOT}/{DRIVE_BATCH_LOG}"
+    local_full    = BUFFER_DIR / "_batch_log_full.csv"
+    header        = ("timestamp,session_id,filename,status,"
+                     "frames,duration_s,fps_processed,error\n")
+    try:
+        subprocess.run(["rclone", "copyto", drive_dest, str(local_full)],
+                       capture_output=True, timeout=30)
+        if not local_full.exists() or local_full.stat().st_size == 0:
+            with open(local_full, "w") as f:
+                f.write(header)
+        staged_lines = [l for l in local_staging.read_text().splitlines()
+                        if l and not l.startswith("timestamp,")]
+        if staged_lines:
+            with open(local_full, "a") as f:
+                f.write("\n".join(staged_lines) + "\n")
+        subprocess.run(["rclone", "copyto", str(local_full), drive_dest],
+                       capture_output=True, timeout=60)
+        local_staging.write_text("")
+        log(f"Batch log synced to Drive ({len(staged_lines)} new row(s))")
+    except Exception as e:
+        log(f"Batch log sync failed (non-fatal): {e}")
+
+
+def process_video(video_path: "Path", args, dm, db_path: "Path",
+                  det_model, embedder, pose_model, device: str,
+                  stop_flag: "list") -> dict:
+    """
+    Process a single video file end-to-end:
+      detect → track → embed → pose → flush → upload → reconcile
+
+    stop_flag is a mutable 1-element list [False] shared with the SIGINT handler;
+    set stop_flag[0] = True to request a graceful stop mid-video.
+
+    Returns a result dict: {status, session_id, frames, duration_s, error}
+    """
+    result = {"status": "error", "session_id": "", "frames": 0,
+              "duration_s": 0.0, "error": ""}
+
+    # ── derive session metadata from filename ─────────────────────────────────
+    camera_id, start_dt, end_dt = parse_filename(str(video_path))
+    if start_dt is None:
+        log(f"Warning: could not parse S<timestamp> from {video_path.name} "
+            "— frame_datetime will be empty.")
+    session_id = (f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
+                  if start_dt else f"{camera_id}_unknown")
+    result["session_id"] = session_id
+
+    outdir = dm.get_session_dir(session_id)
+
+    # ── output dir safety check + clean ──────────────────────────────────────
+    py_files = list(outdir.rglob("*.py"))
+    if py_files:
+        msg = (f"ERROR: .py files found in output dir for {session_id} "
+               f"— refusing to clear it.")
+        log(msg)
+        result["error"] = msg
+        return result
+
+    if outdir.exists():
+        import shutil
+        for item in outdir.iterdir():
+            (shutil.rmtree if item.is_dir() else item.unlink)(item if item.is_dir() else item)
+        log(f"Cleared output directory: {outdir}")
+
+    crops_dir = ensure_dir(outdir / "crops") if args.save_crops else None
+    # Parquet writers use the session outdir; part files are named automatically.
+    # embed_pq_path / kps_pq_path are gone — use embed_writer._parts / kps_writer._parts.
+
+    # ── Reset tracker state before starting this video ────────────────────────
+    # det_model is loaded once and reused across every video in the batch. With
+    # persist=True (below), Ultralytics keeps the tracker's internal state —
+    # active tracks, Kalman filters, next-id counter — alive on that model
+    # object across .track() calls. Without an explicit reset here, this video
+    # would start with tracker state left over from the end of the *previous*
+    # video, producing spurious ID switches right at frame 0 that have nothing
+    # to do with this video's actual motion or occlusion. Dropping the
+    # predictor makes Ultralytics lazily rebuild a fresh one (and fresh
+    # trackers) on the next .track() call, so every video starts clean —
+    # identical to running it as a standalone single-video invocation.
+    if getattr(det_model, "predictor", None) is not None:
+        det_model.predictor.trackers = []
+        det_model.predictor = None
+    log("  tracker      : reset (fresh state for this video)")
+
+    dm.mark_dirty("parquet", session_id=session_id)
+    dm.mark_dirty("db",      session_id=session_id)
+
+    log("=" * 60)
+    log(f"Processing: {video_path.name}")
+    log(f"  session_id   : {session_id}")
+    log(f"  camera_id    : {camera_id}")
+    log(f"  start_dt     : {start_dt.isoformat() if start_dt else 'unknown'}")
+    log(f"  end_dt       : {end_dt.isoformat()   if end_dt   else 'unknown'}")
+    log(f"  outdir       : {outdir}")
+    _save_every  = args.save_every
+    _flush_every = args.flush_every
+    log(f"  save_every   : {_save_every}  flush_every={_flush_every}  "
+        f"(flush each {_save_every*_flush_every} frames)")
+    if args.crop_tags:
+        if _VISION_AVAILABLE:
+            log("  crop_tags    : ON (posture+facing classifiers loaded)")
+        else:
+            log(f"  crop_tags    : ON but vision_features unavailable "
+                f"({_VISION_IMPORT_ERROR}) — tags will be '_unk_unk'")
+
+    conn = init_db(db_path)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        msg = f"Cannot open video: {video_path}"
+        log(f"ERROR: {msg}")
+        conn.close()
+        result["error"] = msg
+        return result
+
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    W            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    log(f"  video        : {W}x{H} @ {fps:.2f} fps  "
+        f"frames~{total_frames or 'unknown'}")
+
+    _epoch = start_dt
+    register_session(conn, session_id, str(video_path),
+                     camera_id,
+                     start_dt.isoformat() if start_dt else "",
+                     end_dt.isoformat()   if end_dt   else "")
+
+    db_batch:   list = []
+    embed_rows: list = []
+    kps_rows:   list = []
+    mask_rows:  list = []
+
+    embed_writer = EmbedWriter(outdir)
+    kps_writer   = KpsWriter(outdir)
+    mask_writer  = MaskWriter(outdir) if args.save_masks else None
+
+    crop_occurrence    = defaultdict(int)
+    warned_kp_mismatch = False
+    embed_row_counter  = 0
+    kps_row_counter    = 0
+    windows_since_flush = 0
+    frame_idx          = 0
+    t_start            = time()
+
+    _window_latest: dict = {}
+
+    pbar = tqdm(total=total_frames or None,
+                desc=f"Tracking {video_path.name}",
+                unit="frame", dynamic_ncols=True)
+
+    INSERT_SQL = """
+        INSERT INTO raw_tracks
+            (session_id, frame_index, frame_time_sec, frame_datetime,
+             temp_id, det_conf, x1, y1, x2, y2, cx, cy, w, h,
+             kps_conf, embed_parquet_row, kps_parquet_row)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """
+
+    def _commit_window():
+        nonlocal windows_since_flush, embed_row_counter, kps_row_counter
+        for tid, det in _window_latest.items():
+            ep_row = None
+            if det["embed"] is not None:
+                ep_row = embed_row_counter
+                embed_rows.append({
+                    "session_id":  session_id,
+                    "frame_index": det["frame_index"],
+                    "temp_id":     tid,
+                    "embed":       det["embed"],
+                })
+                embed_row_counter += 1
+            kp_row = None
+            if det["kps_arr"] is not None:
+                kp_row = kps_row_counter
+                kps_rows.append({
+                    "session_id":  session_id,
+                    "frame_index": det["frame_index"],
+                    "temp_id":     tid,
+                    "kps":         det["kps_arr"],
+                    "kps_kconf":   det["kconf_arr"],
+                })
+                kps_row_counter += 1
+            if mask_writer is not None and det.get("mask_poly_json") is not None:
+                mask_rows.append({
+                    "session_id":     session_id,
+                    "frame_index":    det["frame_index"],
+                    "temp_id":        tid,
+                    "mask_poly_json": det["mask_poly_json"],
+                })
+            db_batch.append((
+                session_id, det["frame_index"], det["t_sec"], det["frame_datetime"],
+                tid, det["conf"],
+                det["x1"], det["y1"], det["x2"], det["y2"],
+                det["cx"], det["cy"], det["w"], det["h"],
+                det["kps_mean"], ep_row, kp_row,
+            ))
+        _window_latest.clear()
+        windows_since_flush += 1
+        if windows_since_flush >= _flush_every:
+            if db_batch:
+                conn.executemany(INSERT_SQL, db_batch)
+                db_batch.clear()
+            conn.commit()
+            embed_writer.flush(embed_rows); embed_rows.clear()
+            kps_writer.flush(kps_rows);     kps_rows.clear()
+            if mask_writer is not None:
+                mask_writer.flush(mask_rows); mask_rows.clear()
+            pbar.set_postfix(frames=frame_idx,
+                             fps=f"{frame_idx/max(time()-t_start,1e-6):.1f}")
+            windows_since_flush = 0
+
+    # ── main frame loop ───────────────────────────────────────────────────────
+    while True:
+        if stop_flag[0]:
+            log(f"Stopping at frame {frame_idx} (graceful stop requested).")
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        t_sec              = frame_idx / max(1e-6, fps)
+        frame_datetime_str = ""
+        if _epoch:
+            frame_wall         = _epoch + timedelta(seconds=t_sec)
+            frame_datetime_str = frame_wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        results = det_model.track(
+            source=frame, imgsz=args.imgsz, conf=args.conf, iou=args.iou,
+            tracker=args.tracker, persist=True, verbose=False,
+        )
+
+        if (not results or results[0].boxes is None
+                or results[0].boxes.xyxy is None
+                or results[0].boxes.id is None):
+            frame_idx += 1; pbar.update(1)
+            if frame_idx % _save_every == 0:
+                _commit_window()
+            continue
+
+        r     = results[0]
+        xyxy  = r.boxes.xyxy.cpu().numpy()
+        confs = (r.boxes.conf.cpu().numpy() if r.boxes.conf is not None
+                 else np.zeros(len(xyxy), dtype=np.float32))
+        tids  = r.boxes.id.cpu().numpy().astype(int)
+
+        # Segmentation polygons, if the loaded model is a -seg model.
+        # r.masks.xy is a list of (Ni,2) arrays in ORIGINAL frame pixel coords,
+        # aligned index-for-index with r.boxes (same underlying detections).
+        # None for a plain detection model — everything downstream falls
+        # back to raw bbox crops in that case.
+        mask_polys = None
+        if getattr(r, "masks", None) is not None and r.masks.xy is not None:
+            mask_polys = r.masks.xy
+
+        is_sample = (frame_idx % _save_every == 0)
+
+        # ── cheap per-frame update (every frame, not just the sampled one) ──
+        # The tracker runs — and tracks correctly — on every frame; this used
+        # to only be recorded on the 1-in-save_every frame where
+        # `frame_idx % save_every == 0`, silently discarding the other
+        # (save_every-1) frames' worth of valid tracking. A cow that was
+        # clearly, continuously tracked but happened to be mid-occlusion at
+        # that one exact sampled instant contributed nothing to the window —
+        # even though it was fully visible a few frames earlier or later.
+        # In a crowded cluster the odds that several cows are simultaneously
+        # unobstructed at that one precise instant get worse the more cows
+        # are in frame, which is exactly the "tracks collapsing as cows
+        # cluster" pattern this bug produced.
+        #
+        # Rich per-detection fields (embed / kps / mask polygon) are still
+        # only computed on the sampled frame below, to keep save_every's
+        # actual cost-saving purpose intact — they get merged into these
+        # same entries rather than recomputed every frame. Until a tid's
+        # first sampled frame arrives, those fields stay None; after that,
+        # cheap frame-to-frame position updates carry the most recent
+        # sampled rich data forward rather than clobbering it.
+        for box, tid, conf_j in zip(xyxy, tids, confs):
+            x1, y1, x2, y2 = box.tolist()
+            tid_i = int(tid)
+            prev  = _window_latest.get(tid_i)
+            _window_latest[tid_i] = {
+                "frame_index":    frame_idx,
+                "t_sec":          round(t_sec, 3),
+                "frame_datetime": frame_datetime_str,
+                "conf":           float(conf_j),
+                "x1": float(x1), "y1": float(y1),
+                "x2": float(x2), "y2": float(y2),
+                "cx": float((x1 + x2) / 2.0), "cy": float((y1 + y2) / 2.0),
+                "w":  float(x2 - x1),         "h":  float(y2 - y1),
+                "kps_mean":       prev["kps_mean"]       if prev else None,
+                "embed":          prev["embed"]          if prev else None,
+                "kps_arr":        prev["kps_arr"]        if prev else None,
+                "kconf_arr":      prev["kconf_arr"]      if prev else None,
+                "mask_poly_json": prev["mask_poly_json"] if prev else None,
+            }
+
+        if is_sample:
+            crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
+
+            # Embedder gets background-removed crops when masks are available
+            # (segmentation model) — pose model and saved crop JPEGs below
+            # deliberately keep using raw `crops` / frame slices unchanged.
+            embed_crops = (
+                masked_crops_from_polys(frame, used_boxes, mask_polys, crops)
+                if mask_polys is not None else crops
+            )
+
+            embed_vecs = [None] * len(embed_crops)
+            if embed_crops:
+                X = torch.from_numpy(
+                    np.stack([to_tensor_bchw(c) for c in embed_crops])
+                ).to(device)
+                with torch.no_grad():
+                    Z = embedder(X).cpu().numpy()
+                embed_vecs = list(Z)
+
+            kps_flat_list  = [None] * len(crops)
+            kps_mean_list  = [None] * len(crops)
+            kps_kconf_list = [None] * len(crops)
+
+            if pose_model and crops:
+                for i, pres in enumerate(pose_model.predict(
+                        source=crops, imgsz=args.pose_imgsz,
+                        conf=args.pose_conf, verbose=False, stream=False)):
+                    if (pres.keypoints is None or pres.keypoints.data is None
+                            or not len(pres.keypoints.data)):
+                        continue
+                    k  = pres.keypoints
+                    xy = k.xy[0].cpu().numpy()
+                    sc = k.conf[0].cpu().numpy() if k.conf is not None else None
+                    Kn = xy.shape[0]
+                    if EXPECTED_KP and Kn != EXPECTED_KP and not warned_kp_mismatch:
+                        log(f"Warning: pose model returned {Kn} kps, expected {EXPECTED_KP}")
+                        warned_kp_mismatch = True
+                    vis = (np.where(sc >= args.pose_kp_conf_thresh, 2, 1).astype(int)
+                           if sc is not None else np.ones(Kn, dtype=int) * 2)
+                    cx1, cy1, cx2, cy2 = used_boxes[i]
+                    sx = max(1, cx2-cx1) / max(1, pres.orig_img.shape[1])
+                    sy = max(1, cy2-cy1) / max(1, pres.orig_img.shape[0])
+                    xy_full      = np.zeros((Kn,2), np.float32)
+                    xy_full[:,0] = cx1 + xy[:,0] * sx
+                    xy_full[:,1] = cy1 + xy[:,1] * sy
+                    kps_flat_list[i]  = flat_kps_xyv(
+                        np.concatenate([xy_full, vis.reshape(-1,1)], axis=1))
+                    kps_mean_list[i]  = float(np.nanmean(sc)) if sc is not None else 0.0
+                    kps_kconf_list[i] = sc.tolist() if sc is not None else [0.0]*Kn
+
+            for j, (box, tid, conf_j) in enumerate(zip(xyxy, tids, confs)):
+                x1,y1,x2,y2 = box.tolist()
+                kps_mean = None; kps_arr = None; kconf_arr = None
+                if kps_flat_list[j] is not None:
+                    kps_mean  = kps_mean_list[j]
+                    kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
+                    kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
+                mask_poly_json = None
+                if mask_writer is not None and mask_polys is not None and j < len(mask_polys):
+                    poly = mask_polys[j]
+                    if poly is not None and len(poly) >= 3:
+                        mask_poly_json = json.dumps(np.asarray(poly).round(1).tolist())
+                # Position/conf/time for this exact frame were already set by
+                # the cheap per-frame update above (every tid present this
+                # frame has an entry) — just attach this sample's rich
+                # (embed/kps/mask) fields onto it rather than rebuilding it.
+                entry = _window_latest[int(tid)]
+                entry["kps_mean"]  = kps_mean
+                entry["embed"]     = embed_vecs[j].astype(np.float32) if embed_vecs[j] is not None else None
+                entry["kps_arr"]   = kps_arr
+                entry["kconf_arr"] = kconf_arr
+                entry["mask_poly_json"] = mask_poly_json
+
+                if crops_dir is not None:
+                    tid_i = int(tid)
+                    crop_occurrence[tid_i] += 1
+                    if crop_occurrence[tid_i] % max(1, args.crop_every) == 0:
+                        cx1,cy1,cx2,cy2 = used_boxes[j]
+                        cw,ch = int(cx2-cx1), int(cy2-cy1)
+                        mw,mh = args.min_crop_wh
+                        if cw >= int(mw) and ch >= int(mh):
+                            tag = ""
+                            if args.crop_tags and _VISION_AVAILABLE and kps_arr is not None:
+                                try:
+                                    _kps  = kps_arr.reshape(1, 19, 3)
+                                    _kc   = kconf_arr.reshape(1, 19)
+                                    _bbox = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+                                    _det  = np.array([float(conf_j)], dtype=np.float32)
+                                    p_out = extract_posture(_kps, _kc, _bbox, _det)
+                                    f_out = extract_facing(_kps, _kc, _bbox,
+                                                           posture=p_out["posture"])
+                                    posture_val = int(p_out["posture"][0])
+                                    facing_val  = int(f_out["facing"][0])
+                                    p_name = POSTURE_NAMES.get(Posture(posture_val), "unk")
+                                    f_name = FACING_NAMES.get(Facing(facing_val),   "unk")
+                                    p_tag = p_name if p_name != "uncertain" else "unk"
+                                    f_tag = f_name if f_name != "uncertain" else "unk"
+                                    tag = f"_{p_tag}_{f_tag}"
+                                except Exception:
+                                    tag = "_unk_unk"
+                            elif args.crop_tags:
+                                tag = "_unk_unk"
+                            cv2.imwrite(
+                                str(crops_dir/f"{camera_id}_id{tid_i:04d}_f{frame_idx:06d}{tag}.jpg"),
+                                frame[cy1:cy2, cx1:cx2])
+
+            _commit_window()
+
+        frame_idx += 1; pbar.update(1)
+
+    # ── flush & close ─────────────────────────────────────────────────────────
+    pbar.close()
+    if _window_latest:
+        _commit_window()
+    if db_batch:
+        conn.executemany(INSERT_SQL, db_batch)
+    if _epoch:
+        conn.execute("UPDATE video_sessions SET end_dt=? WHERE session_id=?",
+                     ((_epoch + timedelta(seconds=frame_idx/max(1e-6,fps))).isoformat(),
+                      session_id))
+    conn.commit()
+    conn.close()
+    cap.release()
+
+    embed_writer.flush(embed_rows); embed_rows.clear()
+    kps_writer.flush(kps_rows);     kps_rows.clear()
+    embed_writer.close()
+    kps_writer.close()
+    if mask_writer is not None:
+        mask_writer.flush(mask_rows); mask_rows.clear()
+        mask_writer.close()
+
+    t_total = time() - t_start
+    log(f"Done. {frame_idx} frames in {t_total:.1f}s "
+        f"({frame_idx/max(t_total,1e-6):.1f} fps processed)")
+    if crops_dir:
+        log(f"crops → {crops_dir}")
+
+    # ── Upload outputs to Drive ───────────────────────────────────────────────
+    log("Uploading session outputs to Drive...")
+    dm.sync_db(session_id=session_id)
+    for pq_path in sorted(outdir.glob("embeds_part*.parquet")) + \
+                   sorted(outdir.glob("kps_part*.parquet")):
+        if pq_path.exists():
+            dm.write_file(pq_path, f"outputs/{session_id}/{pq_path.name}",
+                          flag="parquet")
+
+    if crops_dir and crops_dir.exists() and not args.crops_local:
+        crop_files = sorted(crops_dir.glob("*.jpg"))
+        if crop_files:
+            log(f"Uploading {len(crop_files)} crop(s) to Drive...")
+            from drive_manager import write_file as _wf, _flush_upload_log
+            _wf._batch_mode = True
+            try:
+                for cf in crop_files:
+                    _wf(cf, f"outputs/{session_id}/crops/{cf.name}",
+                        caller=__file__)
+            finally:
+                _wf._batch_mode = False
+            _flush_upload_log()
+    elif crops_dir and args.crops_local:
+        log(f"crops_local=True — crops kept locally only: {crops_dir}")
+
+    # ── run reconcile.py ──────────────────────────────────────────────────────
+    log("=" * 60)
+    log("Starting reconcile.py ...")
+    log("=" * 60)
+    try:
+        import importlib.util
+        import argparse as _ap
+        reconcile_path = Path(__file__).parent / "reconcile.py"
+        if not reconcile_path.exists():
+            raise FileNotFoundError(f"reconcile.py not found at {reconcile_path}")
+        spec  = importlib.util.spec_from_file_location("reconcile", reconcile_path)
+        r_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(r_mod)
+        r_args = _ap.Namespace(
+            session            = session_id,
+            corr_threshold     = args.corr_threshold,
+            min_active_bins    = 3,
+            min_temp_id_frames = 0.10,
+            activity_pct       = 0.25,
+            bin_minutes        = 15,
+            ema_alpha          = args.ema_alpha,
+            min_embeds_gallery = 10,
+            cosine_threshold   = args.cosine_threshold,
+            cosine_min_embeds  = 5,
+            dry_run            = False,
+            verbose            = False,
+            bypass_upload_check = getattr(args, "bypass_upload_check", False),
+        )
+        r_mod.run(r_args)
+    except Exception as exc:
+        log(f"reconcile.py failed: {exc}")
+        log("Tracking output is intact — run reconcile.py manually to retry.")
+
+    result.update(status="ok" if not stop_flag[0] else "interrupted",
+                  frames=frame_idx, duration_s=t_total)
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run(args) -> None:
-    """
-    Core pipeline entry point. Callable from CLI (via main()) or directly when
-    imported by track_and_dump.py. args is an argparse.Namespace with all fields
-    from parse_args() — no --tracks needed; tracks are loaded from the DB.
-    """
-    section("reconcile.py — ReID pipeline")
-    log(f"session_id  : {args.session}")
-    log("All data paths (db, kinetics, behavior, gallery, parquet) resolved via drive_manager")
-    log(f"dry_run     : {args.dry_run}")
+def main():
+    args = parse_args()
 
     # ── Drive setup ───────────────────────────────────────────────────────────
-    bypass = getattr(args, "bypass_upload_check", False)
-    dm = DriveManager(bypass=bypass, caller=__file__)
+    dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
 
-    # Dirty-flag check: reconcile reads from DB and gallery — both must be clean
-    try:
-        dm.check_flag("db")
-        dm.check_flag("gallery")
-        dm.check_flag("parquet")
-    except DriveNotSyncedError as e:
-        log(f"ERROR: {e}")
-        log("Use --bypass_upload_check to proceed with current Drive state.")
-        return
+    # ── Resolve source → list of video files ─────────────────────────────────
+    source = Path(args.source).expanduser().resolve()
+    if source.is_dir():
+        video_files = sorted(
+            f for f in source.iterdir()
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        )
+        if not video_files:
+            print(f"[track] ERROR: no video files found in {source}")
+            raise SystemExit(1)
+        log(f"Batch mode: {len(video_files)} video(s) found in {source}")
+        for vf in video_files:
+            log(f"  {vf.name}")
+    else:
+        try:
+            video_files = [dm.get_video_path(str(source))]
+        except FileNotFoundError as e:
+            print(f"[track] ERROR: {e}")
+            raise SystemExit(1)
 
-    # Pull the canonical DB from Drive before opening
+    # ── Pull canonical DB from Drive (once for the whole batch) ──────────────
     try:
-        db_local = dm.pull_db(allow_stale=False)
+        db_path = dm.pull_db(allow_stale=False)
     except DriveUnavailableError as e:
-        log(f"ERROR pulling DB: {e}")
-        return
+        print(f"[track] ERROR pulling DB from Drive: {e}")
+        raise SystemExit(1)
 
-    # Pull gallery files from Drive
-    dm.pull_gallery()
+    # ── Load models once ──────────────────────────────────────────────────────
+    log(f"Loading models...")
+    log(f"  detector     : {args.model}")
+    device    = "cuda" if torch.cuda.is_available() else "cpu"
+    det_model = YOLO(args.model); det_model.fuse()
+    is_seg_model = getattr(det_model, "task", None) == "segment"
+    log(f"  det. task    : {getattr(det_model, 'task', 'unknown')}"
+        + ("  (masks -> masked embedder crops)" if is_seg_model
+           else "  (no masks — embedder uses raw bbox crops)"))
+    if args.save_masks and not is_seg_model:
+        log("  save_masks   : requested but model has no segmentation head — no-op")
+    elif args.save_masks:
+        log("  save_masks   : ON (QA-only, local disk, never uploaded to Drive)")
+    embedder  = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
+    pose_model = None
+    if args.pose_model:
+        log(f"  pose         : {args.pose_model}")
+        pose_model = YOLO(args.pose_model); pose_model.fuse()
+    log(f"  device       : {device}")
 
-    # Resolve gallery_dir to the local copy
-    gallery_dir = str(dm.get_gallery_dir())
-    log(f"Using local gallery_dir: {gallery_dir}")
+    # ── Graceful stop shared across all videos ────────────────────────────────
+    stop_flag = [False]
+    def _handle_sigint(sig, frame):
+        if not stop_flag[0]:
+            stop_flag[0] = True
+            print("\n[track] Ctrl+C received — finishing current video then stopping...",
+                  flush=True)
+    signal.signal(signal.SIGINT, _handle_sigint)
 
-    # ── database ──────────────────────────────────────────────────────────────
-    conn = init_db(str(db_local))
-    migrate_timeline_schema(conn)
+    # ── Process each video ────────────────────────────────────────────────────
+    results_summary = []
+    for i, video_path in enumerate(video_files):
+        if stop_flag[0]:
+            log(f"Batch stopped before {video_path.name} (Ctrl+C).")
+            results_summary.append({
+                "status": "skipped", "session_id": "", "frames": 0,
+                "duration_s": 0.0, "error": "batch interrupted"
+            })
+            _log_to_batch_log(dm, video_path, "", "skipped", 0, 0.0,
+                              "batch interrupted by Ctrl+C")
+            continue
 
+        log(f"\n{'='*60}")
+        log(f"Video {i+1}/{len(video_files)}: {video_path.name}")
+        log(f"{'='*60}")
 
-    # ── load tracks from SQLite ───────────────────────────────────────────────
-    log("Loading tracks from SQLite...")
-    tracks_df = pd.read_sql(
-        "SELECT frame_index, frame_datetime, temp_id, cx, cy, x1, y1, x2, y2 "
-        "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
-        conn, params=(args.session,), parse_dates=["frame_datetime"],
-    )
-    if tracks_df.empty:
-        log(f"No rows in raw_tracks for session '{args.session}' — aborting.")
-        conn.close()
-        return
-    log(f"  {len(tracks_df)} rows, {tracks_df['temp_id'].nunique()} temp_ids, "
-        f"frames {tracks_df['frame_index'].min()}–{tracks_df['frame_index'].max()}")
+        try:
+            result = process_video(video_path, args, dm, db_path,
+                                   det_model, embedder, pose_model,
+                                   device, stop_flag)
+        except Exception as exc:
+            import traceback
+            result = {"status": "error", "session_id": "", "frames": 0,
+                      "duration_s": 0.0, "error": str(exc)}
+            log(f"ERROR processing {video_path.name}: {exc}")
+            traceback.print_exc()
 
+        results_summary.append(result)
+        _log_to_batch_log(dm, video_path,
+                          result["session_id"], result["status"],
+                          result["frames"],     result["duration_s"],
+                          result.get("error", ""))
 
-    # detect day/night
-    is_night = detect_is_night_from_tracks(tracks_df)
-    log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
+    # ── Flush batch log to Drive ──────────────────────────────────────────────
+    _flush_batch_log(dm)
 
-    # update is_night on the session row and load camera_id
-    # (video_path is registered by track_and_dump.py; this is just a fallback
-    #  INSERT OR IGNORE for sessions reconcile.py is run against standalone)
-    upsert_session(conn, args.session, "", is_night)
-    session_row = get_session(conn, args.session)
-    camera_id   = (session_row.get("camera_id") or "cam0") if session_row else "cam0"
-    log(f"camera_id={camera_id}")
-
-    # ── load kinetics + behavior — auto-discover from Drive unless --kinetics given ──
-    session_start = pd.to_datetime(
-        session_row.get("start_dt") if session_row else None, errors="coerce"
-    )
-    session_end = pd.to_datetime(
-        session_row.get("end_dt") if session_row else None, errors="coerce"
-    )
-    # Fall back to track timestamps if session row has no datetimes
-    if pd.isnull(session_start):
-        session_start = tracks_df["frame_datetime"].min()
-    if pd.isnull(session_end):
-        session_end = tracks_df["frame_datetime"].max()
-
-    log("Auto-discovering kinetics CSVs from Drive...")
-    kinetics_df = dm.load_collar_data(session_start.to_pydatetime(),
-                                      session_end.to_pydatetime(), kind="kinetic")
-    if kinetics_df is None or kinetics_df.empty:
-        log("WARNING: no kinetics data found for this session window — "
-            "kinetic matching will be skipped.")
-        kinetics_df = pd.DataFrame(columns=["AnimalId","datetime",
-                                             "KineticsCountX","KineticsCountY",
-                                             "KineticsCountZ","KineticsCountR"])
-    else:
-        log(f"  {len(kinetics_df)} rows, animals: "
-            f"{sorted(kinetics_df['AnimalId'].unique().tolist())}")
-
-    # behavior — auto-discover from Drive
-    log("Auto-discovering behavior CSVs from Drive...")
-    behavior_df = dm.load_collar_data(session_start.to_pydatetime(),
-                                      session_end.to_pydatetime(), kind="behavior")
-    if behavior_df is None or behavior_df.empty:
-        log("No behavior data found for this session window — d_f12/f23/v will be NaN")
-        behavior_df = None
-    else:
-        log(f"  {len(behavior_df)} rows")
-
-    # ── Step A — kinetic matching ─────────────────────────────────────────────
-    kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
-
-    # ── Step A.5 — merge manual assignments ──────────────────────────────────
-    manual_assignment = load_manual_assignments(conn, args.session)
-    if manual_assignment:
-        conflicts = set(kinetic_assignment) & set(manual_assignment)
-        if conflicts:
-            log(f"  Note: manual overrides kinetic for temp_ids: {sorted(conflicts)}")
-        kinetic_assignment.update(manual_assignment)
-
-    # ── load embeds from parquet (always via drive_manager — never a CLI override) ──
-    # NOTE: embeds are written as multi-part files (embeds_part000.parquet, ...)
-    # by track_and_dump.py's EmbedWriter, so we pass the session directory —
-    # load_embeds_for_session() globs *_part*.parquet within it.
-    embed_parquet_path = str(dm.get_session_dir(args.session))
-    embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session)
-
-    # ── Step B — gallery builder ──────────────────────────────────────────────
-    gallery = step_b_gallery_builder(
-        tracks_df          = tracks_df,
-        embed_df           = embed_df,
-        kinetic_assignment = kinetic_assignment,
-        is_night           = is_night,
-        conn               = conn,
-        args               = args,
-        gallery_dir        = gallery_dir,
-        dry_run            = args.dry_run,
-    )
-
-    # ── Step C — cosine resolver ──────────────────────────────────────────────
-    merge_map = {}   # populated by Step A.6 below
-    full_assignment = step_c_cosine_resolver(
-        tracks_df          = tracks_df,
-        embed_df           = embed_df,
-        kinetic_assignment = kinetic_assignment,
-        gallery            = gallery,
-        is_night           = is_night,
-        conn               = conn,
-        args               = args,
-        gallery_dir        = gallery_dir,
-        session_id         = args.session,
-        camera_id          = camera_id,
-        dry_run            = args.dry_run,
-    )
-
-    # ── Step A.6 — resolve duplicates across all assignments (kinetic+manual+cosine)
-    full_assignment, merge_map = resolve_duplicate_assignments(
-        assignment   = full_assignment,
-        manual_tids  = set(manual_assignment.keys()),
-        kinetic_tids = set(
-            tid for tid, aid in kinetic_assignment.items()
-            if tid not in manual_assignment
-        ),
-        tracks_df    = tracks_df,
-        conn         = conn,
-        session_id   = args.session,
-        dry_run      = args.dry_run,
-    )
-
-    # remap loser embed rows → winner so gallery update pools all sightings
-    if merge_map and not embed_df.empty:
-        embed_df_remapped = embed_df.copy()
-        embed_df_remapped["temp_id"] = embed_df_remapped["temp_id"].replace(merge_map)
-        # rebuild gallery with remapped embeds for any merged pairs
-        gallery = step_b_gallery_builder(
-            tracks_df          = tracks_df,
-            embed_df           = embed_df_remapped,
-            kinetic_assignment = full_assignment,
-            is_night           = is_night,
-            conn               = conn,
-            args               = args,
-            gallery_dir        = gallery_dir,
-            dry_run            = args.dry_run,
-        )
-
-    # ── update known_temp_ids ─────────────────────────────────────────────────
-    update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
-
-    # Step A.6 deletes loser temp_ids from full_assignment (keeps only
-    # {winner_tid: real_id}) — tracks_df still carries the losers' rows under
-    # their original temp_id. Without this remap, step_d_sensor_sequencer's
-    # per-row assignment.get(temp_id) lookup would silently treat every
-    # merged-but-losing fragment as unassigned, even though Step A.6 already
-    # decided it's the same animal. Mirrors the embed_df remap above.
-    if merge_map:
-        tracks_df = tracks_df.copy()
-        tracks_df["temp_id"] = tracks_df["temp_id"].replace(merge_map)
-
-    # ── Step D — sensor sequencer + Vision feature extractor ─────────────────────────────────────────────
-    timeline_df = step_d_sensor_sequencer(
-        tracks_df   = tracks_df,
-        kinetics_df = kinetics_df,
-        behavior_df = behavior_df,
-        assignment  = full_assignment,
-        bin_minutes = args.bin_minutes,
-    )
-    if not timeline_df.empty:
-        timeline_df["session_id"] = args.session
-
-    # ── Step B (vision) — feature extraction ─────────────────────────────────
-    if not timeline_df.empty:
-        timeline_df = run_vision_features(
-            session_id    = args.session,
-            timeline_df   = timeline_df,
-            conn          = conn,
-            assignment    = full_assignment,
-            is_night      = is_night,
-            camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
-            # kps is written as multi-part files (kps_part000.parquet, ...) by
-            # track_and_dump.py's KpsWriter, same as embeds — pass the session
-            # directory so extractor.py's glob-based loader can find them.
-            # (dm.get_parquet_path(session, "kps") returns a single hardcoded
-            # "kps.parquet" filename that never actually exists — see embeds
-            # a few lines up for the correct pattern.)
-            kps_parquet   = str(dm.get_session_dir(args.session)),
-            embed_parquet = embed_parquet_path,
-            gallery_dir   = gallery_dir,
-            ema_alpha     = args.ema_alpha,
-            dry_run       = args.dry_run,
-            bin_minutes   = args.bin_minutes,
-            merge_map     = merge_map,
-        )
-
-    # ── Step E — write to DB ──────────────────────────────────────────────────
-    step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
-
-    # ── summary ───────────────────────────────────────────────────────────────
-    section("Summary")
-    n_manual  = len(manual_assignment)
-    n_kinetic = len(kinetic_assignment) - n_manual
-    if merge_map:
-        log(f"Merged switches : {len(merge_map)} "
-            f"({', '.join(f't{l}→t{w}' for l,w in sorted(merge_map.items()))})")
-    log(f"Kinetic matches : {n_kinetic}")
-    log(f"Manual matches  : {n_manual}")
-    log(f"Cosine matches  : {len(full_assignment) - len(kinetic_assignment)}")
-    log(f"Total resolved  : {len(full_assignment)} temp_ids → AnimalId")
-    unresolved = set(tracks_df["temp_id"].unique()) - set(full_assignment.keys())
-    if unresolved:
-        log(f"Unresolved      : {sorted(int(t) for t in unresolved)}")
-    log(f"Timeline rows   : {len(timeline_df)}")
-    if args.dry_run:
-        log("dry_run=True — no data written to DB or gallery files")
-
-    # ── Upload updated files to Drive ─────────────────────────────────────────
-    if not args.dry_run:
-        section("Drive sync")
-        # DB
-        dm.sync_db(session_id=args.session)
-        # Gallery .npy files
-        modality = "night" if detect_is_night_from_tracks(tracks_df) else "day"
-        gallery_files = [
-            f"gallery_{modality}.npy",
-            f"gallery_pose_{modality}.npy",
-            f"temp_gallery_pose_{modality}.npy",
-            "synthetic_id_counter.npy",
-        ]
-        from drive_manager import LOCAL_GALLERY_DIR, DRIVE_GALLERY_PREFIX
-        for fname in gallery_files:
-            local_f = LOCAL_GALLERY_DIR / fname
-            if local_f.exists():
-                dm.write_file(local_f, f"{DRIVE_GALLERY_PREFIX}/{fname}", flag="gallery")
-
-    conn.close()
-    log("Done.")
-
-
-def main() -> None:
-    run(parse_args())
+    # ── Print batch summary ───────────────────────────────────────────────────
+    log(f"\n{'='*60}")
+    log(f"Batch complete — {len(video_files)} video(s)")
+    ok       = sum(1 for r in results_summary if r["status"] == "ok")
+    stopped  = sum(1 for r in results_summary if r["status"] == "interrupted")
+    skipped  = sum(1 for r in results_summary if r["status"] == "skipped")
+    errors   = sum(1 for r in results_summary if r["status"] == "error")
+    log(f"  ok={ok}  interrupted={stopped}  skipped={skipped}  errors={errors}")
+    for vf, r in zip(video_files, results_summary):
+        flag = {"ok":"✓","interrupted":"⚠","skipped":"–","error":"✗"}.get(r["status"],"?")
+        log(f"  {flag} {vf.name}  [{r['status']}]"
+            + (f"  {r['frames']} frames  {r['duration_s']:.0f}s" if r["frames"] else "")
+            + (f"  ERROR: {r['error']}" if r.get("error") else ""))
+    log(f"{'='*60}")
 
 
 if __name__ == "__main__":
     main()
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Example usage
 # ─────────────────────────────────────────────────────────────────────────────
 #
+# Paths
+# SEG=~/thesis_workspace/vcf-ctp/models/cow_seg/run14/weights/best.pt
+# POSE=~/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
+# VID=~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts
+#
+# ── Single video ─────────────────────────────────────────────────────────────
+# python3 track_and_dump.py \
+#   --model      "$SEG" \
+#   --source     "$VID" \
+#   --pose_model "$POSE" \
+#   --imgsz 960 --conf 0.30 --iou 0.45 \
+#   --pose_imgsz 384 --pose_conf 0.25 \
+#   --save_every 5 --flush_every 10
+#
+# ── Batch — all videos in a directory ────────────────────────────────────────
+# python3 track_and_dump.py \
+#   --model      "$SEG" \
+#   --source     ~/thesis_workspace/raw_data/calving/ \
+#   --pose_model "$POSE" \
+#   --imgsz 960 --conf 0.30 --iou 0.60 \
+#   --pose_imgsz 384 --pose_conf 0.25 \
+#   --save_every 10 --flush_every 5
+#
+# ── With crops ───────────────────────────────────────────────────────────────
+# python3 track_and_dump.py ... \
+#   --save_crops --crop_every 300 --min_crop_wh 100 100 --crop_tags
+#   # add --crops_local to skip uploading crops to Drive
+#
+# ── With masks ───────────────────────────────────────────────────────────────
+# --save_masks
+
+
+# ── Re-run reconcile manually on an existing session ─────────────────────────
+# SESSION=refet_33_20241221070000   # auto-derived from filename _S<timestamp>
 # python3 reconcile.py \
-#   --session    refet33_20241221 \
-#   --corr_threshold 0.7 \
-#   --min_active_bins 3 \
-#   --cosine_threshold 0.75 \
-#   --ema_alpha 0.15
+#   --session       "$SESSION"
+#   # add --dry_run to test without writing
+#   # db, kinetics, behavior, gallery, and parquet are all resolved via
+#   # drive_manager.py — there is no manual-override flag for any of them
 #
-# Dry run (no DB writes):
-#   --dry_run
-#
-# After running, validate visually:
-#   python3 display_tracks.py \
-#     --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.mp4 \
-#     --session_id refet33_20241221 \
-#     --draw_pose --show_fps --sink ffplay
-#
-# Pipeline notes:
-#   - Run once per session after track_and_dump.py completes
-#   - DB, kinetics, behavior, gallery, and parquet are all resolved through
-#     drive_manager.py — there is no local-path override for any of them
-#   - Gallery files accumulate across sessions — more sessions = better cosine matching
-#   - Kinetic matching requires ≥3 active 15-min bins (45+ minutes of video)
-#   - Cosine resolver is a no-op on first run (empty gallery) — by design
-#   - Vision features (spine_angle etc.) will be NULL until pose extractor is added
+# Notes:
+#   Models are loaded once and reused across all videos in a batch.
+#   session_id is auto-derived from each filename's _S<timestamp> token.
+#   Kinetics/behavior CSVs are auto-discovered from Drive per video time window.
+#   A processing_log.csv is maintained on Drive with one row per processed video.
+#   Ctrl+C finishes the current video, logs it as 'interrupted', then stops.
+#   Upload collar CSVs to Drive once before processing any sessions:
+#     python3 drive_manager.py upload-kinetics ~/thesis_workspace/raw_data/CollarData/
+#     python3 drive_manager.py upload-behavior ~/thesis_workspace/raw_data/CollarData/

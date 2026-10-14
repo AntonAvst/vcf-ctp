@@ -47,24 +47,68 @@ EXPECTED_KP = 19
 DRIVE_BATCH_LOG = "processing_log.csv"   # append-only log on Drive
 VIDEO_EXTENSIONS = {".mp4", ".ts", ".avi", ".mov", ".mkv"}
 
-_FNAME_RE = re.compile(r'^(?P<camera>.+?)_S(?P<start>\d{14})(?:_E(?P<end>\d{14}))?')
+# Cameras monitoring the enclosure. Mirrored from vision_features.schema.
+# CAMERA_IDS (same convention as EXPECTED_KP above mirroring schema.KP) so
+# this file keeps working even when the optional vision_features import
+# below fails. Keep both lists in sync when a camera is added/renamed/removed.
+KNOWN_CAMERA_IDS = ["רפת 26", "רפת 33", "רפת 38"]
+
+# Filenames look like:
+#   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
+# e.g. "רפת 26_24_S20260616090000_E20260616110000.mp4"
+# <segment> is an arbitrary clip/chunk number — it is NOT part of the camera
+# identity and must be stripped, or every clip would be treated as a distinct
+# "camera" (e.g. "רפת 26_24" vs "רפת 26_17"), silently fragmenting per-camera
+# matching and galleries.
+_TS_RE = re.compile(r'_S(?P<start>\d{14})(?:_E(?P<end>\d{14}))?')
+_TRAILING_SEGMENT_RE = re.compile(r'_\d+$')
 
 def parse_filename(video_path: str):
     """Extract (camera_id, start_dt, end_dt) from filename.
-    Format: <camera>_S<YYYYMMDDHHmmss>_E<YYYYMMDDHHmmss>
+    Format: <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
     Returns (camera_id: str, start_dt: datetime|None, end_dt: datetime|None).
+
+    The camera name is resolved in two steps:
+      1. Exact match (or exact match + "_<segment>") against KNOWN_CAMERA_IDS
+         — the reliable path for every camera we actually operate.
+      2. Fallback for an unrecognized camera: strip a trailing "_<digits>"
+         token (the segment/chunk number) from whatever precedes "_S...".
+         Logged, since it's a best-effort guess rather than a verified name.
     """
     stem = Path(video_path).stem
-    m = _FNAME_RE.search(stem)
-    if not m:
+
+    ts_match = _TS_RE.search(stem)
+    if not ts_match:
+        # No recognizable timestamp — can't reliably locate the camera/segment
+        # boundary at all, so fall back to returning the whole stem.
+        log(f"parse_filename: no _S<timestamp> found in '{stem}' — "
+            f"using full stem as camera_id")
         return stem, None, None
-    camera_id = m.group("camera")
+
+    prefix = stem[:ts_match.start()].rstrip("_")
+
+    camera_id = None
+    for known in KNOWN_CAMERA_IDS:
+        if prefix == known or prefix.startswith(known + "_"):
+            camera_id = known
+            break
+
+    if camera_id is None:
+        stripped = _TRAILING_SEGMENT_RE.sub("", prefix)
+        camera_id = stripped if stripped else prefix
+        log(f"parse_filename: '{prefix}' didn't match any KNOWN_CAMERA_IDS "
+            f"{KNOWN_CAMERA_IDS} — guessed camera_id='{camera_id}' by "
+            f"stripping a trailing segment number. Verify this is correct "
+            f"(and add it to KNOWN_CAMERA_IDS / vision_features.schema."
+            f"CAMERA_IDS if it's a real camera).")
+
     try:
-        start_dt = datetime.strptime(m.group("start"), "%Y%m%d%H%M%S")
+        start_dt = datetime.strptime(ts_match.group("start"), "%Y%m%d%H%M%S")
     except (ValueError, TypeError):
         start_dt = None
     try:
-        end_dt = datetime.strptime(m.group("end"), "%Y%m%d%H%M%S") if m.group("end") else None
+        end_dt = (datetime.strptime(ts_match.group("end"), "%Y%m%d%H%M%S")
+                  if ts_match.group("end") else None)
     except (ValueError, TypeError):
         end_dt = None
     return camera_id, start_dt, end_dt

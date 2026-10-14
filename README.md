@@ -732,7 +732,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
 - [ ] Carry a provenance tag through Steps A.5→B→A.6
-- [ ] drop camera_id restriction in TempPoseGallery
+- [x] drop camera_id restriction in TempPoseGallery
 - [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
 - [ ] Cross-camera identity tracking (continuation of the point above)
 - [x] Reset the tracker between videos in batch mode.
