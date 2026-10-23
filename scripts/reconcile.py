@@ -396,9 +396,15 @@ def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
 
 def step_a_kinetic_match(tracks_df: pd.DataFrame,
                           kinetics_df: pd.DataFrame,
-                          args: argparse.Namespace) -> dict:
+                          args: argparse.Namespace) -> tuple[dict, dict]:
     """
-    Returns assignment dict: {temp_id (int) -> AnimalId (int)}
+    Returns (assignment, kinetic_corr):
+        assignment   : {temp_id (int) -> AnimalId (int)}
+        kinetic_corr : {temp_id (int) -> Pearson r}, the correlation that
+                       produced each assignment. Added for Step C.5
+                       (cross_camera.py), which needs per-temp_id confidence
+                       for its tier-1 / confidence-gap logic — previously
+                       this was computed into `scores` but never returned.
     """
     section("Step A — Kinetic Matcher")
 
@@ -424,7 +430,7 @@ def step_a_kinetic_match(tracks_df: pd.DataFrame,
 
     if cam_disp.empty or kin_delta.empty:
         log("WARNING: empty displacement or kinetics signal — no matches possible.")
-        return {}
+        return {}, {}
 
     scores = _compute_scores(cam_disp, kin_delta, args.activity_pct, args.min_active_bins)
 
@@ -437,6 +443,12 @@ def step_a_kinetic_match(tracks_df: pd.DataFrame,
         print()
 
     assignment = _greedy_assign(scores, args.corr_threshold)
+
+    kinetic_corr = {}
+    for tid, aid in assignment.items():
+        row = scores[(scores["temp_id"] == tid) & (scores["AnimalId"] == aid)]
+        if not row.empty:
+            kinetic_corr[tid] = float(row.iloc[0]["correlation"])
 
     if assignment:
         for tid, aid in sorted(assignment.items()):
@@ -451,7 +463,7 @@ def step_a_kinetic_match(tracks_df: pd.DataFrame,
     if unmatched:
         log(f"  Unmatched temp_ids after kinetics: {sorted(unmatched)}")
 
-    return assignment
+    return assignment, kinetic_corr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -743,9 +755,13 @@ def step_c_cosine_resolver(
     session_id: str,
     camera_id: str = "cam0",
     dry_run: bool = False,
-) -> dict:
+) -> tuple[dict, dict]:
     """
     Resolve unconfirmed temp_ids via cosine similarity.
+
+    Returns (merged_assignment, cosine_scores): cosine_scores is
+    {temp_id -> score}, parallel to the cosine-resolved subset of
+    merged_assignment — added for Step C.5 (cross_camera.py).
 
     Query order per unresolved temp_id:
       1. Flat real_id gallery        — confirmed identities across all sessions
@@ -776,7 +792,7 @@ def step_c_cosine_resolver(
 
     if embed_df.empty:
         log("No embeds available — cosine resolver skipped.")
-        return dict(kinetic_assignment)
+        return dict(kinetic_assignment), {}
 
     embed_counts   = embed_df.groupby("temp_id").size()
     queryable_tids = [
@@ -791,6 +807,10 @@ def step_c_cosine_resolver(
     temp_gallery = TempPoseGallery.load(gallery_dir, modality)
 
     cosine_assignment = {}
+    # {temp_id -> score}, parallel to cosine_assignment — needed by Step C.5
+    # (cross_camera.py) for its tier-1 / confidence-gap logic. Each of the
+    # four assignment sites below records whichever score produced its match.
+    cosine_scores = {}
 
     # aid -> list of (claim_tid, frame_array) that currently hold this
     # real_id. Seeded from kinetic_assignment so we know which tids are
@@ -891,6 +911,7 @@ def step_c_cosine_resolver(
 
         if best_aid is not None and best_sim >= args.cosine_threshold:
             cosine_assignment[tid] = best_aid
+            cosine_scores[tid] = float(best_sim)
             aid_claims.setdefault(best_aid, []).append((tid, tid_frames.get(tid, np.array([]))))
             log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
             continue
@@ -908,6 +929,7 @@ def step_c_cosine_resolver(
             near_miss.append(("pose-slot", p_id, p_cos))
         if p_id is not None and not _aid_blocked_for(tid, p_id):
             cosine_assignment[tid] = p_id
+            cosine_scores[tid] = float(p_cos)
             aid_claims.setdefault(p_id, []).append((tid, tid_frames.get(tid, np.array([]))))
             log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
             continue
@@ -956,6 +978,7 @@ def step_c_cosine_resolver(
             if matched_sid is not None and not _aid_blocked_for(tid, matched_sid):
                 # Inherit the same synthetic id
                 cosine_assignment[tid] = matched_sid
+                cosine_scores[tid] = float(t_cos)
                 aid_claims.setdefault(matched_sid, []).append((tid, tid_frames.get(tid, np.array([]))))
                 log(f"  t{tid} → synthetic_id {matched_sid}  "
                     f"(temp cosine={t_cos:.3f}, matched {match_key})")
@@ -964,6 +987,8 @@ def step_c_cosine_resolver(
                 new_synth = mint_synthetic_id(gallery_dir)
                 cosine_assignment[tid]              = new_synth
                 cosine_assignment[match_key.temp_id] = new_synth
+                cosine_scores[tid]                   = float(t_cos)
+                cosine_scores[match_key.temp_id]     = float(t_cos)
                 aid_claims.setdefault(new_synth, []).append((tid, tid_frames.get(tid, np.array([]))))
                 # Register synthetic id in reid_registry
                 if not dry_run:
@@ -1076,7 +1101,7 @@ def step_c_cosine_resolver(
     log(f"Final assignment: {len(merged)} temp_ids resolved  "
         f"({len(kinetic_assignment)} kinetic, {len(cosine_assignment)} cosine  "
         f"[{n_real} real_id, {n_synth} synthetic])")
-    return merged
+    return merged, cosine_scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1532,7 +1557,7 @@ def run(args) -> None:
         log(f"  {len(behavior_df)} rows")
 
     # ── Step A — kinetic matching ─────────────────────────────────────────────
-    kinetic_assignment = step_a_kinetic_match(tracks_df, kinetics_df, args)
+    kinetic_assignment, kinetic_corr = step_a_kinetic_match(tracks_df, kinetics_df, args)
 
     # ── Step A.5 — merge manual assignments ──────────────────────────────────
     manual_assignment = load_manual_assignments(conn, args.session)
@@ -1563,7 +1588,7 @@ def run(args) -> None:
 
     # ── Step C — cosine resolver ──────────────────────────────────────────────
     merge_map = {}   # populated by Step A.6 below
-    full_assignment = step_c_cosine_resolver(
+    full_assignment, cosine_scores = step_c_cosine_resolver(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
@@ -1582,16 +1607,6 @@ def run(args) -> None:
     # unlike the pose-conditioned one, which isn't computed until
     # run_vision_features runs later) so a boundary-triggered resolution
     # still makes it into THIS session's own Step D / timeline output.
-    #
-    # PREREQUISITE (not yet true of the code as it stands): step_a_kinetic_match
-    # and step_c_cosine_resolver currently return only {temp_id -> AnimalId}
-    # assignment dicts — the correlation/cosine score that produced each
-    # assignment is computed locally inside each function's loop and only
-    # ever logged, never returned. Step C.5 needs those per-temp_id
-    # confidence values for its tier-1/conflict-confidence logic, so both
-    # functions need a small change to also return a parallel
-    # {temp_id -> float} dict (or a single {temp_id -> (AnimalId, float)}
-    # dict) alongside the assignment they already return.
     from cross_camera import run_step_c5, CrossCameraConfig, build_confidence_dict
     c5_confidence = build_confidence_dict(
         kinetic_corr=kinetic_corr,       # {temp_id -> Pearson r} — NEW, from Step A
