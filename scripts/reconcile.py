@@ -1577,6 +1577,35 @@ def run(args) -> None:
         dry_run            = args.dry_run,
     )
 
+    # ── Step C.5 — boundary rendezvous + triggered cross-camera reconcile ────
+    # See cross_camera.py. Matches on the flat embedding (available now,
+    # unlike the pose-conditioned one, which isn't computed until
+    # run_vision_features runs later) so a boundary-triggered resolution
+    # still makes it into THIS session's own Step D / timeline output.
+    #
+    # PREREQUISITE (not yet true of the code as it stands): step_a_kinetic_match
+    # and step_c_cosine_resolver currently return only {temp_id -> AnimalId}
+    # assignment dicts — the correlation/cosine score that produced each
+    # assignment is computed locally inside each function's loop and only
+    # ever logged, never returned. Step C.5 needs those per-temp_id
+    # confidence values for its tier-1/conflict-confidence logic, so both
+    # functions need a small change to also return a parallel
+    # {temp_id -> float} dict (or a single {temp_id -> (AnimalId, float)}
+    # dict) alongside the assignment they already return.
+    from cross_camera import run_step_c5, CrossCameraConfig, build_confidence_dict
+    c5_confidence = build_confidence_dict(
+        kinetic_corr=kinetic_corr,       # {temp_id -> Pearson r} — NEW, from Step A
+        cosine_scores=cosine_scores,     # {temp_id -> cosine}    — NEW, from Step C
+    )
+    full_assignment, c5_log = run_step_c5(
+        conn=conn, session_id=args.session, camera_id=camera_id,
+        tracks_df=tracks_df, embed_df=embed_df,
+        assignment=full_assignment, confidence=c5_confidence,
+        config=CrossCameraConfig(), dry_run=args.dry_run,
+    )
+    for line in c5_log:
+        log(line)
+
     # ── Step A.6 — resolve duplicates across all assignments (kinetic+manual+cosine)
     full_assignment, merge_map = resolve_duplicate_assignments(
         assignment   = full_assignment,
