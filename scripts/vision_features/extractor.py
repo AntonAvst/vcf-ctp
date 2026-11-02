@@ -3,8 +3,8 @@ vision_features/extractor.py
 ─────────────────────────────
 Orchestrator for Stage 2-B: Vision Feature Extraction.
 
-Called by reconcile.py after kinetic matching (Step A) and before gallery
-building (Step B / gallery update) and sensor sequencer (Step D).
+Called by reconcile.py after Kinetic Matcher and before Gallery Builder
+(gallery update) and Sensor Sequencer.
 
 Responsibilities
 ────────────────
@@ -12,8 +12,8 @@ Responsibilities
    (or from raw_tracks in SQLite if parquet is absent — slower).
 2. Run all feature extractors in vision_features/features/ in sequence.
 3. Aggregate per-frame labels into per-window scalars.
-4. Merge scalars into the timeline_df produced by step_d_sensor_sequencer.
-5. Optionally update the pose-conditioned gallery (step B extension).
+4. Merge scalars into the timeline_df produced by sensor_sequencer.
+5. Optionally update the pose-conditioned gallery (Gallery Builder extension).
 
 How to add a new feature
 ─────────────────────────
@@ -310,7 +310,7 @@ def aggregate_window(window_rows: pd.DataFrame) -> dict:
 
 def run_vision_features(
     session_id:        str,
-    timeline_df:       pd.DataFrame,          # output of step_d_sensor_sequencer
+    timeline_df:       pd.DataFrame,          # output of sensor_sequencer
     conn:              sqlite3.Connection,
     assignment:        dict,                   # {temp_id -> real_id}
     is_night:          bool,
@@ -322,7 +322,7 @@ def run_vision_features(
     min_slot_conf:     float      = 0.30,
     dry_run:           bool       = False,
     bin_minutes:       int        = 15,
-    merge_map:         dict | None = None,   # {loser_tid -> winner_tid} from Step A.6
+    merge_map:         dict | None = None,   # {loser_tid -> winner_tid} from Duplicate Resolver
 ) -> pd.DataFrame:
     """
     Stage 2-B: Vision Feature Extraction.
@@ -330,7 +330,7 @@ def run_vision_features(
     Parameters
     ----------
     session_id      : session being processed.
-    timeline_df     : sensor-only timeline from step_d_sensor_sequencer.
+    timeline_df     : sensor-only timeline from sensor_sequencer.
     conn            : SQLite connection.
     assignment      : {temp_id -> real_id} from kinetic + cosine resolution.
     is_night        : True if this is a night/IR session.
@@ -340,13 +340,13 @@ def run_vision_features(
     ema_alpha       : EMA learning rate for gallery update.
     min_slot_conf   : min confidence to assign a frame to a gallery slot.
     dry_run         : if True, skip all writes.
-    bin_minutes     : window size in minutes (must match Step D).
+    bin_minutes     : window size in minutes (must match Sensor Sequencer).
 
     Returns
     -------
     timeline_df with new vision feature columns filled in.
     """
-    section("Step B (vision) — Feature Extraction")
+    section("Vision Feature Extraction")
     log(f"session_id: {session_id}  |  is_night: {is_night}  |  dry_run: {dry_run}")
 
     if timeline_df.empty:
@@ -363,12 +363,12 @@ def run_vision_features(
         log("No kps data available — vision columns will remain NULL.")
         return timeline_df
 
-    # Step A.6 (resolve_duplicate_assignments) deletes loser temp_ids from
+    # Duplicate Resolver (resolve_duplicate_assignments) deletes loser temp_ids from
     # `assignment` — it only keeps {winner_tid: real_id}. kps_df still has
     # the losers' rows under their original temp_id, so without this remap
     # `kps_df["temp_id"].map(assignment)` below would silently classify every
     # merged-but-losing fragment as unresolved (NaN real_id), dropping it from
-    # the timeline/gallery even though Step A.6 already decided it belongs to
+    # the timeline/gallery even though Duplicate Resolver already decided it belongs to
     # the same animal. Mirrors the equivalent embed_df remap in reconcile.py.
     if merge_map:
         n_remapped = int(kps_df["temp_id"].isin(merge_map.keys()).sum())
@@ -493,7 +493,7 @@ def _update_pose_gallery(
     ema_alpha:     float,
     min_slot_conf: float,
     dry_run:       bool,
-    merge_map:     dict | None = None,   # {loser_tid -> winner_tid} from Step A.6
+    merge_map:     dict | None = None,   # {loser_tid -> winner_tid} from Duplicate Resolver
 ) -> None:
     """
     Update both pose galleries after feature extraction:

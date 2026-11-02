@@ -6,11 +6,15 @@ Runs after track_and_dump.py. Reads raw_tracks + collar_signals from SQLite, res
 real_id for every temp_id in a session, and writes to resolved_cow_timeline.
 
 Steps (in order):
-  A. Kinetic matcher    — bbox centroid speed ↔ ΔKineticsCountR (Pearson r)
-  B. Gallery builder    — group embeds by confirmed AnimalId → EMA mean → day/night galleries
-  C. Cosine resolver    — heal temp_id switches, cross-video continuity
-  D. Sensor sequencer   — forward-fill behavior/kinetics to video time grid
-  E. Write output       — resolved_cow_timeline rows
+  Kinetic Matcher        — bbox centroid speed ↔ ΔKineticsCountR (Pearson r)
+  Manual Merge           — load operator overrides, manual beats kinetic on conflict
+  Gallery Builder        — group embeds by confirmed AnimalId → EMA mean → day/night galleries
+  Cosine Resolver        — heal temp_id switches, cross-video/cross-camera continuity
+  Boundary Rendezvous    — cross-camera match via shared-zone tracks (see cross_camera.py)
+  Duplicate Resolver     — merge temp_ids assigned to the same AnimalId (tracker switches)
+  Sensor Sequencer       — forward-fill behavior/kinetics to video time grid
+  Vision Feature Extraction — posture/facing from keypoints, update pose-conditioned gallery
+  Timeline Writer        — write resolved_cow_timeline rows
 
 Usage:
     python3 reconcile.py \\
@@ -312,7 +316,7 @@ def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step A — Kinetic Matcher (wraps match_identity.py logic inline)
+# Kinetic Matcher (wraps match_identity.py logic inline)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _camera_displacement_per_bin(tracks: pd.DataFrame,
@@ -394,19 +398,19 @@ def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
     return assignment
 
 
-def step_a_kinetic_match(tracks_df: pd.DataFrame,
+def kinetic_matcher(tracks_df: pd.DataFrame,
                           kinetics_df: pd.DataFrame,
                           args: argparse.Namespace) -> tuple[dict, dict]:
     """
     Returns (assignment, kinetic_corr):
         assignment   : {temp_id (int) -> AnimalId (int)}
         kinetic_corr : {temp_id (int) -> Pearson r}, the correlation that
-                       produced each assignment. Added for Step C.5
+                       produced each assignment. Added for Boundary Rendezvous
                        (cross_camera.py), which needs per-temp_id confidence
                        for its tier-1 / confidence-gap logic — previously
                        this was computed into `scores` but never returned.
     """
-    section("Step A — Kinetic Matcher")
+    section("Kinetic Matcher")
 
     total_frames = tracks_df["frame_index"].nunique()
     tid_counts = tracks_df.groupby("temp_id")["frame_index"].nunique()
@@ -558,10 +562,10 @@ def save_gallery(gallery_dir: str, modality: str, gallery: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step B — Gallery Builder
+# Gallery Builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def step_b_gallery_builder(
+def gallery_builder(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
     kinetic_assignment: dict,       # {temp_id -> AnimalId}
@@ -579,7 +583,7 @@ def step_b_gallery_builder(
 
     Returns updated gallery dict {real_id: np.ndarray}.
     """
-    section("Step B — Gallery Builder")
+    section("Gallery Builder")
 
     modality = "night" if is_night else "day"
     gallery = load_gallery(gallery_dir, modality)
@@ -640,7 +644,7 @@ def step_b_gallery_builder(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step C — Cosine Resolver
+# Cosine Resolver
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -743,7 +747,7 @@ def _frames_cooccur(arr_a: np.ndarray, arr_b: np.ndarray, tol: int) -> bool:
     return _min_frame_dist(arr_a, arr_b) <= tol
 
 
-def step_c_cosine_resolver(
+def cosine_resolver(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
     kinetic_assignment: dict,       # {temp_id -> AnimalId} — already confirmed
@@ -761,7 +765,7 @@ def step_c_cosine_resolver(
 
     Returns (merged_assignment, cosine_scores): cosine_scores is
     {temp_id -> score}, parallel to the cosine-resolved subset of
-    merged_assignment — added for Step C.5 (cross_camera.py).
+    merged_assignment — added for Boundary Rendezvous (cross_camera.py).
 
     Query order per unresolved temp_id:
       1. Flat real_id gallery        — confirmed identities across all sessions
@@ -782,7 +786,7 @@ def step_c_cosine_resolver(
     Also runs backpropagation: if any confirmed real_id in this session was
     previously a synthetic id, all timeline rows are updated.
     """
-    section("Step C — Cosine Resolver")
+    section("Cosine Resolver")
 
     modality = "night" if is_night else "day"
 
@@ -807,7 +811,7 @@ def step_c_cosine_resolver(
     temp_gallery = TempPoseGallery.load(gallery_dir, modality)
 
     cosine_assignment = {}
-    # {temp_id -> score}, parallel to cosine_assignment — needed by Step C.5
+    # {temp_id -> score}, parallel to cosine_assignment — needed by Boundary Rendezvous
     # (cross_camera.py) for its tier-1 / confidence-gap logic. Each of the
     # four assignment sites below records whichever score produced its match.
     cosine_scores = {}
@@ -1089,11 +1093,11 @@ def step_c_cosine_resolver(
     # temporal-overlap check above) is intentionally NOT done here. A prior
     # "switch healing" pass used to pre-merge duplicates using only raw frame
     # count, with no manual-assignment priority and no audit trail — it ran
-    # before resolve_duplicate_assignments (Step A.6) and silently deleted
-    # every duplicate but the single largest fragment, so Step A.6 (which has
+    # before resolve_duplicate_assignments (Duplicate Resolver) and silently deleted
+    # every duplicate but the single largest fragment, so Duplicate Resolver (which has
     # the correct manual > cosine > kinetic priority, proper tiebreaking, and
     # writes temp_id_merges for traceability) only ever saw what that pass
-    # left behind. Step A.6 is the single authoritative merge step — leave
+    # left behind. Duplicate Resolver is the single authoritative merge step — leave
     # every raw match intact here and let it do that job once, correctly.
     merged = {**kinetic_assignment, **cosine_assignment}
     n_real    = sum(1 for v in merged.values() if not is_synthetic(v))
@@ -1105,10 +1109,10 @@ def step_c_cosine_resolver(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step D — Sensor Sequencer (forward-fill to video time grid)
+# Sensor Sequencer (forward-fill to video time grid)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def step_d_sensor_sequencer(
+def sensor_sequencer(
     tracks_df: pd.DataFrame,
     kinetics_df: pd.DataFrame,
     behavior_df: pd.DataFrame | None,
@@ -1125,7 +1129,7 @@ def step_d_sensor_sequencer(
 
     Returns DataFrame with columns aligned to resolved_cow_timeline schema.
     """
-    section("Step D — Sensor Sequencer")
+    section("Sensor Sequencer")
 
     if assignment is None or len(assignment) == 0:
         log("No assignments — sensor sequencer skipped.")
@@ -1225,16 +1229,16 @@ def step_d_sensor_sequencer(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step E — Write resolved_cow_timeline
+# Timeline Writer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def step_e_write_timeline(
+def write_timeline(
     timeline_df: pd.DataFrame,
     session_id: str,
     conn: sqlite3.Connection,
     dry_run: bool = False,
 ) -> None:
-    section("Step E — Write resolved_cow_timeline")
+    section("Timeline Writer")
 
     if timeline_df.empty:
         log("Nothing to write.")
@@ -1320,7 +1324,7 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step A.6 — Duplicate assignment resolver
+# Duplicate Resolver
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_duplicate_assignments(
@@ -1357,7 +1361,7 @@ def resolve_duplicate_assignments(
     if not duplicates:
         return assignment, {}
 
-    section("Step A.6 — Duplicate Assignment Resolver")
+    section("Duplicate Resolver")
 
     # frame counts for all temp_ids in this session
     frame_counts = (
@@ -1425,7 +1429,7 @@ def resolve_duplicate_assignments(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step A.5 — Manual assignment loader
+# Manual Merge
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_manual_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
@@ -1556,10 +1560,10 @@ def run(args) -> None:
     else:
         log(f"  {len(behavior_df)} rows")
 
-    # ── Step A — kinetic matching ─────────────────────────────────────────────
-    kinetic_assignment, kinetic_corr = step_a_kinetic_match(tracks_df, kinetics_df, args)
+    # ── Kinetic Matcher ───────────────────────────────────────────────────────
+    kinetic_assignment, kinetic_corr = kinetic_matcher(tracks_df, kinetics_df, args)
 
-    # ── Step A.5 — merge manual assignments ──────────────────────────────────
+    # ── Manual Merge ──────────────────────────────────────────────────────────
     manual_assignment = load_manual_assignments(conn, args.session)
     if manual_assignment:
         conflicts = set(kinetic_assignment) & set(manual_assignment)
@@ -1574,8 +1578,8 @@ def run(args) -> None:
     embed_parquet_path = str(dm.get_session_dir(args.session))
     embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session)
 
-    # ── Step B — gallery builder ──────────────────────────────────────────────
-    gallery = step_b_gallery_builder(
+    # ── Gallery Builder ───────────────────────────────────────────────────────
+    gallery = gallery_builder(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
@@ -1586,9 +1590,9 @@ def run(args) -> None:
         dry_run            = args.dry_run,
     )
 
-    # ── Step C — cosine resolver ──────────────────────────────────────────────
-    merge_map = {}   # populated by Step A.6 below
-    full_assignment, cosine_scores = step_c_cosine_resolver(
+    # ── Cosine Resolver ───────────────────────────────────────────────────────
+    merge_map = {}   # populated by Duplicate Resolver below
+    full_assignment, cosine_scores = cosine_resolver(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
@@ -1602,15 +1606,15 @@ def run(args) -> None:
         dry_run            = args.dry_run,
     )
 
-    # ── Step C.5 — boundary rendezvous + triggered cross-camera reconcile ────
+    # ── Boundary Rendezvous — triggered cross-camera reconcile ───────────────
     # See cross_camera.py. Matches on the flat embedding (available now,
     # unlike the pose-conditioned one, which isn't computed until
     # run_vision_features runs later) so a boundary-triggered resolution
-    # still makes it into THIS session's own Step D / timeline output.
+    # still makes it into THIS session's own Sensor Sequencer / timeline output.
     from cross_camera import run_step_c5, CrossCameraConfig, build_confidence_dict
     c5_confidence = build_confidence_dict(
-        kinetic_corr=kinetic_corr,       # {temp_id -> Pearson r} — NEW, from Step A
-        cosine_scores=cosine_scores,     # {temp_id -> cosine}    — NEW, from Step C
+        kinetic_corr=kinetic_corr,       # {temp_id -> Pearson r} — NEW, from Kinetic Matcher
+        cosine_scores=cosine_scores,     # {temp_id -> cosine}    — NEW, from Cosine Resolver
     )
     full_assignment, c5_log = run_step_c5(
         conn=conn, session_id=args.session, camera_id=camera_id,
@@ -1621,7 +1625,7 @@ def run(args) -> None:
     for line in c5_log:
         log(line)
 
-    # ── Step A.6 — resolve duplicates across all assignments (kinetic+manual+cosine)
+    # ── Duplicate Resolver — resolve duplicates across all assignments (kinetic+manual+cosine)
     full_assignment, merge_map = resolve_duplicate_assignments(
         assignment   = full_assignment,
         manual_tids  = set(manual_assignment.keys()),
@@ -1640,7 +1644,7 @@ def run(args) -> None:
         embed_df_remapped = embed_df.copy()
         embed_df_remapped["temp_id"] = embed_df_remapped["temp_id"].replace(merge_map)
         # rebuild gallery with remapped embeds for any merged pairs
-        gallery = step_b_gallery_builder(
+        gallery = gallery_builder(
             tracks_df          = tracks_df,
             embed_df           = embed_df_remapped,
             kinetic_assignment = full_assignment,
@@ -1654,18 +1658,18 @@ def run(args) -> None:
     # ── update known_temp_ids ─────────────────────────────────────────────────
     update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
 
-    # Step A.6 deletes loser temp_ids from full_assignment (keeps only
+    # Duplicate Resolver deletes loser temp_ids from full_assignment (keeps only
     # {winner_tid: real_id}) — tracks_df still carries the losers' rows under
-    # their original temp_id. Without this remap, step_d_sensor_sequencer's
+    # their original temp_id. Without this remap, sensor_sequencer's
     # per-row assignment.get(temp_id) lookup would silently treat every
-    # merged-but-losing fragment as unassigned, even though Step A.6 already
+    # merged-but-losing fragment as unassigned, even though Duplicate Resolver already
     # decided it's the same animal. Mirrors the embed_df remap above.
     if merge_map:
         tracks_df = tracks_df.copy()
         tracks_df["temp_id"] = tracks_df["temp_id"].replace(merge_map)
 
-    # ── Step D — sensor sequencer + Vision feature extractor ─────────────────────────────────────────────
-    timeline_df = step_d_sensor_sequencer(
+    # ── Sensor Sequencer + Vision Feature Extraction ─────────────────────────────────────────────
+    timeline_df = sensor_sequencer(
         tracks_df   = tracks_df,
         kinetics_df = kinetics_df,
         behavior_df = behavior_df,
@@ -1675,7 +1679,7 @@ def run(args) -> None:
     if not timeline_df.empty:
         timeline_df["session_id"] = args.session
 
-    # ── Step B (vision) — feature extraction ─────────────────────────────────
+    # ── Vision Feature Extraction ─────────────────────────────────────────────
     if not timeline_df.empty:
         timeline_df = run_vision_features(
             session_id    = args.session,
@@ -1699,8 +1703,8 @@ def run(args) -> None:
             merge_map     = merge_map,
         )
 
-    # ── Step E — write to DB ──────────────────────────────────────────────────
-    step_e_write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
+    # ── Timeline Writer — write to DB ─────────────────────────────────────────
+    write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)
 
     # ── summary ───────────────────────────────────────────────────────────────
     section("Summary")

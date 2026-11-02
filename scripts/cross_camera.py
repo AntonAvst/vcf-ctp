@@ -1,52 +1,53 @@
 """
 cross_camera.py
 ────────────────
-Step C.5 — Boundary rendezvous + triggered cross-camera reconcile.
+Boundary Rendezvous — triggered cross-camera reconcile.
 
 Design doc: "Cross-Camera Cow Tracking — Design Scope"
 
 Where this sits in reconcile.py's step sequence:
 
-    Step A (kinetic matcher)
-    Step B (gallery builder)
-    Step C (cosine resolver)          <- existing, UNCHANGED, UNRESTRICTED
-    *** Step C.5 (this module) ***    <- NEW
-    Step A.6 (resolve_duplicate_assignments)
-    Step D (sensor sequencer)
+    Kinetic Matcher
+    Gallery Builder
+    Cosine Resolver                     <- existing, UNCHANGED, UNRESTRICTED
+    *** Boundary Rendezvous (this module) ***    <- NEW
+    Duplicate Resolver (resolve_duplicate_assignments)
+    Sensor Sequencer
     run_vision_features (posture/facing/pose-gallery update)
-    Step E (write to DB)
+    Timeline Writer
 
-Step C.5 matches on the FLAT embedding (the same one Step C's "Step 1"
-flat-gallery lookup uses), not the pose-conditioned 8-slot one — that
-embedding isn't computed until run_vision_features runs, which is after
-Step D, and Step C.5 has to finish before Step D so a boundary-triggered
-resolution still makes it into this session's own resolved_cow_timeline
-rows. Pose-conditioned gallery ENROLLMENT (see enroll_into_pose_gallery
-below) is a separate, later hook — call it from inside/alongside
-_update_pose_gallery in vision_features/extractor.py, once posture/facing
-are available, using the (posture, facing) pair recorded on each matched
-boundary_observations row.
+Boundary Rendezvous matches on the FLAT embedding (the same one Cosine
+Resolver's "Step 1" flat-gallery lookup uses), not the pose-conditioned
+8-slot one — that embedding isn't computed until run_vision_features runs,
+which is after Sensor Sequencer, and Boundary Rendezvous has to finish
+before Sensor Sequencer so a boundary-triggered resolution still makes it
+into this session's own resolved_cow_timeline rows. Pose-conditioned
+gallery ENROLLMENT (see enroll_into_pose_gallery below) is a separate,
+later hook — call it from inside/alongside _update_pose_gallery in
+vision_features/extractor.py, once posture/facing are available, using the
+(posture, facing) pair recorded on each matched boundary_observations row.
 
-Integration (reconcile.py, after Step C, before Step A.6):
+Integration (reconcile.py, after Cosine Resolver, before Duplicate Resolver):
 
-    from cross_camera import run_step_c5, CrossCameraConfig
+    from cross_camera import run_boundary_rendezvous, CrossCameraConfig
 
-    c5_config = CrossCameraConfig()   # or load overrides from args
-    full_assignment, c5_log = run_step_c5(
+    boundary_config = CrossCameraConfig()   # or load overrides from args
+    full_assignment, boundary_log = run_boundary_rendezvous(
         conn=conn, session_id=args.session, camera_id=camera_id,
         tracks_df=tracks_df, embed_df=embed_df,
         assignment=full_assignment,     # {**kinetic_assignment, **cosine_assignment}
         confidence=assignment_confidence,  # {temp_id -> float}, see note below
-        config=c5_config,
+        config=boundary_config,
     )
-    for line in c5_log:
+    for line in boundary_log:
         log(line)
 
 `confidence` isn't produced anywhere yet as a clean {temp_id: float} dict —
 reconcile.py currently has per-step local confidence values (corr, cosine
 score) that never get collected into one place. Something has to build that
-dict before calling run_step_c5; see build_confidence_dict() below for a
-drop-in example you can adapt to reconcile.py's actual local variable names.
+dict before calling run_boundary_rendezvous; see build_confidence_dict()
+below for a drop-in example you can adapt to reconcile.py's actual local
+variable names.
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ class CrossCameraConfig:
 # direction_relation: 'same' if the two cameras face the same way (so a cow
 # walking "away" in one is walking "toward" in the other in a consistent
 # sense), 'opposite' if not. Only used to decide whether raw directional
-# motion can be compared at all — Step C.5 doesn't do that (it uses motion
+# motion can be compared at all — Boundary Rendezvous doesn't do that (it uses motion
 # MAGNITUDE, which doesn't care), but keeping the field for any future
 # geometric work (e.g. real homography calibration) that would need it.
 #
@@ -456,7 +457,7 @@ def resolve_cross_camera_pair(
               real conflict -> confidence rule.
 
     Returns a dict describing the outcome; caller uses it to update the
-    live `assignment` dict for Step C.5's own session (see run_step_c5).
+    live `assignment` dict for Boundary Rendezvous's own session (see run_boundary_rendezvous).
 
     NOTE: does not check this pairing's result against identity claims
     recorded elsewhere in the DB (e.g. a non-adjacent camera's independent
@@ -561,7 +562,7 @@ def finalize_no_match_observations(
 # Top-level orchestrator — call this from reconcile.py
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_step_c5(
+def run_boundary_rendezvous(
     conn: sqlite3.Connection,
     session_id: str,
     camera_id: str,
@@ -574,12 +575,12 @@ def run_step_c5(
     motion_corr_fn=None,
 ) -> tuple[dict, list[str]]:
     """
-    Runs Step C.5 for one session. Returns (updated_assignment, log_lines).
+    Runs Boundary Rendezvous for one session. Returns (updated_assignment, log_lines).
     `assignment` is also mutated in place for convenience.
 
     Does NOT re-run resolve_duplicate_assignments — the caller (reconcile.py)
-    should do that after this returns, same as the existing Step A.6 call,
-    so same-session conflict protection also covers anything Step C.5
+    should do that after this returns, same as the existing Duplicate Resolver call,
+    so same-session conflict protection also covers anything Boundary Rendezvous
     changed. See the design doc's Priority rule section.
     """
     log: list[str] = []
@@ -597,7 +598,7 @@ def run_step_c5(
 
         tid_embeds = embed_df[embed_df["temp_id"] == temp_id]
         if tid_embeds.empty:
-            log.append(f"  [C.5] t{temp_id}: qualifies for zone {dwell.zone_pair_id} "
+            log.append(f"  [boundary_rendezvous] t{temp_id}: qualifies for zone {dwell.zone_pair_id} "
                        f"but has no embedding — skipped")
             continue
         flat_embed = np.stack(tid_embeds["embed"].values).mean(axis=0)
@@ -614,11 +615,11 @@ def run_step_c5(
             dry_run=dry_run,
         )
         staged_ids[int(temp_id)] = obs_id
-        log.append(f"  [C.5] t{temp_id}: staged in zone {dwell.zone_pair_id} "
+        log.append(f"  [boundary_rendezvous] t{temp_id}: staged in zone {dwell.zone_pair_id} "
                    f"({dwell.frames} frames, {dwell.seconds:.1f}s)")
 
     if not staged_ids:
-        log.append("  [C.5] No boundary candidates this session.")
+        log.append("  [boundary_rendezvous] No boundary candidates this session.")
 
     # ── For each zone this camera participates in, look for a partner match ──
     by_zone: dict[str, list[PendingObservation]] = {}
@@ -647,7 +648,7 @@ def run_step_c5(
         pairs = pair_candidates(this_side, partner_side, config, motion_corr_fn=motion_corr_fn)
         for a, b, tier, score in pairs:
             outcome = resolve_cross_camera_pair(conn, a, b, tier, score, config, dry_run=dry_run)
-            log.append(f"  [C.5] t{a.temp_id}({a.camera_id}) <-> "
+            log.append(f"  [boundary_rendezvous] t{a.temp_id}({a.camera_id}) <-> "
                        f"t{b.temp_id}({b.camera_id})  tier={tier} score={score:.3f}  "
                        f"-> {outcome['kind']}")
 
@@ -656,7 +657,7 @@ def run_step_c5(
                 old = assignment.get(this_tid)
                 new = outcome["animal_id"]
                 if old != new:
-                    log.append(f"  [C.5] OVERRIDE t{this_tid}: {old} -> {new} "
+                    log.append(f"  [boundary_rendezvous] OVERRIDE t{this_tid}: {old} -> {new} "
                                f"(reason=step_c5_{outcome['kind']})")
                 assignment[this_tid] = new
 
@@ -664,7 +665,7 @@ def run_step_c5(
     finalized = finalize_no_match_observations(conn, camera_id, session_start, session_end,
                                                 dry_run=dry_run)
     if finalized:
-        log.append(f"  [C.5] Finalized {len(finalized)} pending observation(s) "
+        log.append(f"  [boundary_rendezvous] Finalized {len(finalized)} pending observation(s) "
                    f"as no_match_found (this session's coverage proved no match)")
 
     return assignment, log
@@ -675,14 +676,14 @@ def run_step_c5(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_confidence_dict(
-    kinetic_corr: dict,      # {temp_id -> Pearson r}, from Step A
-    cosine_scores: dict,     # {temp_id -> cosine}, from Step C
+    kinetic_corr: dict,      # {temp_id -> Pearson r}, from Kinetic Matcher
+    cosine_scores: dict,     # {temp_id -> cosine}, from Cosine Resolver
 ) -> dict:
     """
     reconcile.py doesn't currently collect per-temp_id confidence into one
-    dict — Step A's `corr` and Step C's cosine scores are local variables
+    dict — Kinetic Matcher's `corr` and Cosine Resolver's cosine scores are local variables
     scoped to their own loops. This is a drop-in example of how to build
-    the `confidence` dict run_step_c5 needs; adapt the two input dicts'
+    the `confidence` dict run_boundary_rendezvous needs; adapt the two input dicts'
     construction to reconcile.py's actual variable names at the call site.
     """
     out = dict(kinetic_corr)
