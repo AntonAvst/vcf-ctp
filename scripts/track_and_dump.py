@@ -1184,7 +1184,7 @@ if __name__ == "__main__":
 # ── Batch — all videos in a directory ────────────────────────────────────────
 # python3 track_and_dump.py \
 #   --model      "$SEG" \
-#   --source     ~/thesis_workspace/raw_data/calving/ \
+#   --source     "$SOURCE"
 #   --pose_model "$POSE" \
 #   --imgsz 960 --conf 0.30 --iou 0.60 \
 #   --pose_imgsz 384 --pose_conf 0.25 \
