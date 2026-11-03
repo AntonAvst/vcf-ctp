@@ -33,7 +33,7 @@ except ImportError:
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
 
 # session_id derivation — single source of truth, shared with track_and_dump.py
-from track_and_dump import parse_filename
+from track_and_dump import parse_filename, make_session_id
 
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
@@ -972,9 +972,7 @@ def main():
 
     # ── session_id: auto-derive from filename (same logic as track_and_dump.py) ──
     if not args.session_id:
-        camera_id, start_dt, _end_dt = parse_filename(str(vid))
-        args.session_id = (f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
-                            if start_dt else f"{camera_id}_unknown")
+        args.session_id = make_session_id(str(vid))
         log(f"session_id auto-derived: {args.session_id}")
     else:
         log(f"session_id (manual override): {args.session_id}")

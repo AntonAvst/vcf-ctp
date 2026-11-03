@@ -53,6 +53,11 @@ VIDEO_EXTENSIONS = {".mp4", ".ts", ".avi", ".mov", ".mkv"}
 # below fails. Keep both lists in sync when a camera is added/renamed/removed.
 KNOWN_CAMERA_IDS = ["רפת 26", "רפת 33", "רפת 38"]
 
+# Short ASCII code per camera, used only to build session_id (see
+# make_session_id). camera_id itself keeps the real name everywhere else.
+# Mirrored from vision_features.schema.CAMERA_CODES — keep both in sync.
+CAMERA_CODES = {"רפת 26": "cam26", "רפת 33": "cam33", "רפת 38": "cam38"}
+
 # Filenames look like:
 #   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
 # e.g. "רפת 26_24_S20260616090000_E20260616110000.mp4"
@@ -112,6 +117,58 @@ def parse_filename(video_path: str):
     except (ValueError, TypeError):
         end_dt = None
     return camera_id, start_dt, end_dt
+
+
+_UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+def make_session_id(video_path: str) -> str:
+    """Build the session_id for a video: its filename stem, with the camera
+    name replaced by a short ASCII code and any other unsafe characters
+    replaced by '-'.
+
+        "רפת 33_6_S20260616100001_E20260616110000.mp4"
+            -> "cam33_6_S20260616100001_E20260616110000"
+
+    Properties:
+      - One id per file, and the same id every time that file is processed,
+        so re-running a video replaces its own rows (register_session) and
+        two different files can never collide.
+      - ASCII only, no spaces: safe in shell commands, paths, and Drive
+        folder names; nothing displays right-to-left.
+      - Traceable: the id shows exactly which file it came from.
+
+    session_id is an opaque key — nothing in the pipeline parses it to
+    recover camera or time. Use video_sessions.camera_id / start_dt for that.
+
+    This is the ONLY place session_id is built. display_tracks.py imports
+    it from here.
+    """
+    stem = Path(video_path).stem
+
+    for name, code in CAMERA_CODES.items():
+        if stem == name or stem.startswith(name + "_"):
+            stem = code + stem[len(name):]
+            break
+    else:
+        # Unrecognized camera: still produce a unique, safe id, but warn —
+        # the camera should be added to KNOWN_CAMERA_IDS / CAMERA_CODES.
+        if not stem.isascii() or " " in stem:
+            log(f"make_session_id: '{stem}' doesn't start with a known camera "
+                f"name {list(CAMERA_CODES)} — sanitizing the raw filename. "
+                f"Add this camera to CAMERA_CODES for a readable id.")
+
+    safe = _UNSAFE_CHARS_RE.sub("-", stem).strip("-")
+    if safe == stem:
+        return safe
+
+    # Sanitizing changed something (e.g. an unknown Hebrew camera name was
+    # stripped), so two different files could now look the same. Append a
+    # short stable hash of the original stem to keep ids unique.
+    import hashlib
+    digest = hashlib.sha1(Path(video_path).stem.encode("utf-8")).hexdigest()[:6]
+    if not any(c.isalnum() for c in safe):
+        return f"vid-{digest}"   # nothing readable survived at all
+    return f"{safe}-{digest}"
 
 def log(msg: str) -> None:
     print(f"[track] {msg}", flush=True)
@@ -587,8 +644,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     if start_dt is None:
         log(f"Warning: could not parse S<timestamp> from {video_path.name} "
             "— frame_datetime will be empty.")
-    session_id = (f"{camera_id}_{start_dt.strftime('%Y%m%d%H%M%S')}"
-                  if start_dt else f"{camera_id}_unknown")
+    session_id = make_session_id(str(video_path))
     result["session_id"] = session_id
 
     outdir = dm.get_session_dir(session_id)
@@ -1200,7 +1256,7 @@ if __name__ == "__main__":
 
 
 # ── Re-run reconcile manually on an existing session ─────────────────────────
-# SESSION=refet_33_20241221070000   # auto-derived from filename _S<timestamp>
+# SESSION=cam33_6_S20260616100001_E20260616110000   # = make_session_id(<video file>)
 # python3 reconcile.py \
 #   --session       "$SESSION"
 #   # add --dry_run to test without writing
@@ -1209,7 +1265,8 @@ if __name__ == "__main__":
 #
 # Notes:
 #   Models are loaded once and reused across all videos in a batch.
-#   session_id is auto-derived from each filename's _S<timestamp> token.
+#   session_id is the filename stem with the camera name swapped for its
+#   ASCII code (see make_session_id) — e.g. cam33_6_S20260616100001_E20260616110000.
 #   Kinetics/behavior CSVs are auto-discovered from Drive per video time window.
 #   A processing_log.csv is maintained on Drive with one row per processed video.
 #   Ctrl+C finishes the current video, logs it as 'interrupted', then stops.

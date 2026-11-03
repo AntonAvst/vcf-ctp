@@ -254,7 +254,7 @@ vision_features/
   4. Only one cow in the zone on each side, gated by a `single_cow_sanity_floor` cosine score (rejects a stray false-positive detection)
 - **Resolving a pairing:** zone-consistent (expected — both tracks plausibly near the shared boundary) → corroboration, no conflict. Zone-inconsistent (same AnimalId claimed somewhere that isn't physically plausible) → real conflict: auto-resolved by confidence if the gap ≥ `conflict_confidence_gap`, otherwise logged to `cross_camera_conflicts` for manual review instead of guessing.
 - **Priority over Cosine Resolver:** if Boundary Rendezvous resolves a temp_id differently than Cosine Resolver already did, Boundary Rendezvous wins — it rests on verified shared-zone + overlapping-time evidence, not appearance alone. A tier-1 (both-sides-kinetic) win is treated as settling the question outright; tiers 2–4 override with correspondingly less certainty.
-- **Gallery enrichment** (separate from matching, since pose/facing aren't computed until `run_vision_features` runs, later than Boundary Rendezvous): complementary pose/facing slots enroll both observations for free — different slots are just different rows of the same cow's `(8,128)` array. A genuine same-slot, same-instant collision skips the lower-confidence/smaller-bbox observation entirely rather than letting `PoseGallery.update()`'s EMA blend dilute it — *not yet wired into `vision_features/extractor.py`'s `_update_pose_gallery`*.
+- **Gallery enrichment:** no special handling. When two cameras see the same cow at the boundary, each session updates the pose-conditioned gallery normally through `_update_pose_gallery`. Different posture/facing slots land in different rows of the cow's `(8,128)` array, so both views are kept. Same-slot overlap is left to the regular EMA blend — see Key Design Decision 22 for why a "keep only the better view" rule was considered and dropped.
 - **Known gap, deferred:** a pairing's result isn't checked against an independent identity claim already on record elsewhere (e.g. a non-adjacent camera's own kinetic claim on the same AnimalId at an overlapping time) — a real conflict that can't currently arise, by construction, from the pairing logic itself. Explicitly punted; needs its own pass before relying on this for anything adjacent-camera-sensitive.
 - Key config (defaults live in `CrossCameraConfig`, same pattern as reconcile's other thresholds):
 
@@ -591,13 +591,13 @@ python3 track_and_dump.py \
 python3 display_tracks.py \
     --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts \
     --db         ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-    --session_id refet_33_20241221070000 \
+    --session_id cam33_6_S20260616100001_E20260616110000 \
     --draw_pose --show_fps
 
 # 3. If kinetics unavailable — assign manually after watching display_tracks.py
 python3 assign_identity.py \
     --db      ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-    --session refet_33_20241221070000 \
+    --session cam33_6_S20260616100001_E20260616110000 \
     --assign  2:7507  1:6366  71:7513 \
     --note    "manual — no kinetics for this date" \
     --run_reconcile
@@ -605,8 +605,8 @@ python3 assign_identity.py \
 # 4. Re-run reconcile standalone (e.g. after tuning thresholds)
 python3 reconcile.py \
     --db          ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-    --session     refet_33_20241221070000 \
-    --embed_parquet ~/thesis_workspace/vcf-ctp/data/outputs/refet_33_20241221070000/embeds.parquet \
+    --session     cam33_6_S20260616100001_E20260616110000 \
+    --embed_parquet ~/thesis_workspace/vcf-ctp/data/outputs/cam33_6_S20260616100001_E20260616110000/embeds.parquet \
     --corr_threshold 0.7 --cosine_threshold 0.75 --ema_alpha 0.15
     # add --dry_run to test without writing
     # add --kinetics /path/to/file.csv to override auto-discovery
@@ -648,6 +648,8 @@ python3 drive_manager.py retry-buffer
 19. **Pluggable calving ledger adapters** — each farm's ledger format is parsed by a dedicated `BaseAdapter` subclass. Farm-specific column names, date formats, language of outcome values, and derivation rules are fully isolated in the adapter. The orchestrator (`calving_ledger_ingest.py`) only calls `parse()`. Adding a new farm = one new file in `adapters/`, zero changes elsewhere.
 20. **Calving features split from ground truth** — `calving_ledger` holds only the label (outcome + identity + datetime). `calving_features` holds all model input features keyed on `event_id`. The two tables evolve independently: new farms can introduce new feature columns via auto-migration without touching existing rows or code.
 21. **Boundary rendezvous instead of a batch cross-camera pass** — processing is strictly serial but not time-ordered (a batch might process camera 33's whole day before camera 26 even starts, and a camera's feed can be entirely missing for a period). Rather than waiting for all three cameras to finish a shared time window, `cross_camera.py` stages qualifying boundary-zone tracks in `boundary_observations` and triggers a match the moment a partner observation shows up, however much later that is. A pending observation is only finalized as unmatched once the partner camera has an *actually-processed* session that fully covers it and still found nothing — proof of absence, not a timeout guess.
+22. **No "keep the better view" rule for same-slot boundary overlap** — considered and dropped. The idea: when two cameras see the same cow in the same posture/facing slot at the same moment, keep only the higher-quality view instead of blending both into the gallery. It doesn't fit how the gallery is built. `build_slot_embeds` averages every confident frame of a cow in a slot across the **whole session**, and `PoseGallery.update()` runs once per (cow, slot) per session — so the shared-zone moment is only a few seconds inside an average of minutes to hours of frames. Skipping the "worse" update would discard that camera's entire session of frames for the slot, not just the overlap. A frame-level version (drop only the overlapping frames) is possible, but serial processing means it only works one way: the later session can hold back its own frames, but can't remove an earlier session's update that's already blended in. The effect being corrected — a few seconds counted twice — is too small to justify that.
+23. **session_id = filename stem, camera name swapped for an ASCII code** — built in exactly one place, `make_session_id()` in `track_and_dump.py` (which `display_tracks.py` imports). `רפת 33_6_S20260616100001_E20260616110000.mp4` → `cam33_6_S20260616100001_E20260616110000`. One id per file, and the same id every time that file is processed, so re-running a video replaces its own rows and two files can never collide. ASCII with no spaces, so `--session $SES` works without quoting and nothing displays right-to-left. Camera codes live in `CAMERA_CODES` next to `KNOWN_CAMERA_IDS` (mirrored in `vision_features/schema.py`). An unrecognized camera still gets a unique id — unsafe characters are replaced and a short hash of the original name is appended — plus a warning to add it to the map. Replaced the old `<camera_id>_<start time>` format, which dropped the segment number, needed shell quoting, and fell back to `<camera>_unknown` for any filename without a timestamp — giving every such video from one camera the same id, so processing the second deleted the first one's tracks. session_id is an opaque key: nothing parses it, use `video_sessions.camera_id` / `start_dt` for camera and time.
 
 ---
 
@@ -772,18 +774,17 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 
 - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
   When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
-- [ ] resolve session id logic (video name, time, etc...)
+- [x] resolve session id logic (video name, time, etc...) — see Key Design Decision 23 / `make_session_id`
 - [ ] regenerate tracks with higher frame rate (< 0.5[sec])
 - [ ] filter out temp ids with less then epsilon instances
 - [ ] what to do about bbox overpopulation?
 - [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
-- [ ] Carry a provenance tag through Steps A.5→B→A.6
+- [ ] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver
 - [x] drop camera_id restriction in TempPoseGallery
 - [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
   - [ ] Implement tier-3 motion-magnitude correlation (`motion_corr_fn`) — currently falls through to tier 4
-  - [ ] Wire pose-conditioned gallery enrichment into `vision_features/extractor.py`'s `_update_pose_gallery` (same-slot collision → skip the worse observation, don't EMA-blend both)
   - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
   - [ ] Tune `boundary_dwell_seconds` / `boundary_dwell_min_frames` against real crossing durations once more footage is annotated
 - [x] Reset the tracker between videos in batch mode.

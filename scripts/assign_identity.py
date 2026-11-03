@@ -11,9 +11,13 @@ The DB is always the canonical copy pulled from Drive via drive_manager.py,
 and kinetics/gallery/parquet (used only by --run_reconcile) are resolved the
 same way reconcile.py resolves them — keyed off --session.
 
+--session is the session_id built by track_and_dump.make_session_id(): the
+video filename stem with the camera name swapped for its ASCII code, e.g.
+"רפת 33_6_S20260616100001_E20260616110000.mp4" -> "cam33_6_S20260616100001_E20260616110000".
+
 Usage:
     python3 assign_identity.py \\
-        --session   refet33_20241221 \\
+        --session   cam33_6_S20260616100001_E20260616110000 \\
         --assign    2:7507  1:6366  71:7513 \\
         --note      "manual — no kinetics coverage for Dec 21" \\
         --run_reconcile
@@ -431,23 +435,25 @@ if __name__ == "__main__":
 #
 # # 1. Watch video to identify temp_ids:
 # python3 display_tracks.py \
-#   --video      ~/thesis_workspace/raw_data/videos/refet_33_S20241221070000.mp4 \
-#   --session_id refet33_20241221 \
+#   --video      "$VID" \
 #   --show_fps --sink ffplay
+#   # session_id is derived from the filename automatically (and printed at
+#   # startup), e.g. cam33_6_S20260616100001_E20260616110000
 #
 # # 2. Assign identities and run reconcile:
+# SES=cam33_6_S20260616100001_E20260616110000
 # python3 assign_identity.py \
-#   --session    $SES \
+#   --session    "$SES" \
 #   --assign     2:7507  1:6366  71:7513 \
 #   --note       "manual — no kinetics coverage for Dec 21" \
 #   --run_reconcile
 #
 # # List current assignments:
-# python3 assign_identity.py --session refet33_20241221 --list
+# python3 assign_identity.py --session "$SES" --list
 #
 # # Remove a wrong assignment and redo:
-# python3 assign_identity.py --session refet33_20241221 --remove 71
-# python3 assign_identity.py --session refet33_20241221 \
+# python3 assign_identity.py --session "$SES" --remove 71
+# python3 assign_identity.py --session "$SES" \
 #   --assign 71:7513 --run_reconcile
 #
 # Note: db, kinetics, and gallery are never passed as arguments — they're
