@@ -251,7 +251,7 @@ vision_features/
 - **Matching, when multiple candidates are in the zone on both sides:** scores every candidate pair, takes the globally best non-conflicting set of pairings (not a naive one-at-a-time waterfall), using a 4-tier hierarchy — mirrors reconcile's own trust order, with two new tiers appended at the bottom:
   1. Both sides already independently kinetically confirmed to the same AnimalId
   2. Flat-embedding cosine similarity ≥ `cosine_threshold` (same mechanism Cosine Resolver uses)
-  3. Motion-magnitude correlation ≥ `motion_corr_threshold` *(not yet implemented — `run_boundary_rendezvous` takes an injectable `motion_corr_fn`; falls through to tier 4 until supplied)*
+  3. Motion-magnitude correlation ≥ `motion_corr_threshold` — both tracks are read from `raw_tracks` (every camera's tracks share the DB), over the dwell overlap padded by `motion_window_pad_seconds`. Each becomes a speed curve in body-heights per second (1-second bins), and the two are compared with Pearson r, allowing a small time shift for clock offset. Speed only, never direction, since 33 faces opposite to 26/38. No score (tier skipped, not a mismatch) when there are too few shared bins or either cow barely moved, because two near-still curves are just detection jitter. Only computed for pairs tiers 1–2 didn't match. Default scorer is `make_motion_corr_fn`; `run_boundary_rendezvous(motion_corr_fn=...)` can override it.
   4. Only one cow in the zone on each side, gated by a `single_cow_sanity_floor` cosine score (rejects a stray false-positive detection)
 - **Resolving a pairing:** zone-consistent (expected — both tracks plausibly near the shared boundary) → corroboration, no conflict. Zone-inconsistent (same AnimalId claimed somewhere that isn't physically plausible) → real conflict: auto-resolved by confidence if the gap ≥ `conflict_confidence_gap`, otherwise logged to `cross_camera_conflicts` for manual review instead of guessing.
 - **Priority:** follows `SOURCE_PRIORITY` in `reconcile.py` — manual > kinetic > boundary_rendezvous > cosine. Boundary Rendezvous can set an unassigned temp_id or replace a Cosine Resolver id (verified shared-zone + overlapping-time evidence beats appearance alone), but never overwrites a manual or kinetic id: `reconcile.py` passes those temp_ids as `protected_tids`, and a disagreeing boundary match is logged as `KEPT` instead.
@@ -264,7 +264,12 @@ vision_features/
 | `boundary_dwell_seconds` | 3.0 | Min cumulative dwell in a shared zone to stage a candidate |
 | `boundary_dwell_min_frames` | 5 | Min detections contributing to that dwell — rejects single-frame noise |
 | `conflict_confidence_gap` | 0.10 | Min confidence difference to auto-resolve a conflict silently; closer calls go to review |
-| `motion_corr_threshold` | 0.85 | Tier-3 fallback threshold *(tier not yet implemented)* |
+| `motion_corr_threshold` | 0.85 | Tier-3 minimum r between the two speed curves |
+| `motion_bin_seconds` | 1.0 | Tier-3 speed bin width |
+| `motion_window_pad_seconds` | 30.0 | Tier-3 window: dwell overlap ± this |
+| `motion_min_samples` | 8 | Tier-3 minimum shared speed bins to score at all |
+| `motion_min_std` | 0.05 | Tier-3 minimum speed variation (body-heights/s); below it the cow barely moved and r is noise |
+| `motion_max_lag_bins` | 2 | Tier-3 tolerated clock offset between cameras, in bins |
 | `single_cow_sanity_floor` | 0.40 | Tier-4 minimum cosine score even with only one candidate on each side |
 | `cosine_threshold` | 0.75 | Mirrors `reconcile.py`'s own — tier-2 matching |
 
@@ -787,7 +792,8 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [x] drop camera_id restriction in TempPoseGallery
 - [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
-  - [ ] Implement tier-3 motion-magnitude correlation (`motion_corr_fn`) — currently falls through to tier 4
+  - [x] Implement tier-3 motion-magnitude correlation — `make_motion_corr_fn` / `motion_magnitude_corr` in `cross_camera.py`. On synthetic tracks (same cow seen at different scales and opposite directions, 1 px jitter): same cow r≈0.998, different cows ≤0.48; still matches with up to ~1.5 s clock offset, fails at 10 s. `motion_corr_threshold` not yet checked against real crossings.
+  - [ ] Check `frame_datetime` against the video's real clock. It is computed as start + frame_index / fps, so any dropped frame shifts every later timestamp. Camera 38's 2-hour file (`…E110000`) has 143,540 frames = 7,177 s at 20 fps, i.e. ends 23 s short: either the recording is shorter, or frames were lost and late timestamps run up to ~23 s behind. Cross-camera matching (dwell-window overlap, tier 3) assumes cameras agree within ~2 s. Possible fix: use the decoder's per-frame timestamp (`CAP_PROP_POS_MSEC`) instead of frame_index / fps.
   - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
   - [ ] Tune `boundary_dwell_seconds` / `boundary_dwell_min_frames` against real crossing durations once more footage is annotated
 - [x] Reset the tracker between videos in batch mode.

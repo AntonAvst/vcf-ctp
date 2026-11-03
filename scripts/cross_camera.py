@@ -72,6 +72,13 @@ class CrossCameraConfig:
     boundary_dwell_min_frames: int = 5
     conflict_confidence_gap: float = 0.10
     motion_corr_threshold: float = 0.85
+    # Tier 3 (motion-magnitude correlation) — see make_motion_corr_fn
+    motion_bin_seconds: float = 1.0         # speed is computed per bin of this width
+    motion_window_pad_seconds: float = 30.0 # look this far before/after the dwell overlap
+    motion_min_samples: int = 8             # min shared speed bins to trust a correlation
+    motion_min_std: float = 0.05            # min speed std (body-heights/s) — below this
+                                            # the cow barely moved and r is just noise
+    motion_max_lag_bins: int = 2            # tolerate this much clock offset between cameras
     single_cow_sanity_floor: float = 0.40
     cosine_threshold: float = 0.75          # mirror reconcile.py's args.cosine_threshold
 
@@ -402,22 +409,155 @@ def match_tier(
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 3 — motion-magnitude correlation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_track(conn: sqlite3.Connection, session_id: str, temp_id: int) -> pd.DataFrame:
+    """All raw_tracks rows for one track, with frame_datetime parsed.
+    Columns: t (Timestamp), cx, cy, h."""
+    rows = conn.execute(
+        "SELECT frame_datetime, x1, y1, x2, y2 FROM raw_tracks "
+        "WHERE session_id = ? AND temp_id = ?",
+        (session_id, int(temp_id)),
+    ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["t", "cx", "cy", "h"])
+    df = pd.DataFrame(rows, columns=["t", "x1", "y1", "x2", "y2"])
+    df["t"] = pd.to_datetime(df["t"], errors="coerce")
+    df = df.dropna(subset=["t"])
+    return pd.DataFrame({
+        "t":  df["t"],
+        "cx": (df["x1"] + df["x2"]) / 2.0,
+        "cy": (df["y1"] + df["y2"]) / 2.0,
+        "h":  (df["y2"] - df["y1"]).clip(lower=1.0),
+    })
+
+
+def _speed_series(track: pd.DataFrame, t0: pd.Timestamp, t1: pd.Timestamp,
+                  bin_s: float) -> pd.Series:
+    """
+    Speed in body-heights per second, one value per time bin.
+
+    Bins are fixed wall-clock intervals starting at t0, so the same index
+    means the same moment for both cameras. Per bin: mean box center and mean
+    box height. speed[k] = distance between bin k and bin k+1 centers, divided
+    by the mean height of the two bins and by bin_s. Indexed by bin number;
+    only bins where the track is present in both k and k+1 are included.
+
+    Dividing by box height makes the value comparable within a camera (a cow
+    near the camera has a bigger box and moves more pixels per step) — the
+    raw pixel scale doesn't matter for Pearson r, but uneven scale within the
+    window would distort the shape of the curve.
+    """
+    w = track[(track["t"] >= t0) & (track["t"] < t1)]
+    if w.empty:
+        return pd.Series(dtype=float)
+    k = ((w["t"] - t0).dt.total_seconds() // bin_s).astype(int)
+    per_bin = w.groupby(k)[["cx", "cy", "h"]].mean()
+    nxt = per_bin.shift(-1)
+    consecutive = pd.Series(per_bin.index, index=per_bin.index).shift(-1) == per_bin.index + 1
+    step = np.hypot(nxt["cx"] - per_bin["cx"], nxt["cy"] - per_bin["cy"])
+    height = (per_bin["h"] + nxt["h"]) / 2.0
+    speed = step / height / bin_s
+    return speed[consecutive].dropna()
+
+
+def motion_magnitude_corr(track_a: pd.DataFrame, track_b: pd.DataFrame,
+                          t0: pd.Timestamp, t1: pd.Timestamp,
+                          config: "CrossCameraConfig") -> "float | None":
+    """
+    Pearson r between two tracks' speed curves over [t0, t1), maximized over
+    small time shifts (±motion_max_lag_bins) to absorb clock offset between
+    cameras. Uses speed magnitude only, never direction: cameras 26/38 and 33
+    face opposite ways, so "moving right" in one is not "moving right" in the
+    other, but "speeding up" and "stopping" look the same in both.
+
+    Returns None — meaning "no evidence either way", not "no match" — when:
+      - fewer than motion_min_samples shared speed bins, or
+      - either cow barely moved (speed std < motion_min_std). Two near-still
+        curves are just detection jitter, and jitter can correlate by chance.
+    """
+    sa = _speed_series(track_a, t0, t1, config.motion_bin_seconds)
+    sb = _speed_series(track_b, t0, t1, config.motion_bin_seconds)
+    if len(sa) < config.motion_min_samples or len(sb) < config.motion_min_samples:
+        return None
+    if sa.std() < config.motion_min_std or sb.std() < config.motion_min_std:
+        return None
+
+    best = None
+    for lag in range(-config.motion_max_lag_bins, config.motion_max_lag_bins + 1):
+        shifted = sb.copy()
+        shifted.index = shifted.index + lag
+        common = sa.index.intersection(shifted.index)
+        if len(common) < config.motion_min_samples:
+            continue
+        x, y = sa.loc[common].to_numpy(), shifted.loc[common].to_numpy()
+        if x.std() < 1e-9 or y.std() < 1e-9:
+            continue
+        r = float(np.corrcoef(x, y)[0, 1])
+        if best is None or r > best:
+            best = r
+    return best
+
+
+def make_motion_corr_fn(conn: sqlite3.Connection, config: "CrossCameraConfig"):
+    """
+    Build the tier-3 scorer used by pair_candidates: (a, b) -> r | None.
+
+    Both tracks are read from raw_tracks by (session_id, temp_id) — every
+    camera's tracks live in the same DB, so the partner camera's track is
+    available however long ago its session was processed. The comparison
+    window is the overlap of the two dwell windows, padded on both sides by
+    motion_window_pad_seconds: a few seconds of dwell alone is too few
+    samples, and both cameras usually see the cow before and after the zone.
+    Tracks are cached, since one track can be scored against several
+    candidates.
+    """
+    cache: dict = {}
+
+    def track(obs: PendingObservation) -> pd.DataFrame:
+        key = (obs.session_id, int(obs.temp_id))
+        if key not in cache:
+            cache[key] = _load_track(conn, *key)
+        return cache[key]
+
+    def fn(a: PendingObservation, b: PendingObservation) -> "float | None":
+        pad = pd.Timedelta(seconds=config.motion_window_pad_seconds)
+        t0 = max(pd.Timestamp(a.enter_time), pd.Timestamp(b.enter_time)) - pad
+        t1 = min(pd.Timestamp(a.exit_time),  pd.Timestamp(b.exit_time))  + pad
+        if t1 <= t0:
+            return None
+        try:
+            ta, tb = track(a), track(b)
+        except sqlite3.Error:
+            return None   # can't read the tracks: no evidence, never a crash
+        return motion_magnitude_corr(ta, tb, t0, t1, config)
+
+    return fn
+
+
 def pair_candidates(
     candidates_a: list[PendingObservation],
     candidates_b: list[PendingObservation],
     config: CrossCameraConfig,
-    motion_corr_fn=None,   # Optional[(a, b) -> float], injected for testability
+    motion_corr_fn=None,   # Optional[(a, b) -> float | None]; see make_motion_corr_fn
 ) -> list[tuple[PendingObservation, PendingObservation, int, float]]:
     """
     Score every (a, b) candidate pair, then take the globally best set of
     non-conflicting pairings: sort by (tier ascending, score descending),
     greedily accept a pair if neither side has been consumed yet.
+
+    motion_corr_fn is only called for pairs that tiers 1-2 didn't already
+    match (it reads both tracks from raw_tracks, so it isn't free).
     """
     n_a, n_b = len(candidates_a), len(candidates_b)
     scored = []
     for a, b in product(candidates_a, candidates_b):
-        motion_corr = motion_corr_fn(a, b) if motion_corr_fn else None
-        result = match_tier(a, b, config, n_a, n_b, motion_corr=motion_corr)
+        result = match_tier(a, b, config, n_a, n_b)
+        if motion_corr_fn and (result is None or result[0] > TIER_MOTION_MAGNITUDE):
+            result = match_tier(a, b, config, n_a, n_b,
+                                motion_corr=motion_corr_fn(a, b))
         if result is not None:
             tier, score = result
             scored.append((tier, score, a, b))
@@ -652,7 +792,8 @@ def run_boundary_rendezvous(
         if not partner_side:
             continue
 
-        pairs = pair_candidates(this_side, partner_side, config, motion_corr_fn=motion_corr_fn)
+        pairs = pair_candidates(this_side, partner_side, config,
+                                motion_corr_fn=motion_corr_fn or make_motion_corr_fn(conn, config))
         for a, b, tier, score in pairs:
             outcome = resolve_cross_camera_pair(conn, a, b, tier, score, config, dry_run=dry_run)
             log.append(f"  [boundary_rendezvous] t{a.temp_id}({a.camera_id}) <-> "
