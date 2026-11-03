@@ -253,7 +253,7 @@ vision_features/
   3. Motion-magnitude correlation ≥ `motion_corr_threshold` *(not yet implemented — `run_boundary_rendezvous` takes an injectable `motion_corr_fn`; falls through to tier 4 until supplied)*
   4. Only one cow in the zone on each side, gated by a `single_cow_sanity_floor` cosine score (rejects a stray false-positive detection)
 - **Resolving a pairing:** zone-consistent (expected — both tracks plausibly near the shared boundary) → corroboration, no conflict. Zone-inconsistent (same AnimalId claimed somewhere that isn't physically plausible) → real conflict: auto-resolved by confidence if the gap ≥ `conflict_confidence_gap`, otherwise logged to `cross_camera_conflicts` for manual review instead of guessing.
-- **Priority over Cosine Resolver:** if Boundary Rendezvous resolves a temp_id differently than Cosine Resolver already did, Boundary Rendezvous wins — it rests on verified shared-zone + overlapping-time evidence, not appearance alone. A tier-1 (both-sides-kinetic) win is treated as settling the question outright; tiers 2–4 override with correspondingly less certainty.
+- **Priority:** follows `SOURCE_PRIORITY` in `reconcile.py` — manual > kinetic > boundary_rendezvous > cosine. Boundary Rendezvous can set an unassigned temp_id or replace a Cosine Resolver id (verified shared-zone + overlapping-time evidence beats appearance alone), but never overwrites a manual or kinetic id: `reconcile.py` passes those temp_ids as `protected_tids`, and a disagreeing boundary match is logged as `KEPT` instead.
 - **Gallery enrichment:** no special handling. When two cameras see the same cow at the boundary, each session updates the pose-conditioned gallery normally through `_update_pose_gallery`. Different posture/facing slots land in different rows of the cow's `(8,128)` array, so both views are kept. Same-slot overlap is left to the regular EMA blend — see Key Design Decision 22 for why a "keep only the better view" rule was considered and dropped.
 - **Known gap, deferred:** a pairing's result isn't checked against an independent identity claim already on record elsewhere (e.g. a non-adjacent camera's own kinetic claim on the same AnimalId at an overlapping time) — a real conflict that can't currently arise, by construction, from the pairing logic itself. Explicitly punted; needs its own pass before relying on this for anything adjacent-camera-sensitive.
 - Key config (defaults live in `CrossCameraConfig`, same pattern as reconcile's other thresholds):
@@ -412,7 +412,7 @@ def parse(self, df_raw: pd.DataFrame, source_file: str) -> pd.DataFrame:
 | **Gallery Builder** | Group embeds by confirmed AnimalId → EMA mean → separate day/night galleries. Routes on `video_sessions.is_night`. Never mixes modalities. | *(was Step B)* |
 | **Cosine Resolver** | 3-tier query per unresolved temp_id: (1) flat real_id gallery, (2) pose-conditioned real_id gallery, (3) TempPoseGallery — cross-session, **cross-camera** temp matching (cows move freely between cameras, so this is not restricted to one). If a match to a real_id is found → assign it. If a match to another temp_id is found → inherit its synthetic id or mint a new one. Backpropagates: if a synthetic id gets resolved to a real_id, all prior timeline rows are updated. Falls back to kinetics-only if all galleries are empty. | *(was Step C)* |
 | **Boundary Rendezvous** | Cows crossing between cameras 26/33/38 are linked via known shared-zone polygons (`camera_topology` in `cross_camera.py`). A session's track dwelling in a shared zone past a dwell threshold is staged in `boundary_observations`; a matching observation from the zone's other camera triggers an immediate cross-camera resolve, scored by a tiered hierarchy — both-sides-kinetic → cosine → motion-magnitude correlation → single-cow-in-zone sanity check — mirroring reconcile's own kinetic-over-appearance trust order, with two new, lower-priority tiers for cases reconcile never had to handle before. Order-agnostic: works regardless of which camera's session is processed first, or how long apart. Matches on the flat embedding, not the pose-conditioned one, so it resolves in time for Sensor Sequencer to include the result. | *(was Step C.5)* |
-| **Duplicate Resolver** | Merge any temp_ids assigned to the same AnimalId (tracker switches); remap loser embed rows to winner and rebuild gallery. | *(was Step A.6)* |
+| **Duplicate Resolver** | When several temp_ids claim the same AnimalId, rank them by the source of their id (manual > kinetic > boundary_rendezvous > cosine), then frame count. Fragments never on screen together in different spots are the same animal split by the tracker: merged into the winner, embed rows remapped, gallery rebuilt. A temp_id on screen at the same time as the winner in a different spot is a different animal: it loses the id and stays unassigned. | *(was Step A.6)* |
 | **Sensor Sequencer** | Δf_12/f_23/v/kinR → forward-fill to video time grid | *(was Step D)* |
 | **Vision Feature Extractor** | Load kps from Parquet → classify posture + facing per frame → aggregate to window scalars → write to timeline → update pose-conditioned gallery | *(was Step B-vision)* |
 | **Timeline Writer** | Insert rows into `resolved_cow_timeline` | *(was Step E)* |
@@ -544,11 +544,13 @@ gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_e
 - Written by `cross_camera.py` only when two sessions on different cameras independently claim the same real_id for a pairing that isn't zone-consistent (a genuine conflict, not ordinary corroboration)
 - `needs_review` rows need a human — the confidence gap was too close to call automatically
 
-### `temp_id_merges` — tracker-switch merge log
-- session_id, winner_tid, loser_tid, real_id, winner_reason, loser_reason, merged_dt
-- Written by reconcile.py's Duplicate Resolver step when two temp_ids are assigned the same AnimalId (tracker switch)
-- `winner_tid` survives; `loser_tid` embed rows are remapped to winner before gallery rebuild
-- winner_reason / loser_reason: `'manual'` | `'more_frames'` | `'kinetic'`
+### `temp_id_merges` — duplicate-claim log
+- session_id, winner_tid, loser_tid, real_id, winner_reason, loser_reason, merged_dt, action
+- Written by reconcile.py's Duplicate Resolver step when two temp_ids are assigned the same AnimalId
+- winner_reason / loser_reason: the **source** of each temp_id's id — `'manual'` | `'kinetic'` | `'boundary_rendezvous'` | `'cosine'`
+- action:
+  - `'merged'` — same animal split by the tracker; `loser_tid` embed/track rows are remapped to `winner_tid`
+  - `'unassigned_cooccurring'` — on screen at the same time as the winner in a different spot, so a different animal; `loser_tid` lost the id and stays unassigned (its rows are not pooled)
 - UNIQUE on (session_id, loser_tid) — a loser can only be merged once per session
 
 ---
@@ -633,7 +635,7 @@ python3 drive_manager.py retry-buffer
 4. **real_id is nullable** — pipeline doesn't block on unresolved identities; modality_mask signals quality
 5. **Two-stage identity resolution** — kinetic matching (primary) confirms AnimalId; cosine resolver (secondary) heals temp_id switches and enables cross-video, cross-camera continuity. Cosine resolver uses a 3-tier query: flat gallery → pose-conditioned gallery → TempPoseGallery (cross-session, cross-camera temp matching)
 6. **Manual assignment as first-class fallback** — `assign_identity.py` writes to `manual_assignments`; reconcile merges these with kinetic results, manual taking priority
-7. **Duplicate Resolver** — when two temp_ids are assigned the same AnimalId (tracker switch), the loser's embed rows are remapped to the winner before gallery rebuild
+7. **Duplicate Resolver ranks by provenance** — every step records which source set each temp_id's id (`provenance` in `reconcile.run()`), and duplicate claims are ranked manual > kinetic > boundary_rendezvous > cosine, the same trust order as the rest of the pipeline. Ranking only changes the outcome when the claimants were on screen together in different spots (a real conflict — the loser is unassigned); otherwise they're one animal and get merged whichever wins, with the loser's embed rows remapped before gallery rebuild. Uses the same co-occurrence rule as the Cosine Resolver (frame tolerance + IoU ≥ 0.3 means a handoff, not a conflict).
 8. **Pose raw data stays in raw_tracks / Parquet** — reconcile.py extracts scalar features into resolved_cow_timeline; raw kps recomputable any time
 9. **Sensor temporal mismatch handled by forward-fill** — behavior ~90s, kinetics ~15min → upsampled into video time grid in resolved_cow_timeline
 10. **kps_coverage column** — tells the model how reliable vision features are per window (partial occlusion awareness)
@@ -780,7 +782,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] what to do about bbox overpopulation?
 - [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
-- [ ] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver
+- [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `SOURCE_PRIORITY` in `reconcile.py`
 - [x] drop camera_id restriction in TempPoseGallery
 - [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous

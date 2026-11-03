@@ -235,9 +235,13 @@ CREATE TABLE IF NOT EXISTS temp_id_merges (
     winner_tid    INTEGER NOT NULL,   -- temp_id that survives
     loser_tid     INTEGER NOT NULL,   -- temp_id that was remapped to winner
     real_id       INTEGER NOT NULL,   -- the shared AnimalId
-    winner_reason TEXT,               -- 'manual' | 'more_frames' | 'kinetic'
-    loser_reason  TEXT,               -- why the loser was assigned this animal
+    winner_reason TEXT,               -- source of the winner's id: 'manual' | 'kinetic' | 'boundary_rendezvous' | 'cosine'
+    loser_reason  TEXT,               -- source of the loser's id (same values)
     merged_dt     TEXT,
+    action        TEXT DEFAULT 'merged',  -- 'merged' (same animal, rows pooled into winner)
+                                          -- | 'unassigned_cooccurring' (on screen at the same time
+                                          --   as the winner in a different spot, so a different
+                                          --   animal: loser lost the id and stays unassigned)
     UNIQUE(session_id, loser_tid)     -- a loser can only be merged once per session
 );
 """
@@ -247,6 +251,10 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
+    try:   # DBs created before temp_id_merges.action existed
+        conn.execute("ALTER TABLE temp_id_merges ADD COLUMN action TEXT DEFAULT 'merged'")
+    except sqlite3.OperationalError:
+        pass   # column already present
     conn.commit()
     log(f"Database ready: {db_path}")
     return conn
@@ -815,6 +823,10 @@ def cosine_resolver(
     # (cross_camera.py) for its tier-1 / confidence-gap logic. Each of the
     # four assignment sites below records whichever score produced its match.
     cosine_scores = {}
+    # {(other_session_id, other_temp_id) -> id minted for it in THIS run},
+    # so two local tracks matching the same foreign track share one synthetic
+    # id even under --dry_run (when nothing is written to reid_registry).
+    foreign_ids: dict = {}
 
     # aid -> list of (claim_tid, frame_array) that currently hold this
     # real_id. Seeded from kinetic_assignment so we know which tids are
@@ -971,28 +983,31 @@ def cosine_resolver(
             near_miss.append(("temp-key", match_key, t_cos))
 
         if match_key is not None:
-            # The matched temp_id may already have a synthetic id assigned
-            matched_sid = cosine_assignment.get(match_key.temp_id)
+            # match_key is a temp_id from ANOTHER session (exclude_session=
+            # session_id above). Its temp_id number means nothing in this
+            # session's dicts, and it is not a real_id, so look up any id it
+            # already has by (session_id, temp_id) — in this run first, then
+            # in reid_registry.known_temp_ids.
+            foreign = (match_key.session_id, int(match_key.temp_id))
+            matched_sid = foreign_ids.get(foreign)
             if matched_sid is None:
-                # check reid_registry for an existing assignment
-                existing_row = get_reid_row(conn, match_key.temp_id)
-                if existing_row:
-                    matched_sid = existing_row.get("real_id")
+                matched_sid = find_real_id_for_temp(conn, *foreign)
 
             if matched_sid is not None and not _aid_blocked_for(tid, matched_sid):
-                # Inherit the same synthetic id
+                # Inherit the id the matched track already has
                 cosine_assignment[tid] = matched_sid
                 cosine_scores[tid] = float(t_cos)
                 aid_claims.setdefault(matched_sid, []).append((tid, tid_frames.get(tid, np.array([]))))
-                log(f"  t{tid} → synthetic_id {matched_sid}  "
+                log(f"  t{tid} → id {matched_sid}  "
                     f"(temp cosine={t_cos:.3f}, matched {match_key})")
             else:
-                # Mint a new synthetic id for this pair
+                # Mint a new synthetic id for this pair. Only THIS session's
+                # temp_id goes into cosine_assignment; the other session's
+                # temp_id is linked through reid_registry.known_temp_ids below.
                 new_synth = mint_synthetic_id(gallery_dir)
-                cosine_assignment[tid]              = new_synth
-                cosine_assignment[match_key.temp_id] = new_synth
-                cosine_scores[tid]                   = float(t_cos)
-                cosine_scores[match_key.temp_id]     = float(t_cos)
+                cosine_assignment[tid] = new_synth
+                cosine_scores[tid]     = float(t_cos)
+                foreign_ids[foreign]   = new_synth
                 aid_claims.setdefault(new_synth, []).append((tid, tid_frames.get(tid, np.array([]))))
                 # Register synthetic id in reid_registry
                 if not dry_run:
@@ -1301,6 +1316,80 @@ def write_timeline(
 # Update known_temp_ids in reid_registry
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Assignment provenance
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Which step produced a temp_id's current AnimalId, and how much to trust it
+# when two temp_ids in one session claim the same AnimalId. Lower wins.
+# Mirrors the README's trust order: operator > collar ground truth >
+# cross-camera boundary match > appearance alone.
+SOURCE_PRIORITY = {
+    "manual":              0,
+    "kinetic":             1,
+    "boundary_rendezvous": 2,
+    "cosine":              3,
+}
+# Sources Boundary Rendezvous is not allowed to overwrite.
+PROTECTED_SOURCES = {"manual", "kinetic"}
+
+# Same threshold the Cosine Resolver uses: two temp_ids on screen at the same
+# moment with box IoU at or above this are one animal whose box briefly had
+# two ids (handoff artifact); below it, they are two different animals.
+IOU_SAME_ANIMAL = 0.3
+
+
+def _pair_conflict(frames_a: np.ndarray, boxes_a, frames_b: np.ndarray, boxes_b,
+                   tol: int, iou_same: float = IOU_SAME_ANIMAL) -> tuple:
+    """Are temp_ids A and B two different animals? Same rule as the Cosine
+    Resolver's _aid_block_reason: they conflict only if they were on screen
+    within `tol` frames of each other AND, at that closest moment, their
+    boxes overlap less than `iou_same` (different spots in the pen).
+
+    Returns (conflict: bool, min_frame_dist: float, iou: float|None).
+    """
+    d = _min_frame_dist(frames_a, frames_b)
+    if d > tol:
+        return False, d, None
+    iou = 0.0
+    if boxes_a is not None and len(boxes_a) and boxes_b is not None and len(boxes_b):
+        idx    = np.searchsorted(frames_b, frames_a)
+        idx_lo = np.clip(idx - 1, 0, len(frames_b) - 1)
+        idx_hi = np.clip(idx,     0, len(frames_b) - 1)
+        dist_lo = np.abs(frames_a - frames_b[idx_lo])
+        dist_hi = np.abs(frames_a - frames_b[idx_hi])
+        use_lo  = dist_lo <= dist_hi
+        other   = np.where(use_lo, frames_b[idx_lo], frames_b[idx_hi])
+        i       = int(np.argmin(np.where(use_lo, dist_lo, dist_hi)))
+        box_a = _nearest_box(boxes_a, int(frames_a[i]))
+        box_b = _nearest_box(boxes_b, int(other[i]))
+        iou = _iou(box_a, box_b) if box_a and box_b else 0.0
+    return iou < iou_same, d, iou
+
+
+def find_real_id_for_temp(conn: sqlite3.Connection, session_id: str,
+                          temp_id: int):
+    """The id (real or synthetic) already recorded for a temp_id of a given
+    session, looked up through reid_registry.known_temp_ids. None if none.
+
+    temp_ids are per-session counters, so a temp_id is only meaningful
+    together with its session_id, and it is never a real_id itself.
+    """
+    rows = conn.execute(
+        "SELECT real_id, known_temp_ids FROM reid_registry "
+        "WHERE known_temp_ids IS NOT NULL"
+    ).fetchall()
+    target = {"session_id": session_id, "temp_id": int(temp_id)}
+    for row in rows:
+        try:
+            known = json.loads(row[1] or "[]")
+        except Exception:
+            continue
+        if target in known:
+            return row[0]
+    return None
+
+
 def update_known_temp_ids(conn: sqlite3.Connection,
                            assignment: dict,
                            session_id: str,
@@ -1329,29 +1418,37 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 
 def resolve_duplicate_assignments(
     assignment: dict,               # {temp_id -> real_id}  — may contain duplicates
-    manual_tids: set,               # temp_ids that came from manual assignments
-    kinetic_tids: set,              # temp_ids that came from kinetic matching
-    tracks_df: pd.DataFrame,        # for frame-count lookup
+    provenance: dict,               # {temp_id -> source}, see SOURCE_PRIORITY
+    tracks_df: pd.DataFrame,        # for frame counts and co-occurrence
     conn: sqlite3.Connection,
     session_id: str,
     dry_run: bool = False,
-) -> dict:
+) -> tuple[dict, dict]:
     """
-    Detect AnimalIds assigned to multiple temp_ids and resolve by merging.
+    Resolve AnimalIds claimed by more than one temp_id in this session.
 
-    Winner hierarchy (highest priority first):
-      1. Manual assignment
+    Each duplicate group is ranked by:
+      1. Source of the id (SOURCE_PRIORITY): manual > kinetic >
+         boundary_rendezvous > cosine
       2. More frames in raw_tracks
-      3. Kinetic assignment (lower temp_id breaks ties)
+      3. Lower temp_id
+    The top-ranked temp_id is the winner and keeps the id.
 
-    The loser temp_id is remapped to the winner temp_id in the returned dict.
-    A record is written to temp_id_merges for traceability.
+    Every other temp_id in the group is then checked against the winner and
+    any fragments already merged into it:
+      - Never on screen at the same time in a different spot -> the same
+        animal split across tracker ids. Merged: remapped to the winner,
+        recorded in temp_id_merges with action='merged'.
+      - On screen at the same time in a different spot (_pair_conflict) ->
+        a different animal; one of the two ids is wrong. The lower-ranked
+        temp_id loses the id and stays unassigned, recorded with
+        action='unassigned_cooccurring'. It is NOT added to merge_map, so
+        its rows are never pooled into the winner's.
 
-    Returns a cleaned assignment dict where every real_id appears exactly once,
-    plus a merge_map {loser_tid -> winner_tid} for downstream steps to use
-    when pooling embed/track rows.
+    Returns (clean_assignment, merge_map): every real_id appears at most
+    once in clean_assignment; merge_map is {loser_tid -> winner_tid} for
+    merged fragments only, for downstream steps to pool embed/track rows.
     """
-    # group by real_id → find duplicates
     from collections import defaultdict
     aid_to_tids = defaultdict(list)
     for tid, aid in assignment.items():
@@ -1363,67 +1460,85 @@ def resolve_duplicate_assignments(
 
     section("Duplicate Resolver")
 
-    # frame counts for all temp_ids in this session
-    frame_counts = (
-        tracks_df.groupby("temp_id")["frame_index"]
-        .nunique()
-        .to_dict()
-    )
+    frame_counts = tracks_df.groupby("temp_id")["frame_index"].nunique().to_dict()
+    tid_frames   = _tid_frame_arrays(tracks_df)
+    tid_boxes    = _tid_frame_boxes(tracks_df)
+    cooccur_tol  = _estimate_frame_tolerance(tracks_df)
 
-    def priority(tid, aid):
-        """Lower number = higher priority (wins).
-        Hierarchy: manual(0) > cosine(1) > kinetic(2)
-        Tiebreak within same tier: more frames wins, then lower temp_id.
-        """
-        if tid in manual_tids:
-            return (0, -frame_counts.get(tid, 0), tid)   # manual — highest
-        if tid not in kinetic_tids:
-            return (1, -frame_counts.get(tid, 0), tid)   # cosine — second
-        return (2, -frame_counts.get(tid, 0), tid)       # kinetic — lowest
+    def source(tid):
+        return provenance.get(tid, "unknown")
 
-    def reason(tid):
-        if tid in manual_tids:   return "manual"
-        if tid in kinetic_tids:  return "kinetic"
-        return "cosine"
+    def rank(tid):
+        """Lower sorts first (wins)."""
+        return (SOURCE_PRIORITY.get(source(tid), len(SOURCE_PRIORITY)),
+                -frame_counts.get(tid, 0), tid)
 
-    merge_map = {}   # {loser_tid -> winner_tid}
+    def describe(tid):
+        return f"temp_id {tid} ({source(tid)}, {frame_counts.get(tid, 0)} frames)"
+
+    def record(winner, loser, aid, action):
+        if dry_run:
+            return
+        conn.execute("""
+            INSERT INTO temp_id_merges
+                (session_id, winner_tid, loser_tid, real_id,
+                 winner_reason, loser_reason, merged_dt, action)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(session_id, loser_tid) DO UPDATE SET
+                winner_tid    = excluded.winner_tid,
+                real_id       = excluded.real_id,
+                winner_reason = excluded.winner_reason,
+                loser_reason  = excluded.loser_reason,
+                merged_dt     = excluded.merged_dt,
+                action        = excluded.action
+        """, (session_id, winner, loser, aid,
+              source(winner), source(loser), ts, action))
+
+    merge_map  = {}   # {loser_tid -> winner_tid}, merged fragments only
+    unassigned = []
     clean = dict(assignment)
     ts = pd.Timestamp.now().isoformat()
 
     for aid, tids in sorted(duplicates.items()):
-        ranked = sorted(tids, key=lambda t: priority(t, aid))
+        ranked = sorted(tids, key=rank)
         winner = ranked[0]
-        losers = ranked[1:]
+        kept   = [winner]   # winner + fragments merged into it = one animal
 
         log(f"  AnimalId {aid} → duplicate temp_ids {sorted(tids)}")
-        log(f"    winner: temp_id {winner} ({reason(winner)}, "
-            f"{frame_counts.get(winner,0)} frames)")
+        log(f"    winner: {describe(winner)}")
 
-        for loser in losers:
-            log(f"    merge:  temp_id {loser} ({reason(loser)}, "
-                f"{frame_counts.get(loser,0)} frames) → remapped to temp_id {winner}")
-            merge_map[loser] = winner
-            del clean[loser]
+        for tid in ranked[1:]:
+            conflict_with = None
+            for k in kept:
+                conflict, dist, iou = _pair_conflict(
+                    tid_frames.get(tid, np.array([])), tid_boxes.get(tid),
+                    tid_frames.get(k,   np.array([])), tid_boxes.get(k),
+                    cooccur_tol,
+                )
+                if conflict:
+                    conflict_with = (k, dist, iou)
+                    break
 
-            if not dry_run:
-                conn.execute("""
-                    INSERT INTO temp_id_merges
-                        (session_id, winner_tid, loser_tid, real_id,
-                         winner_reason, loser_reason, merged_dt)
-                    VALUES (?,?,?,?,?,?,?)
-                    ON CONFLICT(session_id, loser_tid) DO UPDATE SET
-                        winner_tid    = excluded.winner_tid,
-                        real_id       = excluded.real_id,
-                        winner_reason = excluded.winner_reason,
-                        loser_reason  = excluded.loser_reason,
-                        merged_dt     = excluded.merged_dt
-                """, (session_id, winner, loser, aid,
-                      reason(winner), reason(loser), ts))
+            del clean[tid]
+            if conflict_with:
+                k, dist, iou = conflict_with
+                iou_str = f"{iou:.2f}" if iou is not None else "n/a"
+                log(f"    UNASSIGN: {describe(tid)} — on screen with temp_id {k} "
+                    f"({int(dist)} frames apart, IoU {iou_str}), so a different "
+                    f"animal; {source(winner)} outranks {source(tid)}")
+                unassigned.append(tid)
+                record(winner, tid, aid, "unassigned_cooccurring")
+            else:
+                log(f"    merge:  {describe(tid)} → remapped to temp_id {winner}")
+                merge_map[tid] = winner
+                kept.append(tid)
+                record(winner, tid, aid, "merged")
 
-    if not dry_run and merge_map:
+    if not dry_run and (merge_map or unassigned):
         conn.commit()
 
-    log(f"  Resolved {len(merge_map)} duplicate(s) → "
+    log(f"  Resolved {len(merge_map) + len(unassigned)} duplicate(s): "
+        f"{len(merge_map)} merged, {len(unassigned)} unassigned → "
         f"{len(clean)} unique assignments")
     return clean, merge_map
 
@@ -1563,6 +1678,11 @@ def run(args) -> None:
     # ── Kinetic Matcher ───────────────────────────────────────────────────────
     kinetic_assignment, kinetic_corr = kinetic_matcher(tracks_df, kinetics_df, args)
 
+    # provenance: {temp_id -> source of its current id}. Every step that sets
+    # or changes an id records itself here, so the Duplicate Resolver can rank
+    # competing claims by SOURCE_PRIORITY and the audit trail is accurate.
+    provenance = {tid: "kinetic" for tid in kinetic_assignment}
+
     # ── Manual Merge ──────────────────────────────────────────────────────────
     manual_assignment = load_manual_assignments(conn, args.session)
     if manual_assignment:
@@ -1570,6 +1690,8 @@ def run(args) -> None:
         if conflicts:
             log(f"  Note: manual overrides kinetic for temp_ids: {sorted(conflicts)}")
         kinetic_assignment.update(manual_assignment)
+        for tid in manual_assignment:
+            provenance[tid] = "manual"
 
     # ── load embeds from parquet (always via drive_manager — never a CLI override) ──
     # NOTE: embeds are written as multi-part files (embeds_part000.parquet, ...)
@@ -1611,28 +1733,32 @@ def run(args) -> None:
     # unlike the pose-conditioned one, which isn't computed until
     # run_vision_features runs later) so a boundary-triggered resolution
     # still makes it into THIS session's own Sensor Sequencer / timeline output.
-    from cross_camera import run_step_c5, CrossCameraConfig, build_confidence_dict
+    for tid in full_assignment:            # anything new came from the Cosine Resolver
+        provenance.setdefault(tid, "cosine")
+
+    from cross_camera import run_boundary_rendezvous, CrossCameraConfig, build_confidence_dict
     c5_confidence = build_confidence_dict(
         kinetic_corr=kinetic_corr,       # {temp_id -> Pearson r} — NEW, from Kinetic Matcher
         cosine_scores=cosine_scores,     # {temp_id -> cosine}    — NEW, from Cosine Resolver
     )
-    full_assignment, c5_log = run_step_c5(
+    before_boundary = dict(full_assignment)   # run_boundary_rendezvous mutates in place
+    full_assignment, c5_log = run_boundary_rendezvous(
         conn=conn, session_id=args.session, camera_id=camera_id,
         tracks_df=tracks_df, embed_df=embed_df,
         assignment=full_assignment, confidence=c5_confidence,
         config=CrossCameraConfig(), dry_run=args.dry_run,
+        protected_tids={t for t, s in provenance.items() if s in PROTECTED_SOURCES},
     )
     for line in c5_log:
         log(line)
+    for tid, aid in full_assignment.items():
+        if before_boundary.get(tid) != aid:
+            provenance[tid] = "boundary_rendezvous"
 
     # ── Duplicate Resolver — resolve duplicates across all assignments (kinetic+manual+cosine)
     full_assignment, merge_map = resolve_duplicate_assignments(
         assignment   = full_assignment,
-        manual_tids  = set(manual_assignment.keys()),
-        kinetic_tids = set(
-            tid for tid, aid in kinetic_assignment.items()
-            if tid not in manual_assignment
-        ),
+        provenance   = provenance,
         tracks_df    = tracks_df,
         conn         = conn,
         session_id   = args.session,

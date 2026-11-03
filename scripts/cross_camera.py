@@ -22,10 +22,10 @@ Resolver's "Step 1" flat-gallery lookup uses), not the pose-conditioned
 which is after Sensor Sequencer, and Boundary Rendezvous has to finish
 before Sensor Sequencer so a boundary-triggered resolution still makes it
 into this session's own resolved_cow_timeline rows. Pose-conditioned
-gallery ENROLLMENT (see enroll_into_pose_gallery below) is a separate,
-later hook — call it from inside/alongside _update_pose_gallery in
-vision_features/extractor.py, once posture/facing are available, using the
-(posture, facing) pair recorded on each matched boundary_observations row.
+gallery updates need no special handling here: each session updates the
+gallery normally in vision_features/extractor.py's _update_pose_gallery
+(see README, Key Design Decision 22, for why a same-slot "keep the better
+view" rule was dropped).
 
 Integration (reconcile.py, after Cosine Resolver, before Duplicate Resolver):
 
@@ -573,10 +573,17 @@ def run_boundary_rendezvous(
     config: CrossCameraConfig = CrossCameraConfig(),
     dry_run: bool = False,
     motion_corr_fn=None,
+    protected_tids: set | None = None,   # temp_ids whose id came from manual or kinetic
 ) -> tuple[dict, list[str]]:
     """
     Runs Boundary Rendezvous for one session. Returns (updated_assignment, log_lines).
     `assignment` is also mutated in place for convenience.
+
+    `protected_tids` are never overwritten: a manual or collar-confirmed id
+    outranks a cross-camera match (reconcile.SOURCE_PRIORITY). If a boundary
+    match points such a temp_id at a different id, the existing id is kept
+    and the disagreement is logged. Unassigned temp_ids and ones resolved by
+    appearance alone (cosine) can still be set or changed.
 
     Does NOT re-run resolve_duplicate_assignments — the caller (reconcile.py)
     should do that after this returns, same as the existing Duplicate Resolver call,
@@ -656,9 +663,15 @@ def run_boundary_rendezvous(
                 this_tid = a.temp_id if a.camera_id == camera_id else b.temp_id
                 old = assignment.get(this_tid)
                 new = outcome["animal_id"]
-                if old != new:
-                    log.append(f"  [boundary_rendezvous] OVERRIDE t{this_tid}: {old} -> {new} "
-                               f"(reason=step_c5_{outcome['kind']})")
+                if old == new:
+                    continue
+                if protected_tids and this_tid in protected_tids:
+                    log.append(f"  [boundary_rendezvous] KEPT t{this_tid}={old}: partner "
+                               f"camera suggests {new}, but a manual/kinetic id "
+                               f"outranks a boundary match ({outcome['kind']})")
+                    continue
+                log.append(f"  [boundary_rendezvous] OVERRIDE t{this_tid}: {old} -> {new} "
+                           f"(reason={outcome['kind']})")
                 assignment[this_tid] = new
 
     # ── Coverage-based finalization ───────────────────────────────────────────
