@@ -1039,12 +1039,16 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     # ── Upload outputs to Drive ───────────────────────────────────────────────
     log("Uploading session outputs to Drive...")
     dm.sync_db(session_id=session_id)
-    for pq_path in sorted(outdir.glob("embeds_part*.parquet")) + \
-                   sorted(outdir.glob("kps_part*.parquet")):
-        if pq_path.exists():
-            dm.write_file(pq_path, f"outputs/{session_id}/{pq_path.name}",
-                          flag="parquet")
+    remote_dir = f"outputs/{session_id}"
+    pq_files = [p for p in sorted(outdir.glob("embeds_part*.parquet")) +
+                           sorted(outdir.glob("kps_part*.parquet")) if p.exists()]
+    pq_all_uploaded = True
+    for pq_path in pq_files:
+        pq_all_uploaded &= dm.write_file(pq_path, f"{remote_dir}/{pq_path.name}",
+                                         flag="parquet")
 
+    uploaded_crops: list[str] = []
+    crops_all_uploaded = True
     if crops_dir and crops_dir.exists() and not args.crops_local:
         crop_files = sorted(crops_dir.glob("*.jpg"))
         if crop_files:
@@ -1053,13 +1057,36 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             _wf._batch_mode = True
             try:
                 for cf in crop_files:
-                    _wf(cf, f"outputs/{session_id}/crops/{cf.name}",
-                        caller=__file__)
+                    crops_all_uploaded &= _wf(cf, f"{remote_dir}/crops/{cf.name}",
+                                              caller=__file__)
+                    uploaded_crops.append(cf.name)
             finally:
                 _wf._batch_mode = False
             _flush_upload_log()
     elif crops_dir and args.crops_local:
         log(f"crops_local=True — crops kept locally only: {crops_dir}")
+
+    # ── Remove leftovers from an earlier run of this same video ───────────────
+    # session_id is the same every time a video is processed, and this run's
+    # files were just uploaded over outputs/<session_id>/. Anything else there
+    # is from an earlier run: parquet parts beyond this run's count, and crops
+    # (named by temp_id + frame, so a re-run never overwrites them) for
+    # temp_ids that no longer exist in raw_tracks. Remove them so Drive holds
+    # exactly this run's output. Skipped if any upload was buffered for retry:
+    # Drive is then still mid-update, and the next run will clean up instead.
+    if pq_all_uploaded:
+        dm.remove_stale_remote_files(
+            remote_dir, keep=[p.name for p in pq_files],
+            patterns=["embeds_part*.parquet", "kps_part*.parquet"])
+    else:
+        log("Some parquet uploads were buffered — skipping stale-part cleanup on Drive.")
+    if crops_all_uploaded:
+        # Crops not uploaded this run (no --save_crops, or --crops_local) are
+        # still stale if left on Drive from an earlier run: keep=[] removes them.
+        dm.remove_stale_remote_files(
+            f"{remote_dir}/crops", keep=uploaded_crops, patterns=["*.jpg"])
+    else:
+        log("Some crop uploads were buffered — skipping stale-crop cleanup on Drive.")
 
     # ── run reconcile.py ──────────────────────────────────────────────────────
     log("=" * 60)

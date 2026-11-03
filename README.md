@@ -44,6 +44,7 @@ dm.get_session_dir(session_id)                     # → local outputs/<session_
 dm.get_kinetics_path(filename)                     # → local collar_data/<filename>
 dm.get_video_path(path)                            # pass-through — validates local file exists
 dm.write_file(local_path, drive_rel_dest)          # upload with retry + buffer on failure
+dm.remove_stale_remote_files(drive_rel_dir, keep, patterns)  # delete matching Drive files not in keep
 dm.find_collar_files(start_dt, end_dt, "kinetic")  # → list of local paths overlapping session
 dm.load_collar_data(start_dt, end_dt, "kinetic")   # → merged DataFrame of all matching CSVs
 dm.mark_dirty(flag, session_id)                    # set flag before writing
@@ -784,7 +785,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] change day-night logic to grayscale vs rgb
 - [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `SOURCE_PRIORITY` in `reconcile.py`
 - [x] drop camera_id restriction in TempPoseGallery
-- [ ] Delete stale Drive-side parquet parts before re-uploading on reprocess (on session ran on the same video - to remove duplicates \ stale detections)
+- [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
   - [ ] Implement tier-3 motion-magnitude correlation (`motion_corr_fn`) — currently falls through to tier 4
   - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed

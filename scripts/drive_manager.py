@@ -568,6 +568,75 @@ def write_file(local_path: Path, drive_relative_dest: str,
     return False
 
 
+def remove_stale_remote_files(drive_relative_dir: str, keep: "list[str]",
+                              patterns: "list[str]", caller: str = "") -> "list[str] | None":
+    """
+    Delete files in a Drive folder that match `patterns` but are not in `keep`.
+
+    Used after re-processing a video: the new run's files have just been
+    uploaded under outputs/<session_id>/, and anything left over from an
+    earlier run of the same video (parquet parts beyond the new count, crops
+    for temp_ids that no longer exist) is removed so the Drive copy matches
+    exactly what the pipeline last produced.
+
+    drive_relative_dir — folder relative to DRIVE_ROOT, e.g. "outputs/<session_id>"
+    keep               — bare file names to leave alone (this run's uploads)
+    patterns           — fnmatch patterns limiting what may be deleted, e.g.
+                         ["embeds_part*.parquet"]. Files not matching any
+                         pattern are never touched.
+
+    Only looks at files directly in the folder (not subfolders).
+    Returns the list of deleted names ([] if nothing was stale or the folder
+    doesn't exist yet), or None if Drive couldn't be listed or the delete
+    failed — in which case nothing is assumed deleted.
+    """
+    import fnmatch
+    import tempfile
+
+    drive_dir = _drive_path(drive_relative_dir.rstrip("/")) + "/"
+    try:
+        r = subprocess.run(["rclone", "lsf", "--files-only", drive_dir],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        _log(f"remove_stale_remote_files: rclone lsf failed: {e}")
+        return None
+    if r.returncode != 0:
+        if "directory not found" in r.stderr.lower():
+            return []   # first upload for this folder — nothing to clean
+        _log(f"remove_stale_remote_files: could not list {drive_dir}: {r.stderr.strip()}")
+        return None
+
+    keep_set = set(keep)
+    remote = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    stale = [f for f in remote
+             if f not in keep_set and any(fnmatch.fnmatch(f, p) for p in patterns)]
+    if not stale:
+        return []
+
+    # One rclone call for the whole list (crops can number in the hundreds).
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write("\n".join(stale) + "\n")
+        list_path = fh.name
+    try:
+        d = subprocess.run(["rclone", "delete", drive_dir,
+                            "--files-from-raw", list_path],
+                           capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        _log(f"remove_stale_remote_files: rclone delete failed: {e}")
+        return None
+    finally:
+        Path(list_path).unlink(missing_ok=True)
+    if d.returncode != 0:
+        _log(f"remove_stale_remote_files: rclone delete failed in {drive_dir}: "
+             f"{d.stderr.strip()}")
+        return None
+
+    caller_name = Path(caller).name if caller else "unknown"
+    _log(f"Removed {len(stale)} stale file(s) from {drive_dir} ({caller_name})")
+    return stale
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Path helpers (library API used by other scripts)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,6 +1085,11 @@ class DriveManager:
                    flag: str = "") -> bool:
         return write_file(local_path, drive_relative_dest,
                           caller=self.caller, flag=flag)
+
+    def remove_stale_remote_files(self, drive_relative_dir: str, keep: "list[str]",
+                                  patterns: "list[str]") -> "list[str] | None":
+        return remove_stale_remote_files(drive_relative_dir, keep, patterns,
+                                         caller=self.caller)
 
     # ── flag management ──────────────────────────────────────────────────────
 
