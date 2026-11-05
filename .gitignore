@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Windows download metadata (appears when copying files into WSL via Explorer)
+*:Zone.Identifier
+
+# Local data — Google Drive is the source of truth
+.buffer/
+data/
+metrics/
+scripts/metrics.json
+
+# Model weights / training runs — kept on Drive under models/
+models/
