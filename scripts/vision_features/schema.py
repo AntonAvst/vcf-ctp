@@ -1,1100 +1,164 @@
-#!/usr/bin/env python3
 """
-display_tracks.py — browser-based track visualiser (WSLg-compatible)
+vision_features/schema.py
+─────────────────────────
+Canonical definitions for posture labels, facing labels, pose-conditioned gallery
+slot indices, and the column names added to resolved_cow_timeline.
 
-Replaces the X11/SDL2 GUI with a Flask web server that streams annotated
-video as MJPEG and renders sensor charts as PNG via matplotlib.
-No X11, Wayland, or SDL2 required — runs in any Windows browser over localhost.
-
-Usage:  same CLI as before.
-Opens:  http://localhost:5000  (auto-launched in Windows browser)
-Stop:   Ctrl+C in terminal, or click Quit in browser.
+Everything else in the vision_features package imports from here — never hard-codes
+strings or indices directly.
 """
 
-import argparse, json, os, signal as _sig, sqlite3, subprocess, threading, time
-from datetime import timedelta
-from pathlib import Path
-
-import cv2
-import numpy as np
-
-# Vision feature classifiers — live per-frame labels for all temp_ids
-try:
-    import sys as _sys, os as _os
-    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-    from vision_features.features.posture import extract_posture
-    from vision_features.features.facing  import extract_facing
-    from vision_features.schema import Posture, Facing, POSTURE_NAMES, FACING_NAMES
-    _VISION_AVAILABLE = True
-except ImportError:
-    _VISION_AVAILABLE = False
-
-# Drive I/O layer
-from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
-
-# session_id derivation — single source of truth, shared with track_and_dump.py
-from track_and_dump import parse_filename, make_session_id
+from enum import IntEnum
 
 
-# ── optional deps checked at runtime ─────────────────────────────────────────
-try:
-    from flask import Flask, Response, request, jsonify
-except ImportError:
-    print("[viewer] Flask not found.  Run:  pip install flask --break-system-packages")
-    raise
-
-def log(msg):
-    print(f"[viewer] {msg}", flush=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Shared playback state  (video thread writes, Flask threads read)
-# ═══════════════════════════════════════════════════════════════════════════════
-class _State:
-    FF_SPEEDS = [1, 2, 4, 8, 12]
-
-    def __init__(self):
-        self._lock    = threading.Lock()
-        self.paused   = False
-        self.ff_idx   = 0
-        self.ff_speed = 1
-        self.quit     = False
-        self.current_dt = None      # datetime | None — updated by video thread
-        # feature-display toggles (all on by default)
-        self.show_bbox      = True
-        self.show_id        = True
-        self.show_kp        = True
-        self.show_pose      = True
-        self.show_direction = True
-        self.show_mask      = True
-
-    def toggle_pause(self):
-        with self._lock:
-            self.paused = not self.paused
-            return self.paused
-
-    def cycle_ff(self):
-        with self._lock:
-            self.ff_idx   = (self.ff_idx + 1) % len(self.FF_SPEEDS)
-            self.ff_speed = self.FF_SPEEDS[self.ff_idx]
-            return self.ff_speed
-
-    def toggle_feature(self, name):
-        attr = f"show_{name}"
-        with self._lock:
-            if hasattr(self, attr):
-                setattr(self, attr, not getattr(self, attr))
-            return getattr(self, attr, None)
-
-    def do_quit(self):
-        with self._lock:
-            self.quit = True
-
-    def set_dt(self, dt):
-        with self._lock:
-            self.current_dt = dt
-
-    def snapshot(self):
-        with self._lock:
-            return dict(paused=self.paused, ff_speed=self.ff_speed,
-                        quit=self.quit,
-                        show_bbox=self.show_bbox, show_id=self.show_id,
-                        show_kp=self.show_kp, show_pose=self.show_pose,
-                        show_direction=self.show_direction,
-                        show_mask=self.show_mask,
-                        current_dt=self.current_dt.isoformat()
-                        if self.current_dt else None)
-
-STATE = _State()
-
-# Latest annotated JPEG (video thread writes, MJPEG generator reads)
-_latest_jpeg      = None
-_latest_jpeg_lock = threading.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
+# Cameras monitoring the enclosure
+# ─────────────────────────────────────────────────────────────────────────────
+# Cows move freely between these cameras, so cross-session ReID matching
+# (reconcile.py Step C — TempPoseGallery lookups) is NOT restricted to a
+# single camera; it checks every camera below and keeps the best match.
+#
+# track_and_dump.py also uses this exact list (mirrored there as a local
+# constant, same convention as EXPECTED_KP below, since its vision_features
+# import is optional/best-effort) to recognize known camera names reliably
+# when parsing video filenames of the form:
+#   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>].<ext>
+# e.g. "רפת 26_24_S20260616090000_E20260616110000.mp4" -> camera "רפת 26".
+# Keep both lists in sync when a camera is added, renamed, or removed.
+CAMERA_IDS: list[str] = ["רפת 26", "רפת 33", "רפת 38"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Drawing helpers (unchanged from original)
-# ═══════════════════════════════════════════════════════════════════════════════
-def id_color(tid):
-    rng = np.random.default_rng(int(tid) * 123457)
-    c = rng.integers(64, 255, size=3, dtype=np.uint8).tolist()
-    return int(c[0]), int(c[1]), int(c[2])
+# ─────────────────────────────────────────────────────────────────────────────
+# Keypoint index map  (19 kp, matches track_and_dump.py EXPECTED_KP = 19)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def classify_frame_features(d: dict) -> dict | None:
-    """
-    Run posture + facing classifiers on a single detection dict.
-    d must have "kps" (list of 19 (x,y,v) tuples) and "kps_conf" (list[19]).
-    Returns {"posture": str|None, "facing": str|None} or None if unavailable.
-    """
-    if not _VISION_AVAILABLE:
-        return None
-    kps_raw  = d.get("kps")
-    kps_conf = d.get("kps_conf")
-    if not kps_raw or not kps_conf:
-        return None
-    try:
-        # Reshape to (1, 19, 3) and (1, 19) for the vectorised extractors
-        kps_arr  = np.array(kps_raw,  dtype=np.float32).reshape(1, 19, 3)
-        kc_arr   = np.array(kps_conf, dtype=np.float32).reshape(1, 19)
-        bbox_arr = np.array([[d["x1"], d["y1"], d["x2"], d["y2"]]],
-                            dtype=np.float32)
-        det_arr  = np.array([d.get("conf", 1.0)], dtype=np.float32)
-
-        p_out = extract_posture(kps_arr, kc_arr, bbox_arr, det_arr)
-        f_out = extract_facing(kps_arr, kc_arr, bbox_arr,
-                               posture=p_out["posture"])
-
-        posture_label = int(p_out["posture"][0])
-        facing_label  = int(f_out["facing"][0])
-
-        # Return None for uncertain — draw_box omits None parts from the label
-        posture_str = (POSTURE_NAMES[Posture(posture_label)]
-                       if posture_label != int(Posture.UNCERTAIN) else None)
-        facing_str  = (FACING_NAMES[Facing(facing_label)]
-                       if facing_label != int(Facing.UNCERTAIN) else None)
-
-        # Never return the string "uncertain" — treat it as None
-        if posture_str == "uncertain": posture_str = None
-        if facing_str  == "uncertain": facing_str  = None
-
-        # Only return a dict if at least one label is meaningful
-        if posture_str is None and facing_str is None:
-            return None
-        return {"posture": posture_str, "facing": facing_str}
-    except Exception:
-        return None
+class KP(IntEnum):
+    NOSE             = 0
+    FOREHEAD         = 1
+    WITHERS          = 2
+    SPINE_MID        = 3
+    SACRUM           = 4
+    TAIL_BASE        = 5
+    TAIL_TIP         = 6
+    SHOULDER_L       = 7
+    ELBOW_L          = 8
+    FETLOCK_FORE_L   = 9
+    SHOULDER_R       = 10
+    ELBOW_R          = 11
+    FETLOCK_FORE_R   = 12
+    HOCK_R           = 13
+    HOCK_L           = 14
+    FETLOCK_HIND_L   = 15
+    FETLOCK_HIND_R   = 16
+    UDDER_CENTER     = 17
+    NECK             = 18
 
 
-def draw_mask_overlay(img, poly_pts, color, alpha=0.35, outline_thickness=1):
-    """
-    Fill a segmentation mask polygon with a translucent color, plus a thin
-    outline. QA/visualization only — poly_pts is a list of [x,y] pixel
-    coordinates in original-frame space (from track_and_dump.py's
-    qa_masks/masks_part*.parquet, decoded from JSON).
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-frame label enums
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Drawn as a separate alpha-blended layer so it never fully occludes the
-    frame underneath, and so draw_box()'s outline/label pills (called after
-    this) render cleanly on top.
-    """
-    if not poly_pts or len(poly_pts) < 3:
-        return
-    pts = np.array(poly_pts, dtype=np.int32).reshape(-1, 1, 2)
-    overlay = img.copy()
-    cv2.fillPoly(overlay, [pts], color)
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
-    cv2.polylines(img, [pts], isClosed=True, color=color,
-                  thickness=outline_thickness, lineType=cv2.LINE_AA)
+class Posture(IntEnum):
+    UNCERTAIN = 0
+    STANDING  = 1
+    LYING     = 2
 
 
-def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None,
-             show_bbox=True, show_id=True, show_pose=True, show_direction=True):
-    """
-    Draw bounding box with a two-line label stack above it:
-        Line 1 (top)    — vision features: posture · facing  (only when available)
-        Line 2 (bottom) — identity: "cow 6366 (t2)"  or  "id 2"
-    conf is accepted for API compatibility but never displayed.
-
-    features: dict with optional keys:
-        "posture" : str  e.g. "standing" | "lying"   (shown only if show_pose)
-        "facing"  : str  e.g. "left" | "right" | "toward" | "away"  (shown only if show_direction)
-
-    show_bbox/show_id/show_pose/show_direction independently gate each visual element.
-    """
-    color = id_color(tid)
-    x1,y1,x2,y2 = [int(round(float(v))) for v in (x1,y1,x2,y2)]
-    if show_bbox:
-        cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
-
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    id_scale  = 0.55
-    ft_scale  = 0.48
-    pad       = 4
-
-    # ── identity label ────────────────────────────────────────────────────────
-    id_y0 = y1
-    if show_id:
-        id_lbl = (f"cow {animal_id} (t{int(tid)})" if animal_id is not None
-                  else f"id {int(tid)}")
-        (id_w, id_h), _ = cv2.getTextSize(id_lbl, font, id_scale, 2)
-        id_pill_h = id_h + pad * 2
-        id_y0     = max(0, y1 - id_pill_h)
-        cv2.rectangle(img, (x1, id_y0), (x1 + id_w + pad*2, id_y0 + id_pill_h), color, -1)
-        cv2.putText(img, id_lbl, (x1 + pad, id_y0 + id_h + pad - 1),
-                    font, id_scale, (0,0,0), 2, cv2.LINE_AA)
-
-    # ── features label (posture · facing) ────────────────────────────────────
-    feat_parts = []
-    if features:
-        if show_pose      and features.get("posture"): feat_parts.append(features["posture"])
-        if show_direction and features.get("facing"):  feat_parts.append(features["facing"])
-    if feat_parts:
-        ft_lbl = "  ·  ".join(feat_parts)
-        (ft_w, ft_h), _ = cv2.getTextSize(ft_lbl, font, ft_scale, 1)
-        ft_pill_h = ft_h + pad * 2
-        ft_y0     = max(0, id_y0 - ft_pill_h)
-        # slightly darker version of the track colour
-        dark = tuple(max(0, int(c * 0.60)) for c in color)
-        cv2.rectangle(img, (x1, ft_y0), (x1 + ft_w + pad*2, ft_y0 + ft_pill_h), dark, -1)
-        cv2.putText(img, ft_lbl, (x1 + pad, ft_y0 + ft_h + pad - 1),
-                    font, ft_scale, (255,255,255), 1, cv2.LINE_AA)
-
-BASE_EDGES = [(0,1),(1,18),(18,2),(2,3),(3,4),(4,5),(5,6),
-              (2,7),(7,8),(8,9),(2,10),(10,11),(11,12),
-              (4,14),(14,15),(4,13),(13,16),(4,17)]
-CUSTOM_EDGES = [(2,10),(10,12),(4,17),(14,15),(13,16)]
-EDGE_SET = set(tuple(sorted(e)) for e in BASE_EDGES)
-for e in CUSTOM_EDGES: EDGE_SET.add(tuple(sorted(e)))
-EDGES = list(EDGE_SET)
-
-def draw_pose(img, kps_xyv, color, kps_conf=None, kp_radius=3, sk_thickness=2,
-              kp_thresh=0.0, kp_conf_thresh=0.30, hide_lowconf=False,
-              show_index=False, index_scale=0.45, index_thickness=1, index_offset=6,
-              show_kp=True, show_skeleton=True):
-    K = len(kps_xyv)
-    mask = [False]*K
-    for i in range(K):
-        x,y,v = kps_xyv[i]
-        if v is None or float(v)<=kp_thresh: continue
-        if hide_lowconf and kps_conf and i<len(kps_conf):
-            try:
-                if float(kps_conf[i])<kp_conf_thresh: continue
-            except: pass
-        mask[i]=True
-    if show_kp:
-        for i in range(K):
-            if not mask[i]: continue
-            x,y,_ = kps_xyv[i]
-            xi,yi = int(round(x)),int(round(y))
-            cv2.circle(img,(xi,yi),kp_radius,color,-1,lineType=cv2.LINE_AA)
-            if show_index:
-                s = str(i)
-                cv2.putText(img,s,(xi+index_offset,yi-index_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX,index_scale,(0,0,0),index_thickness+2,cv2.LINE_AA)
-                cv2.putText(img,s,(xi+index_offset,yi-index_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX,index_scale,(255,255,255),index_thickness,cv2.LINE_AA)
-    if show_skeleton:
-        for (i,j) in EDGES:
-            if i<K and j<K and mask[i] and mask[j]:
-                xi,yi,_ = kps_xyv[i]; xj,yj,_ = kps_xyv[j]
-                cv2.line(img,(int(round(xi)),int(round(yi))),(int(round(xj)),int(round(yj))),
-                         color,sk_thickness,lineType=cv2.LINE_AA)
+class Facing(IntEnum):
+    UNCERTAIN = 0
+    LEFT      = 1
+    RIGHT     = 2
+    TOWARD    = 3   # nose pointed toward camera (small bbox, facing viewer)
+    AWAY      = 4   # nose pointed away from camera
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SQLite track stream  (unchanged)
-# ═══════════════════════════════════════════════════════════════════════════════
-def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parquet_path="",
-                  want_masks=False, masks_parquet_path=""):
-    import pandas as pd
-    from datetime import datetime as _dt
+# Human-readable names — used for logging and gallery .npy keys
+POSTURE_NAMES = {
+    Posture.UNCERTAIN: "uncertain",
+    Posture.STANDING:  "standing",
+    Posture.LYING:     "lying",
+}
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    kps_df = None
-    if want_pose and kps_parquet_path:
-        kps_dir  = Path(kps_parquet_path).parent
-        kps_stem = Path(kps_parquet_path).name  # e.g. "kps.parquet" (ignored if parts exist)
-        # Collect all part files (kps_part000.parquet, …) or fall back to the exact path
-        part_files = sorted(kps_dir.glob("kps_part*.parquet"))
-        if not part_files and Path(kps_parquet_path).exists():
-            part_files = [Path(kps_parquet_path)]
-        if part_files:
-            kps_df = pd.concat([pd.read_parquet(str(p)) for p in part_files], ignore_index=True)
-            kps_df = kps_df[kps_df["session_id"]==session_id].copy()
-            kps_df["frame_index"] = kps_df["frame_index"].astype(int)
-            kps_df["temp_id"]     = kps_df["temp_id"].astype(int)
-            kps_df = kps_df.set_index(["frame_index","temp_id"])
-            log(f"kps parquet loaded: {len(part_files)} part(s), {len(kps_df)} rows for session")
-        else:
-            log(f"WARNING: no kps parquet files found in {kps_dir}")
-
-    masks_df = None
-    if want_masks and masks_parquet_path:
-        masks_dir = Path(masks_parquet_path).parent
-        # QA-only files, written by track_and_dump.py --save_masks to qa_masks/
-        # (local disk only — never on Drive, never in the main DB).
-        part_files = sorted(masks_dir.glob("masks_part*.parquet"))
-        if not part_files and Path(masks_parquet_path).exists():
-            part_files = [Path(masks_parquet_path)]
-        if part_files:
-            masks_df = pd.concat([pd.read_parquet(str(p)) for p in part_files], ignore_index=True)
-            masks_df = masks_df[masks_df["session_id"]==session_id].copy()
-            masks_df["frame_index"] = masks_df["frame_index"].astype(int)
-            masks_df["temp_id"]     = masks_df["temp_id"].astype(int)
-            masks_df = masks_df.set_index(["frame_index","temp_id"])
-            log(f"masks parquet loaded: {len(part_files)} part(s), {len(masks_df)} rows for session")
-        else:
-            log(f"--draw_masks set but no qa_masks/masks_part*.parquet found in {masks_dir} "
-                f"(re-run track_and_dump.py with --save_masks to generate it)")
-    try:
-        rows = conn.execute("""
-            SELECT frame_index,frame_datetime,temp_id,det_conf,x1,y1,x2,y2,kps_conf,kps_parquet_row
-            FROM raw_tracks WHERE session_id=? AND frame_index>=?
-            ORDER BY frame_index,temp_id""", (session_id,start_frame)).fetchall()
-        has_dt=True
-    except sqlite3.OperationalError:
-        rows = conn.execute("""
-            SELECT frame_index,temp_id,det_conf,x1,y1,x2,y2,kps_conf,kps_parquet_row
-            FROM raw_tracks WHERE session_id=? AND frame_index>=?
-            ORDER BY frame_index,temp_id""", (session_id,start_frame)).fetchall()
-        has_dt=False
-    conn.close()
-    cur_fi=cur_fdt=None; bucket=[]
-    for row in rows:
-        fi=row["frame_index"]; fdt=None
-        if has_dt:
-            r=row["frame_datetime"]
-            if r:
-                try: fdt=(_dt.utcfromtimestamp(r) if isinstance(r,(int,float)) else _dt.fromisoformat(str(r)))
-                except: pass
-        if cur_fi is None: cur_fi,cur_fdt=fi,fdt
-        if fi!=cur_fi:
-            yield cur_fi,cur_fdt,bucket; bucket=[]; cur_fi,cur_fdt=fi,fdt
-        d={"temp_id":row["temp_id"] if row["temp_id"] is not None else -1,
-           "conf":row["det_conf"] or 0.0,
-           "x1":row["x1"],"y1":row["y1"],"x2":row["x2"],"y2":row["y2"]}
-        if want_pose and kps_df is not None:
-            try:
-                krow=kps_df.loc[(fi,row["temp_id"])]
-                flat=list(krow["kps"])
-                if len(flat)%3==0:
-                    d["kps"]=[(flat[i],flat[i+1],flat[i+2]) for i in range(0,len(flat),3)]
-                    d["kps_conf"]=list(krow["kps_kconf"])
-            except: pass
-        if want_masks and masks_df is not None:
-            try:
-                mrow = masks_df.loc[(fi, row["temp_id"])]
-                poly_json = mrow["mask_poly_json"]
-                if poly_json:
-                    d["mask_poly"] = json.loads(poly_json)
-            except: pass
-        bucket.append(d)
-    if bucket: yield cur_fi,cur_fdt,bucket
+FACING_NAMES = {
+    Facing.UNCERTAIN: "uncertain",
+    Facing.LEFT:      "left",
+    Facing.RIGHT:     "right",
+    Facing.TOWARD:    "toward",
+    Facing.AWAY:      "away",
+}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Vision features  (loaded once from resolved_cow_timeline)
-# ═══════════════════════════════════════════════════════════════════════════════
-def load_vision_features(db_path: str, session_id: str) -> dict:
-    """
-    Load posture + facing features from resolved_cow_timeline for this session.
+# ─────────────────────────────────────────────────────────────────────────────
+# Pose-conditioned gallery slots
+#
+# 8 slots = {standing, lying} × {left, right, toward, away}
+# Slot index is the canonical key used in gallery .npy files
+#   gallery_pose_day.npy  → shape (N_cows, 8, 128)
+#   gallery_pose_night.npy → shape (N_cows, 8, 128)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns nested dict:
-        { real_id (int) -> { window_start_dt (datetime) -> {"posture": str, "facing": str} } }
-
-    Returns empty dict if the vision columns don't exist yet (pre-migration DB).
-    """
-    from datetime import datetime as _dt
-    result = {}
-    try:
-        conn = sqlite3.connect(db_path)
-        rows = conn.execute("""
-            SELECT real_id, window_start_dt, facing_dominant, lying_fraction
-            FROM   resolved_cow_timeline
-            WHERE  session_id = ?
-              AND  (facing_dominant IS NOT NULL OR lying_fraction IS NOT NULL)
-        """, (session_id,)).fetchall()
-        conn.close()
-        for real_id, win_dt_str, facing, lying_frac in rows:
-            if real_id is None:
-                continue
-            try:
-                win_dt = _dt.fromisoformat(str(win_dt_str))
-            except Exception:
-                continue
-            posture = None
-            if lying_frac is not None:
-                posture = "lying" if float(lying_frac) >= 0.5 else "standing"
-            # Sanitise: treat "uncertain" and empty string as None
-            clean_facing = facing if (facing and facing != "uncertain") else None
-            result.setdefault(int(real_id), {})[win_dt] = {
-                "posture": posture,
-                "facing":  clean_facing,
-            }
-        log(f"Vision features loaded: {sum(len(v) for v in result.values())} windows "
-            f"across {len(result)} cows")
-    except sqlite3.OperationalError:
-        log("Vision feature columns not yet in DB — labels will be omitted")
-    return result
-
-
-def get_features_for(vision_index: dict, real_id: int, frame_dt) -> dict | None:
-    """
-    Look up vision features for a cow at a given frame datetime.
-    Finds the most recent window that started at or before frame_dt.
-    Returns None if no data available.
-    """
-    if real_id is None or real_id not in vision_index or frame_dt is None:
-        return None
-    windows = vision_index[real_id]
-    best = None
-    for win_dt in windows:
-        if win_dt <= frame_dt:
-            if best is None or win_dt > best:
-                best = win_dt
-    return windows[best] if best is not None else None
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sensor data  (loaded once into DataFrames)
-# ═══════════════════════════════════════════════════════════════════════════════
-def load_sensor_data(kin_df, beh_df):
-    """
-    Build the {AnimalId -> indexed DataFrame} sensor lookup used for the
-    live sensor chart overlay. Accepts DataFrames (as returned by
-    drive_manager.load_collar_data) rather than file paths — sensor CSVs
-    are always auto-discovered from Drive by session time window, never
-    passed in as a manual path.
-    """
-    import pandas as pd
-    frames={}
-    if kin_df is not None and not kin_df.empty:
-        kdf=kin_df.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
-        for col in ["KineticsCountX","KineticsCountY","KineticsCountZ","KineticsCountR"]:
-            kdf[f"d{col.replace('KineticsCount','Kin')}"]=kdf.groupby("AnimalId")[col].diff()
-        for aid,grp in kdf.groupby("AnimalId"):
-            frames[int(aid)]=grp.set_index("datetime").sort_index()
-    if beh_df is not None and not beh_df.empty:
-        bdf=beh_df.sort_values(["AnimalId","datetime"]).reset_index(drop=True)
-        for aid,grp in bdf.groupby("AnimalId"):
-            aid=int(aid)
-            sub=grp.set_index("datetime")[["f_1_2","f_2_3","v"]].sort_index()
-            frames[aid]=(frames[aid].join(sub,how="outer").sort_index() if aid in frames else sub)
-    return frames
-
-SENSOR_DATA   = {}   # aid → DataFrame
-SENSOR_AIDS   = []   # sorted list of animal ids
-_SENSOR_LOCK  = threading.Lock()   # guards matplotlib figure generation
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sensor chart PNG generator
-# ═══════════════════════════════════════════════════════════════════════════════
-_SIGNAL_META = [
-    ("f_1_2",  "f₁₂",  "Behaviour · f₁₂"),
-    ("f_2_3",  "f₂₃",  "Behaviour · f₂₃"),
-    ("v",      "v",    "Behaviour · v"),
-    ("dKinX",  "ΔKinX","Kinetics · ΔX"),
-    ("dKinY",  "ΔKinY","Kinetics · ΔY"),
-    ("dKinZ",  "ΔKinZ","Kinetics · ΔZ"),
-    ("dKinR",  "ΔKinR","Kinetics · ΔR"),
+# Ordered list of (posture, facing) pairs — the index in this list IS the slot index.
+# UNCERTAIN posture/facing frames are never assigned to a slot.
+GALLERY_SLOTS: list[tuple[Posture, Facing]] = [
+    (Posture.STANDING, Facing.LEFT),    # slot 0
+    (Posture.STANDING, Facing.RIGHT),   # slot 1
+    (Posture.STANDING, Facing.TOWARD),  # slot 2
+    (Posture.STANDING, Facing.AWAY),    # slot 3
+    (Posture.LYING,    Facing.LEFT),    # slot 4
+    (Posture.LYING,    Facing.RIGHT),   # slot 5
+    (Posture.LYING,    Facing.TOWARD),  # slot 6
+    (Posture.LYING,    Facing.AWAY),    # slot 7
 ]
-_LINE_COLORS = ["#89b4fa","#cba6f7","#a6e3a1","#fab387","#f9e2af","#89dceb","#f38ba8"]
-_PLOT_BG  = "#181825"
-_BG       = "#1e1e2e"
-_MUTED    = "#6c7086"
-_OVERLAY  = "#45475a"
-_CURSOR   = "#f38ba8"
 
-def render_sensor_png(aid: int, now_dt, lookback_hours: float) -> bytes:
-    """Generate a 7-panel sensor chart and return it as PNG bytes."""
-    import io, matplotlib
-    matplotlib.use("Agg")   # non-interactive backend — no display needed
-    from matplotlib.figure import Figure
-    import matplotlib.dates as mdates
+N_SLOTS = len(GALLERY_SLOTS)   # 8
 
-    df = SENSOR_DATA.get(int(aid))
-    lookback  = timedelta(hours=lookback_hours)
-    win_start = now_dt - lookback
-    win_end   = now_dt
-    right_pad = lookback * 0.04
-
-    n = len(_SIGNAL_META)
-    with _SENSOR_LOCK:
-        fig = Figure(figsize=(12, 8), facecolor=_PLOT_BG)
-        fig.subplots_adjust(hspace=0.06, top=0.97, bottom=0.07, left=0.07, right=0.97)
-        shared_ax = None
-        axes = []
-        for i in range(n):
-            ax = fig.add_subplot(n, 1, i+1, sharex=shared_ax)
-            if shared_ax is None: shared_ax = ax
-            axes.append(ax)
-
-        for i,(ax,color,(col,ylabel,title)) in enumerate(zip(axes,_LINE_COLORS,_SIGNAL_META)):
-            ax.set_facecolor(_PLOT_BG)
-            ax.tick_params(colors=_MUTED, labelsize=7)
-            ax.spines[:].set_color(_OVERLAY)
-            ax.set_ylabel(ylabel, fontsize=8, color=_MUTED)
-            ax.set_title(title, fontsize=8, color=_MUTED, loc="left", pad=2)
-            ax.yaxis.grid(True, color=_OVERLAY, linewidth=0.5, linestyle="--")
-            ax.set_axisbelow(True)
-            if i < n-1: ax.tick_params(labelbottom=False)
-
-            if df is not None and col in df.columns:
-                series = df[col].loc[:win_end].dropna()
-                if not series.empty:
-                    ax.plot(series.index, series.values, color=color, linewidth=1.1, alpha=0.92)
-                    ax.fill_between(series.index, series.values, alpha=0.10, color=color)
-
-            ax.axvline(x=now_dt, color=_CURSOR, linewidth=1.4, linestyle="--", alpha=0.85, zorder=10)
-            ax.set_xlim(win_start, win_end+right_pad)
-
-            if df is not None and col in df.columns:
-                vis = df[col].loc[win_start:win_end].dropna()
-                if not vis.empty:
-                    lo,hi = vis.min(),vis.max()
-                    m = max((hi-lo)*0.12, abs(hi)*0.05, 1e-6)
-                    ax.set_ylim(lo-m, hi+m)
-
-        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%m-%d\n%H:%M"))
-        axes[-1].tick_params(axis="x", labelsize=7, colors=_MUTED)
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", facecolor=_PLOT_BG, dpi=110)
-        fig.clf()
-
-    buf.seek(0)
-    return buf.read()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Flask app  (runs in main thread via app.run)
-# ═══════════════════════════════════════════════════════════════════════════════
-app = Flask(__name__, static_folder=None)
-app.logger.disabled = True
-import logging; logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
-HTML_PAGE = r"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Display Tracks</title>
-<style>
-* { box-sizing: border-box; margin:0; padding:0; }
-body { background:#1e1e2e; color:#cdd6f4; font-family:Helvetica,sans-serif;
-       display:flex; flex-direction:column; height:100vh; overflow:hidden; }
-#top  { display:flex; flex:1; overflow:hidden; }
-#vid  { flex:0 0 auto; padding:8px; display:flex; align-items:flex-start; }
-#vid img { border:2px solid #45475a; max-height:calc(100vh - 60px); width:auto; }
-#sensor { flex:1; padding:8px; overflow:hidden; display:flex; flex-direction:column; }
-#animalRow { display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; align-items:center; }
-#sensorImg { flex:1; overflow:hidden; }
-#sensorImg img { width:100%; height:100%; object-fit:contain; }
-#bar { background:#313244; padding:8px 14px; display:flex; gap:10px;
-       align-items:center; height:52px; flex-shrink:0; }
-button { background:#45475a; color:#cdd6f4; border:none; padding:8px 18px;
-         font-size:13px; cursor:pointer; border-radius:4px; }
-button:hover { background:#585b70; }
-button.active { background:#a6e3a1; color:#1e1e2e; }
-.abtn { background:#89b4fa; color:#1e1e2e; font-weight:bold; border-radius:4px;
-        padding:6px 14px; cursor:pointer; border:none; }
-.abtn.sel { background:#a6e3a1; }
-#clock { color:#89b4fa; font-weight:bold; margin-left:auto; font-size:13px; }
-#ffLabel { color:#cdd6f4; font-size:13px; }
-#qbtn   { color:#f38ba8; }
-#status { font-size:11px; color:#6c7086; }
-</style>
-</head>
-<body>
-<div id="top">
-  <div id="vid">
-    <img id="vstream" src="/video" alt="video stream">
-  </div>
-  <div id="sensor">
-    <div id="animalRow">
-      <span style="color:#6c7086;font-size:12px;">Animal ID:</span>
-      <!-- buttons injected by JS -->
-    </div>
-    <div id="sensorImg">
-      <img id="simg" src="" alt="select an animal" style="display:none">
-      <span id="noSensor" style="color:#6c7086;font-size:13px;">← select an animal to see sensor data</span>
-    </div>
-  </div>
-</div>
-<div id="bar">
-  <button id="pauseBtn" onclick="togglePause()">⏸ Pause</button>
-  <button onclick="cycleFF()">⏩ Fast Forward</button>
-  <span id="ffLabel">Speed: 1×</span>
-  <button id="t_bbox"      class="active" onclick="toggleFeature('bbox')">▭ Bbox</button>
-  <button id="t_id"        class="active" onclick="toggleFeature('id')">🏷 ID</button>
-  <button id="t_kp"        class="active" onclick="toggleFeature('kp')">• Keypoints</button>
-  <button id="t_pose"      class="active" onclick="toggleFeature('pose')">🦴 Pose</button>
-  <button id="t_direction" class="active" onclick="toggleFeature('direction')">🧭 Direction</button>
-  <button id="t_mask"      class="active" onclick="toggleFeature('mask')">🎭 Mask</button>
-  <button id="qbtn" onclick="doQuit()">⏹ Quit</button>
-  <span id="clock"></span>
-  <span id="status"></span>
-</div>
-<script>
-let selectedAid = null;
-let sensorTimer = null;
-const LOOKBACK = 2.0;
-
-// ── populate animal buttons ──────────────────────────────────────────────────
-fetch('/api/animals').then(r=>r.json()).then(aids=>{
-  const row = document.getElementById('animalRow');
-  aids.forEach(aid=>{
-    const b = document.createElement('button');
-    b.className='abtn'; b.textContent=aid; b.id='abtn_'+aid;
-    b.onclick=()=>selectAnimal(aid);
-    row.appendChild(b);
-  });
-});
-
-function selectAnimal(aid){
-  selectedAid = aid;
-  document.querySelectorAll('.abtn').forEach(b=>b.classList.remove('sel'));
-  const btn = document.getElementById('abtn_'+aid);
-  if(btn) btn.classList.add('sel');
-  document.getElementById('noSensor').style.display='none';
-  document.getElementById('simg').style.display='block';
-  refreshSensor();
+# Quick lookup: (posture, facing) → slot index
+SLOT_INDEX: dict[tuple[Posture, Facing], int] = {
+    pair: idx for idx, pair in enumerate(GALLERY_SLOTS)
 }
 
-function refreshSensor(){
-  if(!selectedAid) return;
-  fetch('/api/status').then(r=>r.json()).then(s=>{
-    if(!s.current_dt) return;
-    const url = `/api/sensor_chart?aid=${selectedAid}&lookback=${LOOKBACK}&_t=${Date.now()}`;
-    document.getElementById('simg').src = url;
-  });
-}
-
-// ── status polling ───────────────────────────────────────────────────────────
-let paused=false;
-const FEATURES = ['bbox','id','kp','pose','direction','mask'];
-setInterval(()=>{
-  fetch('/api/status').then(r=>r.json()).then(s=>{
-    paused = s.paused;
-    document.getElementById('pauseBtn').textContent = s.paused ? '▶ Resume' : '⏸ Pause';
-    document.getElementById('pauseBtn').classList.toggle('active', s.paused);
-    document.getElementById('ffLabel').textContent = `Speed: ${s.ff_speed}×`;
-    FEATURES.forEach(f=>{
-      document.getElementById('t_'+f).classList.toggle('active', !!s['show_'+f]);
-    });
-    if(s.current_dt) document.getElementById('clock').textContent = '▶  '+s.current_dt.replace('T',' ').slice(0,19);
-    if(s.quit){ document.getElementById('status').textContent='[stopped]'; }
-  }).catch(()=>{});
-}, 500);
-
-// sensor refresh every 3s
-setInterval(refreshSensor, 3000);
-
-// ── controls ─────────────────────────────────────────────────────────────────
-function togglePause(){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'pause'})}); }
-function cycleFF()    { fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'ff'})}); }
-function toggleFeature(name){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'toggle_'+name})}); }
-function doQuit()     { fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'quit'})}); }
-</script>
-</body>
-</html>"""
-
-@app.route("/")
-def index():
-    return HTML_PAGE
-
-@app.route("/video")
-def video():
-    def generate():
-        last = None
-        while True:
-            with _latest_jpeg_lock:
-                jpeg = _latest_jpeg
-            if jpeg is None or jpeg is last:
-                time.sleep(0.02)
-                continue
-            last = jpeg
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
-            time.sleep(0.02)
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-@app.route("/api/animals")
-def api_animals():
-    return jsonify(SENSOR_AIDS)
-
-@app.route("/api/status")
-def api_status():
-    return jsonify(STATE.snapshot())
-
-@app.route("/api/control", methods=["POST"])
-def api_control():
-    action = request.json.get("action","")
-    if action=="pause":   STATE.toggle_pause()
-    elif action=="ff":    STATE.cycle_ff()
-    elif action=="quit":  STATE.do_quit()
-    elif action.startswith("toggle_"):
-        STATE.toggle_feature(action[len("toggle_"):])
-    return jsonify({"ok":True})
-
-@app.route("/api/sensor_chart")
-def api_sensor_chart():
-    try:
-        aid   = int(request.args.get("aid",-1))
-        lb    = float(request.args.get("lookback",2.0))
-        now   = STATE.snapshot()["current_dt"]
-        if now is None:
-            return Response(b"", mimetype="image/png")
-        from datetime import datetime as _dt
-        now_dt = _dt.fromisoformat(now)
-        png = render_sensor_png(aid, now_dt, lb)
-        return Response(png, mimetype="image/png",
-                        headers={"Cache-Control":"no-store"})
-    except Exception as e:
-        log(f"sensor_chart error: {e}")
-        return Response(b"", mimetype="image/png")
+# Human-readable slot names — used for logging
+SLOT_NAMES: list[str] = [
+    f"{POSTURE_NAMES[p]}_{FACING_NAMES[f]}" for p, f in GALLERY_SLOTS
+]   # e.g. ["standing_left", "standing_right", ..., "lying_away"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Video loop  (background thread)
-# ═══════════════════════════════════════════════════════════════════════════════
-def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None, db_path=None):
-    global _latest_jpeg
-
-    vid = Path(args.video)
-    db = Path(db_path)   # always supplied by main() — no CLI fallback (no --db arg exists)
-    kps_pq   = str(db.parent / "outputs" / args.session_id / "kps.parquet")
-    masks_pq = str(db.parent / "outputs" / args.session_id / "qa_masks" / "masks.parquet")
-
-    cap = cv2.VideoCapture(str(vid))
-    if not cap.isOpened():
-        log(f"Cannot open video: {vid}"); return
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    W   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    log(f"Video: {W}x{H} @ {fps:.2f} fps")
-
-    row_stream = stream_sqlite(str(db), args.session_id,
-                               start_frame=args.start,
-                               want_pose=args.draw_pose,
-                               kps_parquet_path=kps_pq,
-                               want_masks=args.draw_masks,
-                               masks_parquet_path=masks_pq)
-    try:
-        next_fi, next_fdt, next_rows = next(row_stream)
-        log(f"First track frame_index: {next_fi}  rows: {len(next_rows)}")
-    except StopIteration:
-        log("No tracks found."); cap.release(); return
-
-    if args.start > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, args.start)
-    frame_idx   = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-    current_fdt = None
-    stream_done = False
-    n_frames    = 0
-
-    kp_thresh_eff = args.kp_thresh
-    if args.hide_occluded: kp_thresh_eff = max(kp_thresh_eff, 0.5)
-
-    # target ~25 fps output to browser (don't saturate the MJPEG stream)
-    _frame_interval = 1.0 / min(fps, 25.0)
-
-    # carry-forward cache: tid -> last known detection dict (bbox + kps)
-    # keeps boxes and poses visible on non-sampled frames
-    det_cache = {}
-
-    while True:
-        if STATE.quit: break
-
-        if STATE.paused:
-            time.sleep(0.05)
-            continue
-
-        _snap = STATE.snapshot()
-        ff_speed        = _snap["ff_speed"]
-        _show_bbox      = _snap["show_bbox"]
-        _show_id        = _snap["show_id"]
-        _show_kp        = _snap["show_kp"]
-        _show_pose      = _snap["show_pose"]
-        _show_direction = _snap["show_direction"]
-        _show_mask      = _snap["show_mask"]
-
-        # ── advance past any fast-forwarded frames FIRST, then read the one
-        # frame we are actually going to display. Previously cap.read() ran
-        # before this loop, so `frame` held an old image while `frame_idx`
-        # kept climbing underneath it — every ff grab desynced the overlay
-        # from the picture by up to (ff_speed-1) frames. ──────────────────
-        if ff_speed > 1:
-            for _ in range(ff_speed-1):
-                if not cap.grab(): break
-                frame_idx+=1; n_frames+=1
-                if args.limit>0 and n_frames>=args.limit: break
-
-        ok, frame = cap.read()
-        if not ok:
-            log("End of video."); break
-
-        # ── catch the track stream up to (at most) frame_idx, keeping the
-        # MOST RECENT sample seen along the way. The old code required
-        # next_fi == frame_idx exactly to ever touch det_cache — any sample
-        # whose frame_index didn't land exactly on frame_idx (guaranteed
-        # whenever ff_speed>1, since frame_idx then jumps in steps of
-        # ff_speed, and also possible at 1x since samples are spaced by
-        # --save_every and aren't guaranteed to align) was fetched from
-        # row_stream and then silently thrown away. That's why boxes froze
-        # (cache never refreshed) and then appeared to "taper off" — a much
-        # later sample would eventually land exactly on frame_idx and wipe
-        # out every tid not present in that single late sample at once. ──
-        got_fresh  = False
-        fresh_rows = None
-        fresh_fdt  = None
-        if not stream_done:
-            while next_fi <= frame_idx:
-                fresh_rows, fresh_fdt, got_fresh = next_rows, next_fdt, True
-                try:
-                    next_fi, next_fdt, next_rows = next(row_stream)
-                except StopIteration:
-                    stream_done = True
-                    break
-
-        if got_fresh:
-            dets = fresh_rows
-            if fresh_fdt is not None: current_fdt = fresh_fdt
-            # update det_cache with fresh data for this sample
-            # evict tids that are no longer present in this sample
-            active_tids = {int(d["temp_id"]) for d in dets}
-            for tid in list(det_cache.keys()):
-                if tid not in active_tids:
-                    del det_cache[tid]
-            for d in dets:
-                det_cache[int(d["temp_id"])] = d
-        else:
-            # no new sample since the last one — reuse cached detections so
-            # nothing flickers between sample windows
-            dets = list(det_cache.values())
-
-        if session_start_dt is not None:
-            current_fdt = session_start_dt + timedelta(seconds=frame_idx/fps)
-        if current_fdt: STATE.set_dt(current_fdt)
-
-        for d in dets:
-            _aid = assignment.get(int(d["temp_id"]))
-
-            # Live classification (all temp_ids, requires --draw_pose / kps loaded)
-            _feats = classify_frame_features(d) if d.get("kps") else None
-
-            # Fall back to DB lookup for resolved cows when live classify unavailable
-            if _feats is None and _aid is not None:
-                _feats = get_features_for(vision_index or {}, _aid, current_fdt)
-
-            if args.draw_masks and _show_mask and d.get("mask_poly"):
-                draw_mask_overlay(frame, d["mask_poly"],
-                                  color=id_color(int(d["temp_id"])))
-            draw_box(frame, d["x1"], d["y1"], d["x2"], d["y2"],
-                     d["temp_id"], d["conf"],
-                     animal_id=_aid, features=_feats,
-                     show_bbox=_show_bbox, show_id=_show_id,
-                     show_pose=_show_pose, show_direction=_show_direction)
-            if args.draw_pose and d.get("kps") and (_show_kp or _show_pose):
-                draw_pose(frame,d["kps"],
-                          color=id_color(int(d["temp_id"])),
-                          kps_conf=d.get("kps_conf"),
-                          kp_radius=args.kp_radius,
-                          sk_thickness=args.sk_thickness,
-                          kp_thresh=kp_thresh_eff,
-                          kp_conf_thresh=args.kp_conf_thresh,
-                          hide_lowconf=(not args.show_lowconf),
-                          show_index=args.kp_index,
-                          show_kp=_show_kp,
-                          show_skeleton=_show_pose,
-                          index_scale=args.kp_index_scale,
-                          index_thickness=args.kp_index_thickness,
-                          index_offset=args.kp_index_offset)
-
-        if ff_speed>1:
-            lbl=f">> {ff_speed}x"
-            (sw,sh),_=cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,1.1,3)
-            sx,sy=frame.shape[1]-sw-14,38
-            cv2.putText(frame,lbl,(sx,sy),cv2.FONT_HERSHEY_SIMPLEX,1.1,(0,0,0),4,cv2.LINE_AA)
-            cv2.putText(frame,lbl,(sx,sy),cv2.FONT_HERSHEY_SIMPLEX,1.1,(0,220,255),2,cv2.LINE_AA)
-
-        # encode to JPEG and publish
-        ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if ok2:
-            with _latest_jpeg_lock:
-                _latest_jpeg = buf.tobytes()
-
-        frame_idx+=1; n_frames+=1
-        if args.limit>0 and n_frames>=args.limit:
-            log("Limit reached."); break
-
-        time.sleep(_frame_interval / max(ff_speed,1))
-
-    cap.release()
-    log("Video loop done.")
+def slot_name(slot_idx: int) -> str:
+    """Return human-readable name for a slot index, e.g. 'standing_left'."""
+    return SLOT_NAMES[slot_idx]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════════
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--video",      required=True)
-    # NOTE: no --db argument. The DB is always the canonical copy pulled from
-    # Drive via drive_manager.py.
-    ap.add_argument("--session_id", default="",
-                     help="Override auto-derived session_id (normally derived "
-                          "from --video filename, same logic as track_and_dump.py)")
-    ap.add_argument("--start",      type=int,   default=0)
-    ap.add_argument("--max_fps",    type=float, default=0.0)
-    ap.add_argument("--sink",       default="web",
-                    choices=["web","mp4"],
-                    help="web = browser MJPEG (default), mp4 = save to file")
-    ap.add_argument("--outmp4",     default="annotated.mp4")
-    ap.add_argument("--limit",      type=int,   default=0)
-    ap.add_argument("--port",       type=int,   default=5000)
-    ap.add_argument("--draw_pose",  action="store_true")
-    ap.add_argument("--draw_masks", action="store_true",
-                     help="Overlay segmentation mask polygons (QA/visualization only). "
-                          "Reads outputs/<session_id>/qa_masks/masks_part*.parquet, written "
-                          "by track_and_dump.py --save_masks. No-op (with a log warning) if "
-                          "that file doesn't exist — re-run track_and_dump.py with "
-                          "--save_masks first to generate it.")
-    ap.add_argument("--kp_radius",  type=int,   default=3)
-    ap.add_argument("--sk_thickness",type=int,  default=2)
-    ap.add_argument("--kp_thresh",  type=float, default=0.0)
-    ap.add_argument("--hide_occluded",  action="store_true")
-    ap.add_argument("--kp_conf_thresh", type=float, default=0.30)
-    ap.add_argument("--show_lowconf",   action="store_true")
-    ap.add_argument("--kp_index",       action="store_true")
-    ap.add_argument("--kp_index_scale",     type=float, default=0.45)
-    ap.add_argument("--kp_index_thickness", type=int,   default=1)
-    ap.add_argument("--kp_index_offset",    type=int,   default=6)
-    # NOTE: no --kinetic_csv / --behavior_csv. Sensor data is always
-    # auto-discovered from Drive by session time window via drive_manager.
-    ap.add_argument("--sensor_lookback", type=float, default=2.0)
-    ap.add_argument("--bypass_upload_check", action="store_true",
-                    help="Skip dirty-flag check when reading from Drive "
-                         "(proceeds with potentially stale data — use with caution)")
-    return ap.parse_args()
+def slot_index(posture: Posture, facing: Facing) -> int | None:
+    """
+    Return the slot index for a (posture, facing) pair.
+    Returns None if either is UNCERTAIN (no slot should be assigned).
+    """
+    if posture == Posture.UNCERTAIN or facing == Facing.UNCERTAIN:
+        return None
+    return SLOT_INDEX.get((posture, facing))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════════
-def main():
-    global SENSOR_DATA, SENSOR_AIDS
-    args = parse_args()
+# ─────────────────────────────────────────────────────────────────────────────
+# resolved_cow_timeline — new columns added by this module
+#
+# These are the scalar, per-window aggregates written into the timeline.
+# Raw per-frame labels are NOT stored in the timeline — only the aggregates.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    vid = Path(args.video)
-    if not vid.exists(): raise FileNotFoundError(f"Video not found: {vid}")
+TIMELINE_VISION_COLS: list[str] = [
+    # posture
+    "lying_fraction",       # float [0,1]  — fraction of confident frames that were LYING
+    "posture_transitions",  # int          — number of STANDING↔LYING switches in window
+    # facing
+    "facing_dominant",      # str          — modal facing direction (non-uncertain frames)
+    "facing_entropy",       # float [0,1]  — normalised entropy of facing distribution
+]
 
-    # ── session_id: auto-derive from filename (same logic as track_and_dump.py) ──
-    if not args.session_id:
-        args.session_id = make_session_id(str(vid))
-        log(f"session_id auto-derived: {args.session_id}")
-    else:
-        log(f"session_id (manual override): {args.session_id}")
-
-    # ── Drive: pull canonical DB before reading ───────────────────────────────
-    dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
-    try:
-        dm.check_flag("db")
-    except DriveNotSyncedError as e:
-        log(f"ERROR: {e}")
-        log("Use --bypass_upload_check to proceed with current Drive state.")
-        return
-    try:
-        db = dm.pull_db(allow_stale=args.bypass_upload_check)
-    except DriveUnavailableError as e:
-        log(f"ERROR pulling DB: {e}")
-        return
-
-    # ── identity assignment ──────────────────────────────────────────────────
-    assignment = {}
-    try:
-        conn = sqlite3.connect(str(db))
-        for tid,aid in conn.execute(
-                "SELECT temp_id,real_id FROM manual_assignments WHERE session_id=?",
-                (args.session_id,)).fetchall():
-            assignment[int(tid)]=int(aid)
-        for real_id,kj in conn.execute(
-                "SELECT real_id,known_temp_ids FROM reid_registry WHERE known_temp_ids IS NOT NULL"
-                ).fetchall():
-            try:
-                for e in json.loads(kj):
-                    if e.get("session_id")==args.session_id:
-                        tid=int(e["temp_id"])
-                        if tid not in assignment: assignment[tid]=int(real_id)
-            except: pass
-        conn.close()
-        if assignment:
-            log("Assignments: "+", ".join(f"t{t}->{a}" for t,a in sorted(assignment.items())))
-    except Exception as e:
-        log(f"WARNING: assignments not loaded: {e}")
-
-    # ── session window (start/end) ────────────────────────────────────────────
-    session_start_dt = None
-    session_end_dt = None
-    try:
-        from datetime import datetime as _dt2
-        c2=sqlite3.connect(str(db))
-        row=c2.execute("SELECT start_dt, end_dt FROM video_sessions WHERE session_id=?",
-                       (args.session_id,)).fetchone()
-        c2.close()
-        if row and row[0]:
-            session_start_dt=_dt2.fromisoformat(str(row[0]))
-            session_end_dt=_dt2.fromisoformat(str(row[1])) if row[1] else session_start_dt
-            log(f"Session start_dt: {session_start_dt}  end_dt: {session_end_dt}")
-    except: pass
-    if session_start_dt is None:
-        import re; from datetime import datetime as _dt3
-        m=re.search(r'_S(\d{14})',vid.name)
-        if m:
-            try: session_start_dt=_dt3.strptime(m.group(1),"%Y%m%d%H%M%S"); log(f"start_dt from filename: {session_start_dt}")
-            except: pass
-        session_end_dt = session_start_dt
-
-    # ── sensor data — always auto-discovered from Drive by session time window ──
-    if session_start_dt is not None and session_end_dt is not None:
-        log("Auto-discovering collar data from Drive...")
-        kin_df = dm.load_collar_data(session_start_dt, session_end_dt, kind="kinetic")
-        beh_df = dm.load_collar_data(session_start_dt, session_end_dt, kind="behavior")
-        SENSOR_DATA = load_sensor_data(kin_df, beh_df)
-        if SENSOR_DATA:
-            SENSOR_AIDS = sorted(SENSOR_DATA.keys())
-            log(f"Sensor data loaded for AnimalIds: {SENSOR_AIDS}")
-        else:
-            log("No sensor data found for this session window.")
-    else:
-        log("WARNING: no session window known — cannot auto-discover sensor data.")
-
-    # ── vision features ──────────────────────────────────────────────────────
-    vision_index = load_vision_features(str(db), args.session_id)
-
-    # ── SIGINT ───────────────────────────────────────────────────────────────
-    def _sigint(s,f):
-        log("Interrupted.")
-        os._exit(0)
-    _sig.signal(_sig.SIGINT, _sigint)
-
-    # ── video thread ─────────────────────────────────────────────────────────
-    vt = threading.Thread(
-                            target=_video_loop,
-                            args=(args, assignment, None, session_start_dt, vision_index, str(db)),
-                            daemon=True)
-    vt.start()
-
-    # ── open Windows browser ─────────────────────────────────────────────────
-    url = f"http://localhost:{args.port}"
-    log(f"Starting web server on {url}")
-    log(f"Opening browser...")
-    try:
-        subprocess.Popen(
-            ["cmd.exe", "/c", "start", url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        try:
-            subprocess.Popen(
-                ["/mnt/c/Windows/System32/cmd.exe", "/c", "start", url],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            log(f"Could not auto-open browser. Open manually: {url}")
-
-    # ── Flask (blocking, main thread) ────────────────────────────────────────
-    app.run(host="0.0.0.0", port=args.port, threaded=True, use_reloader=False)
-
-
-if __name__ == "__main__":
-    main()
-
-
-# Example usage (--sink flag is now optional, defaults to web):
-# python3 display_tracks.py \
-#   --video      "$VID" \
-#   --draw_pose --kp_index --hide_occluded --kp_conf_thresh 0.35
-# (session_id is now auto-derived from $VID's filename, same logic as
-#  track_and_dump.py; pass --session_id explicitly only to override.
-#  db and sensor data are always resolved via drive_manager.py — there
-#  is no --db, --kinetic_csv, or --behavior_csv flag.)
+# SQLite ALTER TABLE statements to add the new columns to an existing DB.
+# reconcile.py runs these on startup (IF NOT EXISTS via try/except).
+TIMELINE_ALTER_SQLS: list[str] = [
+    "ALTER TABLE resolved_cow_timeline ADD COLUMN lying_fraction      REAL",
+    "ALTER TABLE resolved_cow_timeline ADD COLUMN posture_transitions INTEGER",
+    "ALTER TABLE resolved_cow_timeline ADD COLUMN facing_dominant     TEXT",
+    "ALTER TABLE resolved_cow_timeline ADD COLUMN facing_entropy      REAL",
+]
