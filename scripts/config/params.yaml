@@ -1,0 +1,146 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# params.yaml — every value that changes what the pipeline COMPUTES.
+#
+# Loaded by config.py. Every key is required; an unknown key (typo) is an
+# error, never ignored. Code keeps no defaults of its own for anything here.
+#
+# A copy of this exact file is stored per session on Drive
+# (outputs/<session_id>/params_track.yaml and params_reconcile.yaml) and its
+# hash is written to processing_log.csv, so every result can be traced back
+# to the thresholds that produced it.
+#
+# Validate after editing:   python3 config.py            (or: config.py my.yaml)
+# Run with another file:    any script --params my_sweep.yaml
+#
+# Relative paths resolve against the scripts directory.
+# Structural constants (embedding dim, keypoint count/map, gallery slots,
+# ImageNet normalisation, BACK_KPS) are NOT here: they are fixed in
+# vision_features/schema.py because changing them invalidates stored data.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Models ───────────────────────────────────────────────────────────────────
+models:
+  # relative to scripts/ → ~/thesis_workspace/vcf-ctp/models/...
+  detector: ../models/cow_seg/run14/weights/best.pt   # plain detect or YOLO-seg (auto-detected)
+  pose: ../models/cow_pose/best.pt                    # null → run without pose
+
+# ── Stage 1: detection / tracking (track_and_dump.py) ────────────────────────
+detection:
+  imgsz: 960
+  conf: 0.25                # detection confidence threshold
+  iou: 0.45                 # NMS IoU threshold
+  tracker: bytetrack.yaml   # bare name → config/<name>; ultralytics tracker config
+
+pose:
+  imgsz: 384
+  conf: 0.25
+  kp_conf_thresh: 0.30      # per-keypoint conf: >= → vis=2, < → vis=1 (written to raw data)
+
+embedder:
+  input_size: 224           # crop resize before MobileNetV3
+  crop_margin: 0.10         # bbox padding (fraction of w/h) for embed + pose crops
+
+sampling:
+  save_every: 10            # keep latest detection per temp_id per N frames
+  flush_every: 5            # flush to SQLite + Parquet every M windows (N×M frames)
+  parquet_rows_per_part: 50000
+
+# ── Shared time grid ─────────────────────────────────────────────────────────
+timeline:
+  bin_minutes: 15           # must match the kinetics sampling interval. Used by the
+                            # Kinetic Matcher, Sensor Sequencer and vision windows.
+
+session:
+  # is_night heuristic (time of day). Night = more than night_fraction of
+  # frames fall in [night_start_hour, 24) ∪ [0, night_end_hour).
+  night_start_hour: 20
+  night_end_hour: 6
+  night_fraction: 0.5
+
+# ── Stage 2: identity (reconcile.py) ─────────────────────────────────────────
+kinetic_match:
+  corr_threshold: 0.7       # min Pearson r, camera displacement ↔ ΔKineticsCountR
+  min_active_bins: 3        # min active kinetics bins to score a pair
+  live_min_active_bins: 1   # same, for match_identity.score_up_to (incremental scoring)
+  min_temp_id_frames: 0.10  # min fraction of frames a temp_id must appear in
+  activity_pct: 0.25        # a bin is "active" if delta >= this percentile
+
+gallery:
+  ema_alpha: 0.15           # kinetic-confirmed update; cosine-only uses alpha/2
+  min_embeds: 10            # min embed rows per temp_id to contribute to a gallery
+  synthetic_merge_alpha: 0.5  # blend weight when a synthetic id resolves to a real one
+
+cosine_resolver:
+  threshold: 0.75           # single cosine threshold — Cosine Resolver AND
+                            # Boundary Rendezvous tier 2 both read this
+  min_embeds: 5             # min embed rows for a temp_id to be queried
+
+cooccurrence:
+  # Shared by Cosine Resolver and Duplicate Resolver: are two temp_ids that
+  # claim one AnimalId the same animal (handoff) or two animals (conflict)?
+  iou_same_animal: 0.3      # on screen together with IoU >= this → same animal
+  frame_tolerance_min: 20   # floor for "same moment" frame tolerance
+  gap_multiplier: 2.0       # tolerance = max(floor, multiplier × median sampling gap)
+
+identity:
+  # Trust order, highest first. Duplicate Resolver ranks by this; manual must
+  # stay first (hard override).
+  source_priority: [manual, kinetic, boundary_rendezvous, cosine]
+  # Sources Boundary Rendezvous may never overwrite.
+  protected_sources: [manual, kinetic]
+
+# ── Stage 2-B: vision features (vision_features/) ────────────────────────────
+vision:
+  posture:
+    standing_max_ar: 0.85   # bbox w/h at or below → STANDING
+    lying_min_ar: 1.10      # at or above → LYING; between = UNCERTAIN
+    min_kps_coverage: 0.05  # mean kp conf below → UNCERTAIN
+    min_det_conf: 0.10
+    ar_conf_weight: 0.70    # posture_conf = w·aspect-ratio clarity + (1-w)·kp coverage
+  facing:
+    min_kp_conf: 0.05       # back keypoint usable above this
+    min_body_axis_px: 20.0  # shorter spine axis → UNCERTAIN
+    toward_center: 90.0     # degrees (math convention, image y flipped)
+    away_center: 270.0
+    depth_half_width: 10.0  # ± degrees around toward/away centers
+    lying_conf_penalty: 0.70
+  aggregate_min_conf: 0.30  # per-frame conf needed to count in window aggregates
+  min_slot_conf: 0.30       # posture AND facing conf needed to feed a gallery slot
+
+# ── Boundary Rendezvous (cross_camera.py) ────────────────────────────────────
+cross_camera:
+  boundary_dwell_seconds: 3.0     # min cumulative dwell in a shared zone
+  boundary_dwell_min_frames: 5    # min detections in that dwell
+  conflict_confidence_gap: 0.10   # auto-resolve a conflict only above this gap
+  single_cow_sanity_floor: 0.40   # tier 4 min cosine with one cow per side
+  motion:                         # tier 3 — motion-magnitude correlation
+    corr_threshold: 0.85
+    bin_seconds: 1.0
+    window_pad_seconds: 30.0
+    min_samples: 8
+    min_std: 0.05                 # body-heights/s; below → cow barely moved, skip
+    max_lag_bins: 2               # tolerated clock offset between cameras
+
+# ── Site ─────────────────────────────────────────────────────────────────────
+# id: exact camera name as it appears in video filenames.
+# code: ASCII short code used to build session_id (never change for an
+#       existing camera — it would give already-processed videos a new id).
+cameras:
+  - {id: "רפת 26", code: cam26}
+  - {id: "רפת 33", code: cam33}
+  - {id: "רפת 38", code: cam38}
+
+# Hand-annotated shared zones, [x, y] pixels in each camera's own frame.
+# direction_relation: 'same' / 'opposite' camera facing (kept for future
+# geometric work; tier 3 uses speed magnitude only).
+camera_topology:
+  - camera_a: "רפת 38"
+    camera_b: "רפת 26"
+    zone_a_poly: [[391, 0], [468, 83], [543, 246], [1169, 300], [1040, 0]]
+    zone_b_poly: [[1343, 284], [0, 111], [10, 1072], [1341, 1070]]
+    direction_relation: same
+  - camera_a: "רפת 33"
+    camera_b: "רפת 38"
+    zone_a_poly: [[1342, 1073], [1351, 585], [683, 599], [673, 1076]]
+    zone_b_poly: [[687, 495], [723, 1074], [95, 1074], [380, 504]]
+    direction_relation: opposite

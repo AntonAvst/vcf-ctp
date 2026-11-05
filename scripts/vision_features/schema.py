@@ -12,24 +12,28 @@ from enum import IntEnum
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cameras monitoring the enclosure
-# ─────────────────────────────────────────────────────────────────────────────
-# Cows move freely between these cameras, so cross-session ReID matching
-# (reconcile.py Step C — TempPoseGallery lookups) is NOT restricted to a
-# single camera; it checks every camera below and keeps the best match.
+# Structural constants — FIXED, deliberately not in config/params.yaml.
 #
-# track_and_dump.py also uses this exact list (mirrored there as a local
-# constant, same convention as EXPECTED_KP below, since its vision_features
-# import is optional/best-effort) to recognize known camera names reliably
-# when parsing video filenames of the form:
-#   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>].<ext>
-# e.g. "רפת 26_24_S20260616090000_E20260616110000.mp4" -> camera "רפת 26".
-# Keep both lists in sync when a camera is added, renamed, or removed.
-CAMERA_IDS: list[str] = ["רפת 26", "רפת 33", "רפת 38"]
+# Stored data depends on these: gallery .npy shapes (N_cows, 8, EMBED_DIM),
+# Parquet array widths (embed[EMBED_DIM], kps[N_KP*3], kps_kconf[N_KP]), and
+# the embedder's pretrained ImageNet weights. Changing any of them silently
+# invalidates every existing gallery / parquet file, so they live in code and
+# change only together with a full rebuild.
+#
+# Cameras (ids, session-id codes, shared-zone polygons) are NOT here — they
+# are site configuration in config/params.yaml (cameras / camera_topology).
+# ─────────────────────────────────────────────────────────────────────────────
+
+EMBED_DIM: int = 128          # Embedder128 output, gallery vector width
+N_KP: int = 19                # pose model keypoints (see KP below)
+
+# ImageNet normalisation for the MobileNetV3 backbone (RGB order)
+IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
+IMAGENET_STD:  tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Keypoint index map  (19 kp, matches track_and_dump.py EXPECTED_KP = 19)
+# Keypoint index map  (N_KP = 19)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KP(IntEnum):
@@ -52,6 +56,14 @@ class KP(IntEnum):
     FETLOCK_HIND_R   = 16
     UDDER_CENTER     = 17
     NECK             = 18
+
+
+assert len(KP) == N_KP, "KP enum and N_KP disagree"
+
+# Back keypoints defining the spine axis for facing classification, ordered
+# anterior → posterior (facing.py relies on this order: lower list index =
+# more forward). Head/neck excluded on purpose — they move independently.
+BACK_KPS: tuple[KP, ...] = (KP.WITHERS, KP.SPINE_MID, KP.SACRUM, KP.TAIL_BASE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

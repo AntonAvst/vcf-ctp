@@ -6,7 +6,8 @@ Use when kinetics data is unavailable or doesn't cover the video's date range.
 Watch the video in display_tracks.py to identify which temp_id is which cow,
 then run this script to write the assignment and optionally run reconcile.
 
-Note: there is no --db, --kinetics, --gallery_dir, or --embed_parquet flag.
+Note: there is no --db, --kinetics, --gallery_dir, or --embed_parquet flag,
+and no threshold flags — --run_reconcile uses config/params.yaml (or --params).
 The DB is always the canonical copy pulled from Drive via drive_manager.py,
 and kinetics/gallery/parquet (used only by --run_reconcile) are resolved the
 same way reconcile.py resolves them — keyed off --session.
@@ -44,6 +45,7 @@ from pathlib import Path
 
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
+import config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,15 +92,13 @@ def parse_args() -> argparse.Namespace:
                     help="Run reconcile.py immediately after writing assignments")
     # NOTE: kinetics, gallery_dir, and embed_parquet are NOT arguments — when
     # --run_reconcile fires, reconcile.py resolves all of these via
-    # drive_manager.py, keyed off --session.
-    ap.add_argument("--corr_threshold",   type=float, default=0.7)
-    ap.add_argument("--cosine_threshold", type=float, default=0.75)
-    ap.add_argument("--ema_alpha",        type=float, default=0.15)
+    # drive_manager.py, keyed off --session. Thresholds: config/params.yaml.
     ap.add_argument("--dry_run",          action="store_true",
                     help="Pass --dry_run to reconcile (no DB writes during reconcile)")
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
+    config.add_params_arg(ap)   # used by --run_reconcile
 
     return ap.parse_args()
 
@@ -324,26 +324,11 @@ def run_reconcile(args: argparse.Namespace, dm: DriveManager) -> None:
     r_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(r_mod)
 
-    import argparse as _ap
-    r_args = _ap.Namespace(
-        session            = args.session,
-        corr_threshold     = args.corr_threshold,
-        min_active_bins    = 3,
-        min_temp_id_frames = 0.10,
-        activity_pct       = 0.25,
-        bin_minutes        = 15,
-        ema_alpha          = args.ema_alpha,
-        min_embeds_gallery = 10,
-        cosine_threshold   = args.cosine_threshold,
-        cosine_min_embeds  = 5,
-        dry_run            = args.dry_run,
-        verbose            = False,
-        bypass_upload_check = args.bypass_upload_check,
-    )
-
     # reconcile.py resolves kinetics/behavior/gallery/parquet itself via
-    # drive_manager, keyed off r_args.session — nothing to pass in here.
-    r_mod.run(r_args)
+    # drive_manager, keyed off the session, and reads every threshold from
+    # the params already loaded in this process (config.init in main).
+    r_mod.run(args.session, dry_run=args.dry_run,
+              bypass_upload_check=args.bypass_upload_check)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -352,6 +337,7 @@ def run_reconcile(args: argparse.Namespace, dm: DriveManager) -> None:
 
 def main() -> None:
     args = parse_args()
+    config.init(args.params)
 
     section("assign_identity.py")
     log(f"session : {args.session}")

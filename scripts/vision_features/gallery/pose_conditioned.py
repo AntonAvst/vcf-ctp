@@ -43,8 +43,9 @@ from typing import NamedTuple
 
 import numpy as np
 
+import config
 from ..schema import (
-    N_SLOTS, GALLERY_SLOTS, SLOT_NAMES,
+    EMBED_DIM, N_SLOTS, GALLERY_SLOTS, SLOT_NAMES,
     Posture, Facing,
     slot_index, slot_name,
 )
@@ -201,10 +202,10 @@ class PoseGallery:
         self,
         real_id: int,
         slot_embeds: dict[int, np.ndarray],
-        alpha: float = 0.15,
+        alpha: float,                 # params gallery.ema_alpha (α/2 for cosine-only)
     ) -> dict[int, float]:
         if real_id not in self.embeds:
-            self.embeds[real_id] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
+            self.embeds[real_id] = np.full((N_SLOTS, EMBED_DIM), np.nan, dtype=np.float32)
             self.counts[real_id] = np.zeros(N_SLOTS, dtype=np.int32)
 
         cosines = {}
@@ -221,7 +222,7 @@ class PoseGallery:
 
         return cosines
 
-    def merge_and_delete(self, src_id: int, dst_id: int, alpha: float = 0.5) -> None:
+    def merge_and_delete(self, src_id: int, dst_id: int, alpha: float) -> None:
         """
         Fold src_id gallery slots into dst_id (used when a synthetic id is
         confirmed as dst_id), then remove src_id.
@@ -230,7 +231,7 @@ class PoseGallery:
         if src_id not in self.embeds:
             return
         if dst_id not in self.embeds:
-            self.embeds[dst_id] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
+            self.embeds[dst_id] = np.full((N_SLOTS, EMBED_DIM), np.nan, dtype=np.float32)
             self.counts[dst_id] = np.zeros(N_SLOTS, dtype=np.int32)
 
         for s in range(N_SLOTS):
@@ -253,7 +254,7 @@ class PoseGallery:
         query_embed: np.ndarray,
         posture: Posture | None,
         facing:  Facing  | None,
-        threshold: float = 0.75,
+        threshold: float,             # params cosine_resolver.threshold
     ) -> tuple[int | None, float, int | None]:
         key, cos, s = _slot_query(self.embeds, query_embed, posture, facing, threshold)
         return key, cos, s
@@ -317,10 +318,10 @@ class TempPoseGallery:
         self,
         key: TempKey,
         slot_embeds: dict[int, np.ndarray],
-        alpha: float = 0.15,
+        alpha: float,                 # params gallery.ema_alpha (α/2 for cosine-only)
     ) -> dict[int, float]:
         if key not in self.embeds:
-            self.embeds[key] = np.full((N_SLOTS, 128), np.nan, dtype=np.float32)
+            self.embeds[key] = np.full((N_SLOTS, EMBED_DIM), np.nan, dtype=np.float32)
             self.counts[key] = np.zeros(N_SLOTS, dtype=np.int32)
 
         cosines = {}
@@ -361,7 +362,7 @@ class TempPoseGallery:
         query_embed: np.ndarray,
         posture: Posture | None,
         facing:  Facing  | None,
-        threshold: float = 0.75,
+        threshold: float,             # params cosine_resolver.threshold
         exclude_session: str | None = None,   # don't match against current session
     ) -> tuple[TempKey | None, float, int | None]:
         """
@@ -465,7 +466,8 @@ def backpropagate_resolution(
     conn.commit()
 
     # ── Fold gallery vectors ─────────────────────────────────────────────────
-    pose_gallery.merge_and_delete(synthetic_id, real_id, alpha=0.5)
+    pose_gallery.merge_and_delete(synthetic_id, real_id,
+                                 alpha=config.params().gallery.synthetic_merge_alpha)
     pose_gallery.save(gallery_dir, modality)
 
     return rows_updated
@@ -481,7 +483,7 @@ def build_slot_embeds(
     frame_temp_ids,
     min_conf_posture,
     min_conf_facing,
-    min_conf: float = 0.30,
+    min_conf: float,              # params vision.min_slot_conf
 ) -> dict[int, dict[int, np.ndarray]]:
     """
     Group embed rows by slot, mean-pool each slot per temp_id.

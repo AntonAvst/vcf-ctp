@@ -22,30 +22,28 @@ Per-frame outputs (returned as dict of 1D arrays, length = N_frames):
 Design note
 ───────────
 UNCERTAIN is returned when the aspect ratio falls in the ambiguous band
-[STANDING_MAX_AR, LYING_MIN_AR) or when the detection confidence is too
+[standing_max_ar, lying_min_ar] (params.yaml vision.posture) or when the detection confidence is too
 low. Downstream aggregation should skip UNCERTAIN frames rather than
 casting them as a vote.
 """
 
 import numpy as np
+
+import config
 from ..schema import Posture
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tunable thresholds (easy to override from extractor.py)
+# Thresholds — config/params.yaml → vision.posture
+#   standing_max_ar   bbox w/h at or below → STANDING
+#   lying_min_ar      at or above → LYING; [standing_max_ar, lying_min_ar] = UNCERTAIN
+#   min_kps_coverage  mean keypoint conf below → always UNCERTAIN
+#   min_det_conf      detection conf below → always UNCERTAIN
+#   ar_conf_weight    share of aspect-ratio clarity in posture_conf (rest = kp quality)
+# Read at call time (never at import) so --params always takes effect.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Bounding-box aspect ratio thresholds
-STANDING_MAX_AR    = 0.85   # below this → STANDING
-LYING_MIN_AR       = 1.10   # above this → LYING
-                            # [0.85, 1.10] band → UNCERTAIN
-
-# Minimum mean keypoint confidence to trust the frame at all.
-# Frames with kps_coverage < this threshold are always UNCERTAIN.
-# YOLOv8-Pose often outputs low floats — 0.05 accepts any attempted placement.
-MIN_KPS_COVERAGE   = 0.05
-
-# Minimum detection confidence to include a frame in classification.
-MIN_DET_CONF       = 0.10
+def _cfg():
+    return config.params().vision.posture
 
 
 def extract_posture(
@@ -71,6 +69,7 @@ def extract_posture(
         "posture"       : int8 array of Posture enum values  (N,)
         "posture_conf"  : float32 confidence array           (N,)
     """
+    cfg = _cfg()
     N = len(bbox)
     posture  = np.full(N, Posture.UNCERTAIN, dtype=np.int8)
     conf_out = np.zeros(N, dtype=np.float32)
@@ -91,18 +90,18 @@ def extract_posture(
 
     # ── detection confidence gate ─────────────────────────────────────────────
     if det_conf is not None:
-        low_det = det_conf < MIN_DET_CONF
+        low_det = det_conf < cfg.min_det_conf
     else:
         low_det = np.zeros(N, dtype=bool)
 
     # ── classify ─────────────────────────────────────────────────────────────
     # Frames that fail basic quality gates stay UNCERTAIN
-    quality_ok = valid_box & ~low_det & (kps_coverage >= MIN_KPS_COVERAGE)
+    quality_ok = valid_box & ~low_det & (kps_coverage >= cfg.min_kps_coverage)
 
     # STANDING: narrow bbox, kps look normal
-    standing_mask = quality_ok & (aspect <= STANDING_MAX_AR)
+    standing_mask = quality_ok & (aspect <= cfg.standing_max_ar)
     # LYING: wide bbox
-    lying_mask    = quality_ok & (aspect >= LYING_MIN_AR)
+    lying_mask    = quality_ok & (aspect >= cfg.lying_min_ar)
     # Ambiguous band stays UNCERTAIN
 
     posture[standing_mask] = int(Posture.STANDING)
@@ -116,18 +115,19 @@ def extract_posture(
 
     # Distance from the nearest threshold, normalised to [0, 1].
     ar_conf = np.zeros(N, dtype=np.float32)
-    # For STANDING: standing is clearer the lower the AR is below STANDING_MAX_AR
-    band    = LYING_MIN_AR - STANDING_MAX_AR   # width of uncertain band
+    # For STANDING: standing is clearer the lower the AR is below standing_max_ar
+    smax, lmin = cfg.standing_max_ar, cfg.lying_min_ar
     ar_conf[standing_mask] = np.clip(
-        (STANDING_MAX_AR - aspect[standing_mask]) / (STANDING_MAX_AR * 0.5), 0, 1
+        (smax - aspect[standing_mask]) / (smax * 0.5), 0, 1
     ).astype(np.float32)
     ar_conf[lying_mask] = np.clip(
-        (aspect[lying_mask] - LYING_MIN_AR) / (LYING_MIN_AR * 0.5), 0, 1
+        (aspect[lying_mask] - lmin) / (lmin * 0.5), 0, 1
     ).astype(np.float32)
 
-    # Blend with kps quality
+    # Blend with kps quality (ar_conf_weight · geometry + rest · keypoint quality)
+    w_ar       = cfg.ar_conf_weight
     kps_weight = np.clip(kps_coverage, 0, 1)
-    conf_out   = (0.7 * ar_conf + 0.3 * kps_weight).astype(np.float32)
+    conf_out   = (w_ar * ar_conf + (1.0 - w_ar) * kps_weight).astype(np.float32)
     conf_out[posture == int(Posture.UNCERTAIN)] = 0.0
 
     return {
@@ -143,7 +143,7 @@ def extract_posture(
 def aggregate_posture(
     posture: np.ndarray,        # (N,) int8 — per-frame Posture values
     posture_conf: np.ndarray,   # (N,) float32 — per-frame confidence
-    min_conf: float = 0.3,
+    min_conf: float,            # params vision.aggregate_min_conf
 ) -> dict[str, float | int]:
     """
     Aggregate per-frame posture labels into window-level scalars for

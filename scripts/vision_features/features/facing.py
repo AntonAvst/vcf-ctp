@@ -18,14 +18,14 @@ Two selection strategies are tried in order:
 
   Strategy A — highest-confidence pair
       Take the two KPs with the highest kps_kconf scores, provided
-      both exceed MIN_KP_CONF.  This maximises signal quality.
+      both exceed min_kp_conf.  This maximises signal quality.
 
   Strategy B — farthest-apart pair
-      Among all KPs exceeding MIN_KP_CONF, take the pair with the
+      Among all KPs exceeding min_kp_conf, take the pair with the
       greatest pixel distance.  Longer lever arm → more stable angle.
 
   The strategy that yields the longer axis vector is used (if both pass
-  the MIN_BODY_AXIS_PX check).  If neither passes, frame is UNCERTAIN.
+  the min_body_axis_px check).  If neither passes, frame is UNCERTAIN.
 
 The axis vector always points from the rear KP (higher index = more
 posterior) toward the front KP (lower index = more anterior), so the
@@ -40,8 +40,8 @@ Direction from angle (degrees, image coords)
 
 Segment boundaries (configurable below, all in degrees [0, 360)):
 
-    TOWARD  (up)   : angle in [TOWARD_CENTER ± DEPTH_HALF_WIDTH]
-    AWAY    (down) : angle in [AWAY_CENTER   ± DEPTH_HALF_WIDTH]
+    TOWARD  (up)   : angle in [toward_center ± depth_half_width]
+    AWAY    (down) : angle in [away_center   ± depth_half_width]
     RIGHT          : fills remaining arc on the right half
     LEFT           : fills remaining arc on the left half
 
@@ -61,55 +61,38 @@ Per-frame outputs (dict of 1D arrays, length = N_frames):
 """
 
 import numpy as np
-from ..schema import KP, Facing, Posture
+
+import config
+from ..schema import BACK_KPS, Facing, Posture
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Back keypoints used for spine axis (head/neck explicitly excluded)
-# ─────────────────────────────────────────────────────────────────────────────
-
-BACK_KPS = [KP.WITHERS, KP.SPINE_MID, KP.SACRUM, KP.TAIL_BASE]  # indices 2,3,4,5
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quality thresholds
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Minimum per-keypoint confidence to consider a back KP usable.
-# YOLOv8-Pose outputs low float values even for clearly visible points;
-# 0.05 accepts anything the pose model attempted to place.
-# Raise to 0.20–0.30 only if you see many spurious placements.
-MIN_KP_CONF = 0.05
-
-# Minimum pixel distance between the two chosen back KPs.
-# Shorter axes are too noisy to trust for angle estimation.
-MIN_BODY_AXIS_PX = 20.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Direction segment boundaries  (degrees, 0=right, CCW positive in math space)
+# Back keypoints for the spine axis — schema.BACK_KPS (structural, fixed).
 #
-# In image coordinates y increases downward, so:
-#   np.arctan2(-dy, dx) maps image vectors to math angles correctly:
-#   pure +x (right)  → 0°
-#   pure -y (up)     → 90°   ← TOWARD (cow faces camera from above)
-#   pure -x (left)   → 180°
-#   pure +y (down)   → 270°  ← AWAY   (cow faces away from camera)
+# Thresholds — config/params.yaml → vision.facing
+#   min_kp_conf         back keypoint usable at or above this
+#   min_body_axis_px    shorter spine axis → UNCERTAIN
+#   toward_center       degrees; spine pointing up   → cow faces toward camera
+#   away_center         degrees; spine pointing down → cow faces away
+#   depth_half_width    ± degrees of each TOWARD/AWAY zone
+#   lying_conf_penalty  facing_conf multiplier for LYING frames
 #
-# Change TOWARD_CENTER / AWAY_CENTER to rotate the depth zones.
-# Change DEPTH_HALF_WIDTH to widen or narrow them (both use the same width).
+# Angles: 0=right, CCW positive in math space. Image y grows downward, so
+# np.arctan2(-dy, dx) maps image vectors to math angles:
+#   +x → 0°, -y (up) → 90° (TOWARD), -x → 180°, +y (down) → 270° (AWAY)
+#
+# Read at call time (never at import) so --params always takes effect.
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOWARD_CENTER    = 90.0   # degrees — spine pointing up   → cow faces toward camera
-AWAY_CENTER      = 270.0  # degrees — spine pointing down → cow faces away from camera
-DEPTH_HALF_WIDTH = 10.0   # degrees — half-width of each depth zone (±10° = 20° total band)
+def _cfg():
+    return config.params().vision.facing
 
-# Derived boundaries (computed once at import; do not edit these directly)
-_TOWARD_LO = TOWARD_CENTER - DEPTH_HALF_WIDTH   #  80°
-_TOWARD_HI = TOWARD_CENTER + DEPTH_HALF_WIDTH   # 100°
-_AWAY_LO   = AWAY_CENTER   - DEPTH_HALF_WIDTH   # 260°
-_AWAY_HI   = AWAY_CENTER   + DEPTH_HALF_WIDTH   # 280°
 
-# Confidence penalty applied when the cow is classified LYING
-# (spine axis still works but is less informative in lateral recumbency)
-LYING_CONF_PENALTY = 0.70
+def _zone_bounds(cfg) -> tuple[float, float, float, float]:
+    """(toward_lo, toward_hi, away_lo, away_hi) in degrees — e.g. 80/100/260/280."""
+    return (cfg.toward_center - cfg.depth_half_width,
+            cfg.toward_center + cfg.depth_half_width,
+            cfg.away_center   - cfg.depth_half_width,
+            cfg.away_center   + cfg.depth_half_width)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,10 +105,10 @@ def _best_pair_highest_conf(
 ) -> tuple[int, int] | None:
     """
     Return (i, j) indices into BACK_KPS for the two KPs with the highest
-    confidence, both above MIN_KP_CONF.  Returns None if fewer than 2 qualify.
+    confidence, both above min_kp_conf.  Returns None if fewer than 2 qualify.
     i < j always (i is more anterior in BACK_KPS ordering).
     """
-    usable = np.where(kp_c >= MIN_KP_CONF)[0]
+    usable = np.where(kp_c >= _cfg().min_kp_conf)[0]
     if len(usable) < 2:
         return None
     top2 = usable[np.argsort(kp_c[usable])[::-1][:2]]
@@ -139,10 +122,10 @@ def _best_pair_farthest(
 ) -> tuple[int, int] | None:
     """
     Return (i, j) indices into BACK_KPS for the pair with the greatest
-    pixel distance among KPs above MIN_KP_CONF.
+    pixel distance among KPs above min_kp_conf.
     i < j always.
     """
-    usable = np.where(kp_c >= MIN_KP_CONF)[0]
+    usable = np.where(kp_c >= _cfg().min_kp_conf)[0]
     if len(usable) < 2:
         return None
     best_dist = -1.0
@@ -173,6 +156,7 @@ def _spine_vector(
     pair_hc = _best_pair_highest_conf(kp_xy, kp_c)
     pair_fd = _best_pair_farthest(kp_xy, kp_c)
 
+    min_axis = _cfg().min_body_axis_px
     candidates = []
     for pair in (pair_hc, pair_fd):
         if pair is None:
@@ -182,7 +166,7 @@ def _spine_vector(
         dxv = float(kp_xy[i, 0] - kp_xy[j, 0])
         dyv = float(kp_xy[i, 1] - kp_xy[j, 1])
         length = float(np.sqrt(dxv**2 + dyv**2))
-        if length >= MIN_BODY_AXIS_PX:
+        if length >= min_axis:
             mean_c = float((kp_c[i] + kp_c[j]) / 2.0)
             candidates.append((dxv, dyv, length, mean_c))
 
@@ -208,13 +192,14 @@ def _angle_to_facing(angle_deg: float) -> int:
         LEFT   : everything in left half not covered by depth zones
     """
     a = angle_deg % 360.0
+    t_lo, t_hi, a_lo, a_hi = _zone_bounds(_cfg())
 
-    if _TOWARD_LO <= a <= _TOWARD_HI:
+    if t_lo <= a <= t_hi:
         return int(Facing.TOWARD)
-    if _AWAY_LO <= a <= _AWAY_HI:
+    if a_lo <= a <= a_hi:
         return int(Facing.AWAY)
     # right half: 0–80° and 280–360°
-    if a < _TOWARD_LO or a > _AWAY_HI:
+    if a < t_lo or a > a_hi:
         return int(Facing.RIGHT)
     # left half: 100°–260°
     return int(Facing.LEFT)
@@ -229,35 +214,38 @@ def _angle_confidence(angle_deg: float, facing_label: int) -> float:
     For LEFT/RIGHT (wide zones): confidence scales with distance from the
     nearest depth-zone boundary, normalised by the zone half-width.
     For TOWARD/AWAY (narrow zones): confidence scales with distance from
-    the zone center, normalised by DEPTH_HALF_WIDTH.
+    the zone center, normalised by depth_half_width.
     """
     a = angle_deg % 360.0
+    cfg = _cfg()
+    half = cfg.depth_half_width
+    t_lo, t_hi, a_lo, a_hi = _zone_bounds(cfg)
 
     if facing_label == int(Facing.TOWARD):
-        dist_from_center = abs(a - TOWARD_CENTER)
-        return float(np.clip(1.0 - dist_from_center / DEPTH_HALF_WIDTH, 0.0, 1.0))
+        dist_from_center = abs(a - cfg.toward_center)
+        return float(np.clip(1.0 - dist_from_center / half, 0.0, 1.0))
 
     if facing_label == int(Facing.AWAY):
-        dist_from_center = min(abs(a - AWAY_CENTER), 360.0 - abs(a - AWAY_CENTER))
-        return float(np.clip(1.0 - dist_from_center / DEPTH_HALF_WIDTH, 0.0, 1.0))
+        dist_from_center = min(abs(a - cfg.away_center), 360.0 - abs(a - cfg.away_center))
+        return float(np.clip(1.0 - dist_from_center / half, 0.0, 1.0))
 
     # LEFT or RIGHT — how far are we from the nearest depth-zone boundary?
     # The narrower the remaining arc, the lower the confidence near the edge.
     if facing_label == int(Facing.RIGHT):
         # Confidence = distance to the nearest depth-zone boundary.
         # The two depth boundaries that border the RIGHT zone are
-        # _TOWARD_LO (80°) and _AWAY_HI (280°).
+        # toward_lo (80°) and away_hi (280°).
         # Distance is measured on the circle (shortest arc).
-        dist_to_toward = min(abs(a - _TOWARD_LO), 360.0 - abs(a - _TOWARD_LO))
-        dist_to_away   = min(abs(a - _AWAY_HI),   360.0 - abs(a - _AWAY_HI))
+        dist_to_toward = min(abs(a - t_lo), 360.0 - abs(a - t_lo))
+        dist_to_away   = min(abs(a - a_hi), 360.0 - abs(a - a_hi))
         dist = min(dist_to_toward, dist_to_away)
-        lateral_half = (360.0 - 2 * DEPTH_HALF_WIDTH) / 4.0   # ~85°
+        lateral_half = (360.0 - 2 * half) / 4.0   # ~85°
         return float(np.clip(dist / lateral_half, 0.0, 1.0))
 
     if facing_label == int(Facing.LEFT):
-        # left zone spans [_TOWARD_HI, _AWAY_LO]: boundaries at both ends
-        dist = min(a - _TOWARD_HI, _AWAY_LO - a)
-        lateral_half = (360.0 - 2 * DEPTH_HALF_WIDTH) / 4.0
+        # left zone spans [toward_hi, away_lo]: boundaries at both ends
+        dist = min(a - t_hi, a_lo - a)
+        lateral_half = (360.0 - 2 * half) / 4.0
         return float(np.clip(dist / lateral_half, 0.0, 1.0))
 
     return 0.0
@@ -322,7 +310,7 @@ def extract_facing(
     # Penalise lying frames — spine axis less reliable in lateral recumbency
     if posture is not None:
         lying_mask = (posture == int(Posture.LYING))
-        conf_out[lying_mask] *= LYING_CONF_PENALTY
+        conf_out[lying_mask] *= _cfg().lying_conf_penalty
 
     conf_out[facing == int(Facing.UNCERTAIN)] = 0.0
     conf_out = conf_out.astype(np.float32)
@@ -337,7 +325,7 @@ def extract_facing(
 def aggregate_facing(
     facing: np.ndarray,       # (N,) int8 — per-frame Facing values
     facing_conf: np.ndarray,  # (N,) float32 — per-frame confidence
-    min_conf: float = 0.3,
+    min_conf: float,          # params vision.aggregate_min_conf
 ) -> dict[str, str | float]:
     """
     Aggregate per-frame facing labels into window-level scalars.

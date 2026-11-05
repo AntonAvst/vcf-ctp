@@ -31,7 +31,7 @@ Integration (reconcile.py, after Cosine Resolver, before Duplicate Resolver):
 
     from cross_camera import run_boundary_rendezvous, CrossCameraConfig
 
-    boundary_config = CrossCameraConfig()   # or load overrides from args
+    boundary_config = CrossCameraConfig.from_params(config.params())
     full_assignment, boundary_log = run_boundary_rendezvous(
         conn=conn, session_id=args.session, camera_id=camera_id,
         tracks_df=tracks_df, embed_df=embed_df,
@@ -61,30 +61,55 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+# Imported as _config: several functions here take a parameter named
+# `config` (a CrossCameraConfig), which would shadow the module.
+import config as _config
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(frozen=True)
 class CrossCameraConfig:
-    boundary_dwell_seconds: float = 3.0
-    boundary_dwell_min_frames: int = 5
-    conflict_confidence_gap: float = 0.10
-    motion_corr_threshold: float = 0.85
+    """Flat view of config/params.yaml for this module — cross_camera.* plus
+    the one cosine threshold shared with the Cosine Resolver. No defaults:
+    always build it with from_params(), so it can never drift from the file."""
+    boundary_dwell_seconds: float
+    boundary_dwell_min_frames: int
+    conflict_confidence_gap: float
     # Tier 3 (motion-magnitude correlation) — see make_motion_corr_fn
-    motion_bin_seconds: float = 1.0         # speed is computed per bin of this width
-    motion_window_pad_seconds: float = 30.0 # look this far before/after the dwell overlap
-    motion_min_samples: int = 8             # min shared speed bins to trust a correlation
-    motion_min_std: float = 0.05            # min speed std (body-heights/s) — below this
-                                            # the cow barely moved and r is just noise
-    motion_max_lag_bins: int = 2            # tolerate this much clock offset between cameras
-    single_cow_sanity_floor: float = 0.40
-    cosine_threshold: float = 0.75          # mirror reconcile.py's args.cosine_threshold
+    motion_corr_threshold: float
+    motion_bin_seconds: float         # speed is computed per bin of this width
+    motion_window_pad_seconds: float  # look this far before/after the dwell overlap
+    motion_min_samples: int           # min shared speed bins to trust a correlation
+    motion_min_std: float             # min speed std (body-heights/s) — below this
+                                      # the cow barely moved and r is just noise
+    motion_max_lag_bins: int          # tolerate this much clock offset between cameras
+    single_cow_sanity_floor: float
+    cosine_threshold: float           # = params cosine_resolver.threshold (tier 2)
+
+    @classmethod
+    def from_params(cls, p) -> "CrossCameraConfig":
+        cc, m = p.cross_camera, p.cross_camera.motion
+        return cls(
+            boundary_dwell_seconds    = cc.boundary_dwell_seconds,
+            boundary_dwell_min_frames = cc.boundary_dwell_min_frames,
+            conflict_confidence_gap   = cc.conflict_confidence_gap,
+            motion_corr_threshold     = m.corr_threshold,
+            motion_bin_seconds        = m.bin_seconds,
+            motion_window_pad_seconds = m.window_pad_seconds,
+            motion_min_samples        = m.min_samples,
+            motion_min_std            = m.min_std,
+            motion_max_lag_bins       = m.max_lag_bins,
+            single_cow_sanity_floor   = cc.single_cow_sanity_floor,
+            cosine_threshold          = p.cosine_resolver.threshold,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Camera topology — hand-annotated zone polygons.
+# Camera topology — hand-annotated zone polygons, config/params.yaml
+# camera_topology.
 #
 # direction_relation: 'same' if the two cameras face the same way (so a cow
 # walking "away" in one is walking "toward" in the other in a consistent
@@ -93,29 +118,29 @@ class CrossCameraConfig:
 # MAGNITUDE, which doesn't care), but keeping the field for any future
 # geometric work (e.g. real homography calibration) that would need it.
 #
-# zone_a_poly / zone_b_poly: list of (x, y) pixel points, camera_a's and
+# zone_a_poly / zone_b_poly: list of [x, y] pixel points, camera_a's and
 # camera_b's own frame respectively.
 # ─────────────────────────────────────────────────────────────────────────────
 
-CAMERA_TOPOLOGY: list[dict] = [
-    {
-        "camera_a": "רפת 38", "camera_b": "רפת 26",
-        "zone_a_poly": [(391, 0), (468, 83), (543, 246), (1169, 300), (1040, 0)],
-        "zone_b_poly": [(1343, 284), (0, 111), (10, 1072), (1341, 1070)],
-        "direction_relation": "same",
-    },
-    {
-        "camera_a": "רפת 33", "camera_b": "רפת 38",
-        "zone_a_poly": [(1342, 1073), (1351, 585), (683, 599), (673, 1076)],
-        "zone_b_poly": [(687, 495), (723, 1074), (95, 1074), (380, 504)],
-        "direction_relation": "opposite",
-    },
-]
+def camera_topology() -> list[dict]:
+    """params.yaml camera_topology as the list-of-dicts shape this module uses."""
+    return [
+        {
+            "camera_a": z.camera_a, "camera_b": z.camera_b,
+            "zone_a_poly": [tuple(pt) for pt in z.zone_a_poly],
+            "zone_b_poly": [tuple(pt) for pt in z.zone_b_poly],
+            "direction_relation": z.direction_relation,
+        }
+        for z in _config.params().camera_topology
+    ]
 
 
-def _zone_pairs_for_camera(camera_id: str, topology: list[dict] = CAMERA_TOPOLOGY) -> list[dict]:
+def _zone_pairs_for_camera(camera_id: str, topology: list[dict] | None = None) -> list[dict]:
     """All topology rows involving camera_id, normalized so 'this_poly'/'this_cam'
-    always refers to camera_id and 'partner_poly'/'partner_cam' to the other side."""
+    always refers to camera_id and 'partner_poly'/'partner_cam' to the other side.
+    topology defaults to params.yaml camera_topology."""
+    if topology is None:
+        topology = camera_topology()
     out = []
     for row in topology:
         if row["camera_a"] == camera_id:
@@ -710,7 +735,7 @@ def run_boundary_rendezvous(
     embed_df: pd.DataFrame,           # this session's flat embeddings (temp_id, embed)
     assignment: dict,                 # {temp_id -> real_id or synthetic_id}, mutated in place
     confidence: dict,                 # {temp_id -> float}, see module docstring
-    config: CrossCameraConfig = CrossCameraConfig(),
+    config: CrossCameraConfig | None = None,   # None → from params.yaml
     dry_run: bool = False,
     motion_corr_fn=None,
     protected_tids: set | None = None,   # temp_ids whose id came from manual or kinetic
@@ -720,7 +745,7 @@ def run_boundary_rendezvous(
     `assignment` is also mutated in place for convenience.
 
     `protected_tids` are never overwritten: a manual or collar-confirmed id
-    outranks a cross-camera match (reconcile.SOURCE_PRIORITY). If a boundary
+    outranks a cross-camera match (params identity.source_priority). If a boundary
     match points such a temp_id at a different id, the existing id is kept
     and the disagreement is logged. Unassigned temp_ids and ones resolved by
     appearance alone (cosine) can still be set or changed.
@@ -730,6 +755,8 @@ def run_boundary_rendezvous(
     so same-session conflict protection also covers anything Boundary Rendezvous
     changed. See the design doc's Priority rule section.
     """
+    if config is None:
+        config = CrossCameraConfig.from_params(_config.params())
     log: list[str] = []
     migrate_cross_camera_schema(conn)
 
@@ -859,7 +886,7 @@ if __name__ == "__main__":
     print("  OK")
 
     print("\nTier hierarchy sanity check:")
-    cfg = CrossCameraConfig()
+    cfg = CrossCameraConfig.from_params(_config.params())
     a = PendingObservation(id=1, camera_id="רפת 26", session_id="s1", temp_id=21,
                             enter_time=pd.Timestamp("2026-06-16 09:07:00"),
                             exit_time=pd.Timestamp("2026-06-16 09:07:05"),

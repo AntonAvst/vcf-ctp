@@ -6,29 +6,28 @@ Note on scope: this is the one script in the pipeline that intentionally does
 NOT go through drive_manager.py. It's a standalone correlation utility for
 ad-hoc debugging against any exported tracks.csv / kinetics.csv pair — by
 design it never touches the database (see Databases section of the project
-README). Inside the actual pipeline, reconcile.py and display_tracks.py never
-invoke this CLI; they call score_up_to()/compute_scores() directly with
-in-memory DataFrames that *they* already sourced from drive_manager. If you
-want this CLI mode itself to stop accepting raw file paths too, it would need
-to take --session and call dm.load_collar_data(...) / read tracks from the DB
-instead of --tracks/--kinetics — ask if you want that version instead.
+README). Nothing in the pipeline imports this module today: reconcile.py
+carries its own inline copy of the same correlation logic (Kinetic Matcher),
+and display_tracks.py no longer calls score_up_to(). Merging the two copies
+is a separate ToDo item. Thresholds are shared already — both read
+config/params.yaml kinetic_match.
 
 Strategy:
   - Divide the overlapping time window into 15-minute bins (aligned to kinetics intervals)
   - For each bin: compute camera displacement per temp_id and kinetics delta per animal
   - For each (temp_id, AnimalId) pair: compute Pearson correlation across all bins
-  - Only assign if correlation >= --corr_threshold AND active bins >= --min_active_bins
+  - Only assign if correlation >= corr_threshold AND active bins >= min_active_bins
   - Output: tracks.csv with a new `animal_id` column filled where confident
+
+Thresholds come from config/params.yaml (kinetic_match:, timeline.bin_minutes)
+— the same values reconcile.py uses. Use --params to try other values.
 
 Usage:
     python3 match_identity.py \\
         --tracks   tracks.csv \\
         --kinetics kinetic_data_6558_7509_7774.csv \\
         --output   tracks_identified.csv \\
-        --corr_threshold 0.7 \\
-        --min_active_bins 3 \\
-        --min_temp_id_frames 0.10 \\
-        --activity_pct 0.25
+        [--params  my_params.yaml]
 
 Requirements: pip install pandas numpy scipy
 """
@@ -41,6 +40,8 @@ from itertools import product
 from scipy.stats import pearsonr
 from pathlib import Path
 
+import config
+
 
 # -------------------- CLI --------------------
 
@@ -51,32 +52,10 @@ def parse_args():
     ap.add_argument("--output",   required=True, help="output CSV path")
 
     ap.add_argument(
-        "--corr_threshold", type=float, default=0.7,
-        help="Min Pearson r to accept a temp_id → AnimalId assignment (default: 0.7)"
-    )
-    ap.add_argument(
-        "--min_active_bins", type=int, default=3,
-        help="Min number of kinetics bins where the animal was active (default: 3). "
-             "Prevents matching during long lying/inactive periods."
-    )
-    ap.add_argument(
-        "--min_temp_id_frames", type=float, default=0.10,
-        help="Min fraction of total frames a temp_id must appear in to be considered "
-             "a real cow (default: 0.10 = 10%%). Filters tracker noise."
-    )
-    ap.add_argument(
-        "--activity_pct", type=float, default=0.25,
-        help="A kinetics bin is 'active' if its delta is >= this percentile of all "
-             "deltas for that animal (default: 0.25). Filters lying periods."
-    )
-    ap.add_argument(
-        "--bin_minutes", type=int, default=15,
-        help="Bin width in minutes, should match kinetics sampling interval (default: 15)"
-    )
-    ap.add_argument(
         "--scores_json", default="",
-        help="Optional path to write the full score table as JSON (for display_tracks.py)"
+        help="Optional path to write the full score table as JSON"
     )
+    config.add_params_arg(ap)
     return ap.parse_args()
 
 
@@ -209,12 +188,9 @@ def assign_identities(scores: pd.DataFrame, corr_threshold: float) -> dict:
 
 # -------------------- main --------------------
 
-def run(tracks_path, kinetics_path,
-        corr_threshold=0.7, min_active_bins=3,
-        min_temp_id_frames=0.10, activity_pct=0.25,
-        bin_minutes=15):
+def run(tracks_path, kinetics_path):
     """
-    Callable entry point for display_tracks.py.
+    Callable entry point. Thresholds come from config.params().
     Returns (assignment dict {temp_id -> AnimalId}, scores DataFrame).
     """
     import types
@@ -222,11 +198,6 @@ def run(tracks_path, kinetics_path,
         tracks=tracks_path,
         kinetics=kinetics_path,
         output=None,
-        corr_threshold=corr_threshold,
-        min_active_bins=min_active_bins,
-        min_temp_id_frames=min_temp_id_frames,
-        activity_pct=activity_pct,
-        bin_minutes=bin_minutes,
         scores_json="",
     )
     return _run(args)
@@ -234,6 +205,7 @@ def run(tracks_path, kinetics_path,
 
 def main():
     args = parse_args()
+    config.init(args.params)
     assignment, scores = _run(args)
 
     # write output CSV
@@ -254,6 +226,8 @@ def main():
 def _run(args):
     """Core logic shared by main() and run(). Returns (assignment, scores_df)."""
     args = parse_args() if args is None else args
+    km = config.params().kinetic_match
+    bin_minutes = config.params().timeline.bin_minutes
 
     log(f"Loading tracks:   {args.tracks}")
     tracks = pd.read_csv(args.tracks, parse_dates=["frame_datetime"])
@@ -264,15 +238,15 @@ def _run(args):
     # ---- filter stable temp_ids ----
     total_frames = tracks["frame_index"].nunique()
     tid_counts = tracks.groupby("temp_id")["frame_index"].nunique()
-    stable_tids = tid_counts[tid_counts / total_frames >= args.min_temp_id_frames].index.tolist()
-    log(f"Stable temp_ids (>={args.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
+    stable_tids = tid_counts[tid_counts / total_frames >= km.min_temp_id_frames].index.tolist()
+    log(f"Stable temp_ids (>={km.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
     tracks = tracks[tracks["temp_id"].isin(stable_tids)]
 
     # ---- define time bins covering the overlap window ----
-    t_start = tracks["frame_datetime"].min().floor(f"{args.bin_minutes}min")
-    t_end   = tracks["frame_datetime"].max().ceil(f"{args.bin_minutes}min")
-    bins = pd.date_range(start=t_start, end=t_end, freq=f"{args.bin_minutes}min")
-    log(f"Time bins: {len(bins)-1} x {args.bin_minutes}-min windows from {t_start} to {t_end}")
+    t_start = tracks["frame_datetime"].min().floor(f"{bin_minutes}min")
+    t_end   = tracks["frame_datetime"].max().ceil(f"{bin_minutes}min")
+    bins = pd.date_range(start=t_start, end=t_end, freq=f"{bin_minutes}min")
+    log(f"Time bins: {len(bins)-1} x {bin_minutes}-min windows from {t_start} to {t_end}")
 
     if len(bins) < 3:
         log("WARNING: fewer than 2 complete bins — correlation will be unreliable.")
@@ -287,7 +261,7 @@ def _run(args):
 
     # ---- score all pairs ----
     log("Scoring all (temp_id, AnimalId) pairs...")
-    scores = compute_scores(cam_disp, kin_delta, args.activity_pct, args.min_active_bins)
+    scores = compute_scores(cam_disp, kin_delta, km.activity_pct, km.min_active_bins)
 
     # ---- print score matrix ----
     print("\n=== Correlation matrix (temp_id x AnimalId) ===")
@@ -301,9 +275,9 @@ def _run(args):
     print()
 
     # ---- assign ----
-    assignment = assign_identities(scores, args.corr_threshold)
+    assignment = assign_identities(scores, km.corr_threshold)
 
-    print(f"=== Assignments (threshold={args.corr_threshold}) ===")
+    print(f"=== Assignments (threshold={km.corr_threshold}) ===")
     if assignment:
         for tid, aid in sorted(assignment.items()):
             row = scores[(scores["temp_id"]==tid) & (scores["AnimalId"]==aid)].iloc[0]
@@ -311,7 +285,7 @@ def _run(args):
                   f"(r={row['correlation']:.3f}, n_bins={int(row['n_bins'])})")
     else:
         print("  No confident assignments found. "
-              "Try lowering --corr_threshold or providing a longer video.")
+              "Try lowering kinetic_match.corr_threshold in params.yaml or providing a longer video.")
 
     unmatched_tids = set(stable_tids) - set(assignment.keys())
     if unmatched_tids:
@@ -325,17 +299,19 @@ def _run(args):
 
 def score_up_to(tracks_df: "pd.DataFrame",
                 kinetics_df: "pd.DataFrame",
-                up_to_datetime,
-                bin_minutes: int = 15,
-                activity_pct: float = 0.25,
-                min_active_bins: int = 1,
-                min_temp_id_frames: float = 0.10) -> "tuple[dict, pd.DataFrame]":
+                up_to_datetime) -> "tuple[dict, pd.DataFrame]":
     """
     Compute matching scores using only data up to `up_to_datetime`.
-    Called on each new kinetics interval boundary during live playback.
+    Meant to be called on each new kinetics interval boundary during playback.
     Returns (assignment dict, scores DataFrame) — same format as run().
-    min_active_bins defaults to 1 here so early intervals still produce scores.
+    Uses kinetic_match.live_min_active_bins (default 1) instead of
+    min_active_bins so early intervals still produce scores.
     """
+    km = config.params().kinetic_match
+    bin_minutes        = config.params().timeline.bin_minutes
+    activity_pct       = km.activity_pct
+    min_active_bins    = km.live_min_active_bins
+    min_temp_id_frames = km.min_temp_id_frames
     # filter tracks to window seen so far
     tracks_window = tracks_df[tracks_df["frame_datetime"] <= up_to_datetime].copy()
     if tracks_window.empty:
@@ -366,7 +342,7 @@ def score_up_to(tracks_df: "pd.DataFrame",
     if scores.empty:
         return {}, scores
 
-    assignment = assign_identities(scores, corr_threshold=0.7)
+    assignment = assign_identities(scores, corr_threshold=km.corr_threshold)
     return assignment, scores
 
 
@@ -378,14 +354,10 @@ if __name__ == "__main__":
 # python3 match_identity.py \
 #   --tracks   tracks.csv \
 #   --kinetics kinetic_data_6558_7509_7774.csv \
-#   --output   tracks_identified.csv \
-#   --corr_threshold 0.7 \
-#   --min_active_bins 3 \
-#   --min_temp_id_frames 0.10 \
-#   --activity_pct 0.25
+#   --output   tracks_identified.csv
 #
-# Key parameters to tune:
-#   --corr_threshold   lower (e.g. 0.5) if too few matches; raise (e.g. 0.85) for stricter matching
-#   --min_active_bins  requires this many active kinetics intervals — needs longer video to satisfy
-#   --activity_pct     fraction of bins considered "active" per animal — raise if cows are very inactive
-#   --bin_minutes      should match your kinetics sampling interval (typically 15)
+# Tune in config/params.yaml (kinetic_match:, timeline.bin_minutes):
+#   corr_threshold    lower (e.g. 0.5) if too few matches; raise (e.g. 0.85) for stricter matching
+#   min_active_bins   requires this many active kinetics intervals — needs longer video to satisfy
+#   activity_pct      fraction of bins considered "active" per animal — raise if cows are very inactive
+#   bin_minutes       should match your kinetics sampling interval (typically 15)

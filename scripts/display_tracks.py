@@ -34,6 +34,7 @@ from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableErr
 
 # session_id derivation — single source of truth, shared with track_and_dump.py
 from track_and_dump import parse_filename, make_session_id
+import config
 
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
@@ -311,7 +312,7 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
     masks_df = None
     if want_masks and masks_parquet_path:
         masks_dir = Path(masks_parquet_path).parent
-        # QA-only files, written by track_and_dump.py --save_masks to qa_masks/
+        # QA-only files, written by track_and_dump.py (cli.yaml save_masks) to qa_masks/
         # (local disk only — never on Drive, never in the main DB).
         part_files = sorted(masks_dir.glob("masks_part*.parquet"))
         if not part_files and Path(masks_parquet_path).exists():
@@ -324,8 +325,8 @@ def stream_sqlite(db_path, session_id, start_frame=0, want_pose=False, kps_parqu
             masks_df = masks_df.set_index(["frame_index","temp_id"])
             log(f"masks parquet loaded: {len(part_files)} part(s), {len(masks_df)} rows for session")
         else:
-            log(f"--draw_masks set but no qa_masks/masks_part*.parquet found in {masks_dir} "
-                f"(re-run track_and_dump.py with --save_masks to generate it)")
+            log(f"draw_masks set but no qa_masks/masks_part*.parquet found in {masks_dir} "
+                f"(re-run track_and_dump.py with save_masks: true in cli.yaml)")
     try:
         rows = conn.execute("""
             SELECT frame_index,frame_datetime,temp_id,det_conf,x1,y1,x2,y2,kps_conf,kps_parquet_row
@@ -821,7 +822,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         # whose frame_index didn't land exactly on frame_idx (guaranteed
         # whenever ff_speed>1, since frame_idx then jumps in steps of
         # ff_speed, and also possible at 1x since samples are spaced by
-        # --save_every and aren't guaranteed to align) was fetched from
+        # sampling.save_every and aren't guaranteed to align) was fetched from
         # row_stream and then silently thrown away. That's why boxes froze
         # (cache never refreshed) and then appeared to "taper off" — a much
         # later sample would eventually land exactly on frame_idx and wipe
@@ -861,7 +862,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         for d in dets:
             _aid = assignment.get(int(d["temp_id"]))
 
-            # Live classification (all temp_ids, requires --draw_pose / kps loaded)
+            # Live classification (all temp_ids, requires draw_pose / kps loaded)
             _feats = classify_frame_features(d) if d.get("kps") else None
 
             # Fall back to DB lookup for resolved cows when live classify unavailable
@@ -919,45 +920,27 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 def parse_args():
-    ap = argparse.ArgumentParser()
+    """--video / --session_id / --bypass_upload_check / --params come from the
+    command line; every display option comes from config/cli.yaml
+    (display_tracks:). Both are merged into one namespace so the rest of the
+    script reads args.<name> exactly as before."""
+    ap = argparse.ArgumentParser(
+        description="Browser track visualiser. Overlay options: config/cli.yaml "
+                    "(display_tracks:).")
     ap.add_argument("--video",      required=True)
     # NOTE: no --db argument. The DB is always the canonical copy pulled from
     # Drive via drive_manager.py.
     ap.add_argument("--session_id", default="",
                      help="Override auto-derived session_id (normally derived "
                           "from --video filename, same logic as track_and_dump.py)")
-    ap.add_argument("--start",      type=int,   default=0)
-    ap.add_argument("--max_fps",    type=float, default=0.0)
-    ap.add_argument("--sink",       default="web",
-                    choices=["web","mp4"],
-                    help="web = browser MJPEG (default), mp4 = save to file")
-    ap.add_argument("--outmp4",     default="annotated.mp4")
-    ap.add_argument("--limit",      type=int,   default=0)
-    ap.add_argument("--port",       type=int,   default=5000)
-    ap.add_argument("--draw_pose",  action="store_true")
-    ap.add_argument("--draw_masks", action="store_true",
-                     help="Overlay segmentation mask polygons (QA/visualization only). "
-                          "Reads outputs/<session_id>/qa_masks/masks_part*.parquet, written "
-                          "by track_and_dump.py --save_masks. No-op (with a log warning) if "
-                          "that file doesn't exist — re-run track_and_dump.py with "
-                          "--save_masks first to generate it.")
-    ap.add_argument("--kp_radius",  type=int,   default=3)
-    ap.add_argument("--sk_thickness",type=int,  default=2)
-    ap.add_argument("--kp_thresh",  type=float, default=0.0)
-    ap.add_argument("--hide_occluded",  action="store_true")
-    ap.add_argument("--kp_conf_thresh", type=float, default=0.30)
-    ap.add_argument("--show_lowconf",   action="store_true")
-    ap.add_argument("--kp_index",       action="store_true")
-    ap.add_argument("--kp_index_scale",     type=float, default=0.45)
-    ap.add_argument("--kp_index_thickness", type=int,   default=1)
-    ap.add_argument("--kp_index_offset",    type=int,   default=6)
-    # NOTE: no --kinetic_csv / --behavior_csv. Sensor data is always
-    # auto-discovered from Drive by session time window via drive_manager.
-    ap.add_argument("--sensor_lookback", type=float, default=2.0)
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
-    return ap.parse_args()
+    config.add_params_arg(ap)   # cameras for session_id derivation
+    cli_args = ap.parse_args()
+    config.init(cli_args.params)
+    opts = vars(config.cli().display_tracks)
+    return argparse.Namespace(**opts, **vars(cli_args))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1090,11 +1073,11 @@ if __name__ == "__main__":
     main()
 
 
-# Example usage (--sink flag is now optional, defaults to web):
-# python3 display_tracks.py \
-#   --video      "$VID" \
-#   --draw_pose --kp_index --hide_occluded --kp_conf_thresh 0.35
-# (session_id is now auto-derived from $VID's filename, same logic as
+# Example usage:
+# python3 display_tracks.py --video "$VID"
+# Overlays (draw_pose, kp_index, hide_occluded, kp_conf_thresh, ...) are set in
+# config/cli.yaml under display_tracks:.
+# (session_id is auto-derived from $VID's filename, same logic as
 #  track_and_dump.py; pass --session_id explicitly only to override.
 #  db and sensor data are always resolved via drive_manager.py — there
 #  is no --db, --kinetic_csv, or --behavior_csv flag.)

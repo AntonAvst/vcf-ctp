@@ -14,8 +14,8 @@ Writes:
 
 Usage:
   python3 metrics_export.py                        # always uses drive_manager paths
-  python3 metrics_export.py --out path/to/out.json  # override OUTPUT path only (not a data source)
-  python3 metrics_export.py --watch                 # re-export every 30 s (dev mode)
+  # output path, --watch (re-export every 30 s), pretty-printing:
+  #   config/cli.yaml → metrics_export: {out, watch, pretty}
 
 Note: there is no --db, --collar, --gallery, --proclog, or --buffer flag.
 Every data path is imported directly from drive_manager.py — never
@@ -41,6 +41,7 @@ from drive_manager import (
     LOCAL_ROOT, LOCAL_DB_PATH, LOCAL_GALLERY_DIR, LOCAL_COLLAR_DIR, BUFFER_DIR,
     DriveManager,
 )
+import config
 
 SCRIPTS_DIR  = Path(__file__).parent
 
@@ -48,7 +49,7 @@ DEFAULT_DB           = LOCAL_DB_PATH
 DEFAULT_COLLAR_DIR   = LOCAL_COLLAR_DIR
 DEFAULT_GALLERY_DIR  = LOCAL_GALLERY_DIR
 DEFAULT_PROC_LOG     = LOCAL_ROOT / "processing_log.csv"          # synced from Drive
-DEFAULT_OUT          = SCRIPTS_DIR.parent / "metrics" / "metrics.json"
+# output path / watch / pretty: config/cli.yaml → metrics_export:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -200,7 +201,8 @@ def export_identity(conn: sqlite3.Connection) -> dict:
            FROM resolved_cow_timeline
            GROUP BY modality_mask ORDER BY modality_mask""")
 
-    # Pearson r scores — stored in a scores table if reconcile was run with --verbose
+    # Pearson r scores — read from kinetic_match_scores if that table exists
+    # (no pipeline step writes it yet; the query returns nothing until one does)
     # Fallback: reconstruct approximate distribution from timeline confidence columns
     pearson_rows = _safe_query(conn,
         "SELECT corr_score FROM kinetic_match_scores")  # may not exist yet
@@ -528,16 +530,11 @@ def main():
     # NOTE: no --db / --collar / --gallery / --proclog / --buffer flags.
     # All data paths come directly from drive_manager.py's constants — see
     # the module docstring for why.
-    parser.add_argument("--out",     default=str(DEFAULT_OUT),
-                        help="Output path for metrics.json (the only overridable path — "
-                             "it's a destination, not a data source)")
-    parser.add_argument("--watch",   action="store_true",
-                        help="Re-export every 30 s (dev mode)")
-    parser.add_argument("--pretty",  action="store_true", default=True,
-                        help="Pretty-print JSON (default: on)")
+    # out / watch / pretty: config/cli.yaml → metrics_export:
     parser.add_argument("--bypass_upload_check", action="store_true",
                         help="Skip dirty-flag check when pulling the DB from Drive")
     args = parser.parse_args()
+    M = config.cli().metrics_export
 
     # Pull the canonical DB from Drive (dev dashboard reads — never writes)
     dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
@@ -552,19 +549,19 @@ def main():
     gallery_dir = DEFAULT_GALLERY_DIR
     proc_log    = DEFAULT_PROC_LOG
     buffer_dir  = BUFFER_DIR
-    out_path    = Path(args.out).expanduser()
+    out_path    = config.resolve_path(M.out)
 
     def run_once():
         data = export_all(db_path, collar_dir, gallery_dir, proc_log, buffer_dir)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        indent = 2 if args.pretty else None
+        indent = 2 if M.pretty else None
         out_path.write_text(json.dumps(data, indent=indent, default=str))
         size = out_path.stat().st_size
         print(f"[{datetime.now().strftime('%H:%M:%S')}] metrics.json written "
               f"({size:,} bytes) → {out_path}")
         return data
 
-    if args.watch:
+    if M.watch:
         print(f"Watch mode — refreshing every 30 s. Ctrl+C to stop.")
         while True:
             try:

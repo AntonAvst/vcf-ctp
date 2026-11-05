@@ -46,7 +46,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import config
 from .schema import (
+    BACK_KPS, N_KP,
     TIMELINE_VISION_COLS, TIMELINE_ALTER_SQLS,
     Posture, Facing,
     slot_name,
@@ -236,15 +238,15 @@ def _run_extractors(kps_df: pd.DataFrame) -> pd.DataFrame:
         return kps_df
 
     # Stack arrays for vectorised ops
-    kps_3d   = np.stack(kps_df["kps_flat"].values).reshape(N, 19, 3)   # (N, 19, 3)
+    kps_3d   = np.stack(kps_df["kps_flat"].values).reshape(N, N_KP, 3)  # (N, 19, 3)
     kps_kc   = np.stack(kps_df["kps_kconf"].values)                     # (N, 19)
     bbox     = kps_df[["x1","y1","x2","y2"]].values.astype(np.float32) # (N, 4)
     det_conf = kps_df["det_conf"].values.astype(np.float32)             # (N,)
 
     # ── Diagnostic: log distributions to help tune thresholds ───────────────
-    back_kp_indices = [2, 3, 4, 5]   # WITHERS, SPINE_MID, SACRUM, TAIL_BASE
+    back_kp_indices = [int(k) for k in BACK_KPS]
     back_confs = kps_kc[:, back_kp_indices]
-    log(f"  kps_kconf back KPs (2,3,4,5) — "
+    log(f"  kps_kconf back KPs {tuple(back_kp_indices)} — "
         f"min={back_confs.min():.3f}  p25={np.percentile(back_confs,25):.3f}  "
         f"median={np.median(back_confs):.3f}  p75={np.percentile(back_confs,75):.3f}  "
         f"max={back_confs.max():.3f}")
@@ -252,11 +254,14 @@ def _run_extractors(kps_df: pd.DataFrame) -> pd.DataFrame:
         f"min={det_conf.min():.3f}  median={np.median(det_conf):.3f}  max={det_conf.max():.3f}")
     w = bbox[:,2] - bbox[:,0]; h = bbox[:,3] - bbox[:,1]
     ar = w / np.maximum(h, 1e-6)
+    _pc = config.params().vision.posture
+    smax, lmin = _pc.standing_max_ar, _pc.lying_min_ar
     log(f"  bbox aspect ratio (w/h) — "
         f"min={ar.min():.2f}  p25={np.percentile(ar,25):.2f}  "
         f"median={np.median(ar):.2f}  p75={np.percentile(ar,75):.2f}  "
         f"max={ar.max():.2f}  "
-        f"[standing AR<0.85: {(ar<0.85).sum()}  lying AR>1.10: {(ar>1.10).sum()}  uncertain: {((ar>=0.85)&(ar<=1.10)).sum()}]")
+        f"[standing AR<={smax}: {(ar<=smax).sum()}  lying AR>={lmin}: {(ar>=lmin).sum()}  "
+        f"uncertain: {((ar>smax)&(ar<lmin)).sum()}]")
 
     # ── Posture ───────────────────────────────────────────────────────────────
     posture_out = extract_posture(
@@ -293,13 +298,16 @@ def aggregate_window(window_rows: pd.DataFrame) -> dict:
 
     Add new aggregate calls here as new features are introduced.
     """
+    min_conf = config.params().vision.aggregate_min_conf
     posture_feats = aggregate_posture(
         posture=window_rows["posture"].values.astype(np.int8),
         posture_conf=window_rows["posture_conf"].values.astype(np.float32),
+        min_conf=min_conf,
     )
     facing_feats = aggregate_facing(
         facing=window_rows["facing"].values.astype(np.int8),
         facing_conf=window_rows["facing_conf"].values.astype(np.float32),
+        min_conf=min_conf,
     )
     return {**posture_feats, **facing_feats}
 
@@ -318,10 +326,7 @@ def run_vision_features(
     kps_parquet:       str | None = None,
     embed_parquet:     str | None = None,
     gallery_dir:       str        = "./reid_gallery",
-    ema_alpha:         float      = 0.15,
-    min_slot_conf:     float      = 0.30,
     dry_run:           bool       = False,
-    bin_minutes:       int        = 15,
     merge_map:         dict | None = None,   # {loser_tid -> winner_tid} from Duplicate Resolver
 ) -> pd.DataFrame:
     """
@@ -337,10 +342,13 @@ def run_vision_features(
     kps_parquet     : path to kps.parquet for this session (optional).
     embed_parquet   : path to embeds.parquet (for gallery slot update).
     gallery_dir     : directory containing gallery_pose_*.npy files.
-    ema_alpha       : EMA learning rate for gallery update.
-    min_slot_conf   : min confidence to assign a frame to a gallery slot.
     dry_run         : if True, skip all writes.
-    bin_minutes     : window size in minutes (must match Sensor Sequencer).
+
+    Thresholds come from config/params.yaml, not arguments, so this step can
+    never disagree with the rest of reconcile:
+        gallery.ema_alpha      EMA learning rate for the pose-gallery update
+        vision.min_slot_conf   min posture AND facing conf to feed a slot
+        timeline.bin_minutes   window size (same grid as Sensor Sequencer)
 
     Returns
     -------
@@ -348,6 +356,10 @@ def run_vision_features(
     """
     section("Vision Feature Extraction")
     log(f"session_id: {session_id}  |  is_night: {is_night}  |  dry_run: {dry_run}")
+    P = config.params()
+    ema_alpha     = P.gallery.ema_alpha
+    min_slot_conf = P.vision.min_slot_conf
+    bin_minutes   = P.timeline.bin_minutes
 
     if timeline_df.empty:
         log("timeline_df is empty — nothing to do.")

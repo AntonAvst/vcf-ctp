@@ -69,26 +69,26 @@ signal.signal(signal.SIGINT, _handle_sigint)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration — edit these if your paths change
+# Configuration — config/cli.yaml → storage:  (edit there, not here)
+#   rclone_remote  from `rclone listremotes`
+#   drive_folder   Drive root folder under that remote
+#   local_root     local write buffer
+#   buffer_dir     local-only buffer/flags/logs, never uploaded
+#   max_attempts   upload attempts per file (across sessions) before 'abandoned'
+#   backoff_base   in-session retry waits: base^(2·attempt) s → 2s, 8s, 32s
+# Read once at import (cli.yaml has a fixed location, so no CLI flag can
+# change it — every importer sees the same storage).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# rclone remote name (from `rclone listremotes`)
-RCLONE_REMOTE = "thesis_google_drive"
+import config as _config
+_STORAGE = _config.cli().storage
 
-# Root folder on Google Drive
-DRIVE_ROOT = f"{RCLONE_REMOTE}:vcf_ctp_data"
-
-# Local working directory (write buffer)
-LOCAL_ROOT = Path("~/thesis_workspace/vcf-ctp/data").expanduser()
-
-# Buffer directory (local only, never uploaded)
-BUFFER_DIR = Path("~/thesis_workspace/vcf-ctp/.buffer").expanduser()
-
-# Max upload attempts per file (across all sessions)
-MAX_ATTEMPTS = 5
-
-# Retry backoff in seconds (attempt 1→2s, 2→8s, 3→32s)
-BACKOFF_BASE = 2
+RCLONE_REMOTE = _STORAGE.rclone_remote
+DRIVE_ROOT    = f"{RCLONE_REMOTE}:{_STORAGE.drive_folder}"
+LOCAL_ROOT    = Path(_STORAGE.local_root).expanduser()
+BUFFER_DIR    = Path(_STORAGE.buffer_dir).expanduser()
+MAX_ATTEMPTS  = _STORAGE.max_attempts
+BACKOFF_BASE  = _STORAGE.backoff_base
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal paths (derived from constants above — don't edit)

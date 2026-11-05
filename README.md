@@ -11,6 +11,25 @@
 
 ## Existing Code
 
+### Configuration — `config.py` + `config/`
+Two YAML files hold every setting; scripts keep no defaults of their own.
+
+| File | Holds | Examples |
+|---|---|---|
+| `config/params.yaml` | Everything that changes what the pipeline **computes** | model paths, detection/pose thresholds, kinetic match, gallery EMA, cosine threshold, co-occurrence, trust order, posture/facing thresholds, cross-camera tiers, cameras + zone polygons |
+| `config/cli.yaml` | How scripts **run** and what QA output they produce | `save_crops`, `save_masks`, `crop_tags`, display overlays, metrics output, Drive/local storage |
+| `vision_features/schema.py` | **Fixed** structural constants — not config | `EMBED_DIM`=128, `N_KP`=19, KP map, 8 gallery slots, ImageNet mean/std, `BACK_KPS` |
+
+- `config.py` loads both into frozen, typed objects. **Strict:** a missing key, an unknown key (typo) or a wrong type is an error naming the key; cross-field rules are checked too (`standing_max_ar < lying_min_ar`, `manual` first in `source_priority`, topology cameras must be listed under `cameras`, ASCII camera codes, values in [0,1] where required).
+- Validate after editing: `python3 config.py` (or `python3 config.py my_params.yaml`)
+- Threshold sweep without touching the main file: any script `--params config/params_strict.yaml`. Only params can be swapped; `cli.yaml` is fixed at `config/cli.yaml` because `drive_manager` reads `storage:` at import.
+- Values are read when a function runs, never at import, so `--params` always takes effect.
+- Relative paths resolve against `scripts/`; `detection.tracker` as a bare name resolves to `config/` (where `bytetrack.yaml` / `botsort.yaml` live).
+- **Command-line flags that remain:** inputs (`--source`, `--video`, `--session_id`, `--session`), operations (`assign_identity --assign/--remove/--list/--note/--run_reconcile`, `drive_manager <command>`, ledger `--file/--farm/--overwrite`, `match_identity --tracks/--kinetics/--output/--scores_json`), one-shot safety switches (`--dry_run`, `--bypass_upload_check` — deliberately never settable in a file), and `--params`.
+- **Reproducibility:** every session stores the exact params file it ran with on Drive — `outputs/<session_id>/params_track.yaml` (written by `track_and_dump.py`) and `params_reconcile.yaml` (rewritten on every reconcile run, since reconcile can be re-run with different params later). `processing_log.csv` has a `params_hash` column (short sha256 of the file); older logs are upgraded in place on the next flush.
+
+---
+
 ### `drive_manager.py`
 - Central Google Drive I/O abstraction layer — all scripts read/write through this module
 - Drive (`thesis_google_drive:vcf_ctp_data`) is the single source of truth for all data
@@ -19,14 +38,16 @@
 - Upload failures are buffered locally (`.buffer/pending/`) and retried automatically
 - All uploads logged locally to `upload_log_staging.csv`; flushed to `upload_log.csv` on Drive in a single round-trip at end of batch — never once per file
 - Graceful Ctrl+C: finishes the current file, flushes staged log rows, then exits cleanly
-- Key path constants (edit once at top of file):
+- Storage settings live in `config/cli.yaml` → `storage:` (module constants are derived from it at import):
 
-| Constant | Value |
-|---|---|
-| `RCLONE_REMOTE` | `thesis_google_drive` |
-| `DRIVE_ROOT` | `thesis_google_drive:vcf_ctp_data` |
-| `LOCAL_ROOT` | `~/thesis_workspace/vcf-ctp/data/` |
-| `BUFFER_DIR` | `~/thesis_workspace/vcf-ctp/.buffer/` |
+| Key | Value | Becomes |
+|---|---|---|
+| `rclone_remote` | `thesis_google_drive` | `RCLONE_REMOTE` |
+| `drive_folder` | `vcf_ctp_data` | `DRIVE_ROOT` = `thesis_google_drive:vcf_ctp_data` |
+| `local_root` | `~/thesis_workspace/vcf-ctp/data` | `LOCAL_ROOT` |
+| `buffer_dir` | `~/thesis_workspace/vcf-ctp/.buffer` | `BUFFER_DIR` |
+| `max_attempts` | 5 | `MAX_ATTEMPTS` |
+| `backoff_base` | 2 | `BACKOFF_BASE` |
 
 **Library API (imported by other scripts):**
 
@@ -75,7 +96,7 @@ python3 drive_manager.py clear-flag      db|parquet|gallery   # emergency manual
 - Animal IDs sorted ascending, joined with `_`
 
 **Collar auto-discovery** (`find_collar_files` / `load_collar_data`):
-- Called automatically by `reconcile.py` and `track_and_dump.py` when `--kinetics` is not provided
+- Called automatically by `reconcile.py` and `track_and_dump.py` (there is no manual kinetics-path flag)
 - Lists `collar_data/` on Drive, parses `s/e` timestamps from filenames, keeps files whose window overlaps the session window
 - Pulls matching files to local `collar_data/` (skips if already present)
 - Merges all matching files into a single DataFrame, deduplicating rows by `(AnimalId, datetime)`
@@ -105,8 +126,8 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 
 ### `track_and_dump.py`
 - Runs YOLO detection + ByteTrack/BoT-SORT tracking + YOLOv8-Pose (19 kp) + Embedder128 (MobileNetV3 → 128D L2-norm)
-- **Detector accepts either a plain detection model or a YOLO-seg (instance segmentation) model** — same `--model` flag, auto-detected via `det_model.task` at load time (logged at startup: `det. task : detect|segment`)
-  - **Segmentation model loaded** → `r.masks.xy` polygons are extracted per detection (same index order as `r.boxes`) and used to build **background-removed crops for the embedder only** (`masked_crops_from_polys()`), fixing background contamination in ReID embeddings. Pose-model input and saved crop JPEGs (`--save_crops`) deliberately keep using raw bbox crops — unaffected, so the existing pose model's input distribution doesn't shift.
+- **Detector accepts either a plain detection model or a YOLO-seg (instance segmentation) model** — same `models.detector` setting in params.yaml, auto-detected via `det_model.task` at load time (logged at startup: `det. task : detect|segment`)
+  - **Segmentation model loaded** → `r.masks.xy` polygons are extracted per detection (same index order as `r.boxes`) and used to build **background-removed crops for the embedder only** (`masked_crops_from_polys()`), fixing background contamination in ReID embeddings. Pose-model input and saved crop JPEGs (`save_crops`) deliberately keep using raw bbox crops — unaffected, so the existing pose model's input distribution doesn't shift.
   - **Plain detection model loaded** → behavior unchanged from before segmentation support; embedder uses raw bbox crops.
   - Tracker association (ByteTrack/BoT-SORT) stays **box-IoU only** regardless of model type — mask-IoU association is a separate, not-yet-implemented upgrade (see ToDo).
 - **Batch mode:** `--source` accepts either a single video file or a directory — processes all video files in the directory sequentially
@@ -115,44 +136,30 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 - DB pulled from Drive **once** at startup and reused across all videos
 - Outputs to Drive via `drive_manager` per session: `calving_project.db` (SQLite), `embeds.parquet`, `kps.parquet`, optional `crops/`
 - Arrays (embed[128], kps[19×3], kps_kconf[19]) stored in Parquet — **never in SQLite**
-- **QA-only mask persistence (`--save_masks`):** when enabled with a segmentation model, mask polygons are additionally written to `outputs/<session_id>/qa_masks/masks_part*.parquet` (own schema, own filename prefix) — purely for visualization in `display_tracks.py --draw_masks`. Structurally isolated from the canonical outputs: separate subdirectory, separate file prefix, **never uploaded to Drive** (the end-of-video upload loop globs `embeds_part*`/`kps_part*` directly in `outdir`, non-recursive — `qa_masks/` is invisible to it by directory and by filename pattern), never touches `raw_tracks` or any other pipeline stage. No-op with a log line if the loaded model has no segmentation head.
+- **QA-only mask persistence (`save_masks` in cli.yaml):** when enabled with a segmentation model, mask polygons are additionally written to `outputs/<session_id>/qa_masks/masks_part*.parquet` (own schema, own filename prefix) — purely for visualization in `display_tracks.py` (`draw_masks`). Structurally isolated from the canonical outputs: separate subdirectory, separate file prefix, **never uploaded to Drive** (the end-of-video upload loop globs `embeds_part*`/`kps_part*` directly in `outdir`, non-recursive — `qa_masks/` is invisible to it by directory and by filename pattern), never touches `raw_tracks` or any other pipeline stage. No-op with a log line if the loaded model has no segmentation head.
 - Parses wall-clock start time from filename token `_S<YYYYMMDDHHmmss>`
-- Collar CSVs auto-discovered from Drive by matching session time window — no `--kinetics` needed
+- Collar CSVs auto-discovered from Drive by matching session time window
 - **Calls `reconcile.py` automatically** after each video finishes
 - Appends one row per processed video to `processing_log.csv` on Drive (flushed once at end of batch)
 - Ctrl+C finishes the current video cleanly, logs it as `interrupted`, then stops before the next video
 
-**`processing_log.csv` columns:** `timestamp, session_id, filename, status, frames, duration_s, fps_processed, error`  
+**`processing_log.csv` columns:** `timestamp, session_id, filename, status, frames, duration_s, fps_processed, error, params_hash`  
 **Status values:** `ok` · `interrupted` (Ctrl+C mid-video) · `skipped` (Ctrl+C before start) · `error`
 
-- Key CLI flags:
+- CLI: `--source` (file or directory), `--bypass_upload_check`, `--params`. Everything else is config:
 
-| Flag | Default | Purpose |
+| Setting | File → key | Default |
 |---|---|---|
-| `--model` | required | Detector `.pt` — plain detection or YOLO-seg, auto-detected |
-| `--source` | required | Single video file or directory of videos (local only) |
-| `--tracker` | `bytetrack.yaml` | Tracker config |
-| `--imgsz` | 960 | Detector image size |
-| `--conf` | 0.25 | Detection confidence threshold |
-| `--iou` | 0.45 | NMS IoU threshold |
-| `--pose_model` | *(optional)* | YOLOv8-Pose `.pt` |
-| `--pose_imgsz` | 384 | Pose crop size |
-| `--pose_conf` | 0.25 | Pose confidence threshold |
-| `--pose_kp_conf_thresh` | 0.30 | Per-keypoint conf: ≥ → vis=2, < → vis=1 |
-| `--embed_size` | 128 | Embedding dimension |
-| `--save_crops` | off | Save JPEG crops |
-| `--crop_every` | 1 | Save crop every N-th detection |
-| `--min_crop_wh` | 0 0 | Min crop width/height |
-| `--crop_tags` | off | Append `_<posture>_<facing>` to crop filenames (requires `--pose_model` and `vision_features/`) |
-| `--crops_local` | off | Keep crops on local disk only — do not upload to Drive |
-| `--save_masks` | off | QA-only: save mask polygons to `qa_masks/` (local disk, never uploaded). No-op without a segmentation model |
-| `--save_every` | 10 | Sampling window: keep latest detection per temp_id per N frames |
-| `--flush_every` | 5 | Flush to SQLite + Parquet every M windows (i.e. every N×M frames) |
-| `--kinetics` | *(auto)* | Manual kinetics CSV override; if omitted, auto-discovered from Drive |
-| `--corr_threshold` | 0.7 | Kinetic match Pearson r threshold |
-| `--cosine_threshold` | 0.75 | Cosine similarity threshold |
-| `--ema_alpha` | 0.15 | Gallery EMA decay |
-| `--bypass_upload_check` | off | Skip dirty-flag check (proceeds with stale Drive data) |
+| Detector / pose model | params `models.detector` / `models.pose` (`null` = no pose) | `../models/cow_seg/run14/weights/best.pt` / `../models/cow_pose/best.pt` |
+| Detector size / conf / NMS IoU | params `detection.imgsz` / `conf` / `iou` | 960 / 0.25 / 0.45 |
+| Tracker config | params `detection.tracker` | `bytetrack.yaml` (in `config/`) |
+| Pose size / conf / per-kp vis split | params `pose.imgsz` / `conf` / `kp_conf_thresh` | 384 / 0.25 / 0.30 |
+| Embedder crop size / bbox margin | params `embedder.input_size` / `crop_margin` | 224 / 0.10 |
+| Sampling window / flush cadence / parquet part size | params `sampling.save_every` / `flush_every` / `parquet_rows_per_part` | 10 / 5 / 50000 |
+| Crops: save / local-only / tags / every N / min size | cli `track_and_dump.save_crops` / `crops_local` / `crop_tags` / `crop_every` / `min_crop_wh` | off / off / off / 1 / [0,0] |
+| QA mask polygons | cli `track_and_dump.save_masks` | off |
+
+Reconcile thresholds are no longer passed by `track_and_dump.py` — reconcile reads the same loaded params (previously six reconcile values were hardcoded at this call site and ignored reconcile's own flags).
 
 ---
 
@@ -165,27 +172,18 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 - Syncs DB and updated gallery `.npy` files back to Drive after completion
 - Steps in order: A (kinetic match) → A.5 (merge manual overrides) → B (gallery builder) → C (cosine resolver) → A.6 (resolve duplicate assignments) → D (sensor sequencer) → B-vision (vision feature extractor) → E (write to DB)
 - Imports `vision_features` package for the Vision Feature Extractor step — the `vision_features/` folder must be in the same directory
-- Key CLI flags:
+- CLI: `--session`, `--dry_run`, `--bypass_upload_check`, `--params`. `run(session, dry_run, bypass_upload_check)` is the entry point for `track_and_dump.py` and `assign_identity.py`.
+- Thresholds (all `params.yaml`):
 
-| Flag | Default | Purpose |
+| Step | Keys | Defaults |
 |---|---|---|
-| `--db` | required | Path to `calving_project.db` |
-| `--session` | required | `session_id` to process |
-| `--kinetics` | *(auto)* | Manual kinetics CSV override; if omitted, auto-discovered from Drive |
-| `--gallery_dir` | `./reid_gallery` | Gallery directory (overridden by drive_manager) |
-| `--embed_parquet` | *(optional)* | Parquet file with embed[128] per detection |
-| `--corr_threshold` | 0.7 | Min Pearson r for kinetic match |
-| `--min_active_bins` | 3 | Min active kinetics bins required |
-| `--min_temp_id_frames` | 0.10 | Min fraction of frames a temp_id must appear in |
-| `--activity_pct` | 0.25 | Percentile threshold for "active" kinetics bins |
-| `--bin_minutes` | 15 | Kinetics bin width in minutes |
-| `--ema_alpha` | 0.15 | EMA decay — full α for kinetic-confirmed, α/2 for cosine-only |
-| `--min_embeds_gallery` | 10 | Min embed rows per temp_id to contribute to gallery |
-| `--cosine_threshold` | 0.75 | Min cosine similarity for cross-video / switch-healing |
-| `--cosine_min_embeds` | 5 | Min embed rows for a temp_id to be queried via cosine |
-| `--dry_run` | off | Run all steps, write nothing |
-| `--verbose` | off | Extra diagnostic output |
-| `--bypass_upload_check` | off | Skip dirty-flag check |
+| Kinetic Matcher | `kinetic_match.corr_threshold` / `min_active_bins` / `min_temp_id_frames` / `activity_pct` | 0.7 / 3 / 0.10 / 0.25 |
+| Shared time grid | `timeline.bin_minutes` (matcher, Sensor Sequencer, vision windows) | 15 |
+| is_night heuristic | `session.night_start_hour` / `night_end_hour` / `night_fraction` | 20 / 6 / 0.5 |
+| Gallery Builder | `gallery.ema_alpha` (α/2 for cosine-only) / `min_embeds` / `synthetic_merge_alpha` | 0.15 / 10 / 0.5 |
+| Cosine Resolver | `cosine_resolver.threshold` (also Boundary Rendezvous tier 2) / `min_embeds` | 0.75 / 5 |
+| Cosine + Duplicate Resolver | `cooccurrence.iou_same_animal` / `frame_tolerance_min` / `gap_multiplier` | 0.3 / 20 / 2.0 |
+| Duplicate Resolver, Boundary Rendezvous | `identity.source_priority` / `protected_sources` | manual > kinetic > boundary_rendezvous > cosine / manual, kinetic |
 
 ---
 
@@ -213,8 +211,8 @@ vision_features/
 
 | Classifier | Signal | Output |
 |---|---|---|
-| Posture | Bbox aspect ratio (AR < 0.85 → standing, AR > 1.10 → lying, band = uncertain) + kps_coverage gate | `posture` ∈ {standing, lying, uncertain}, `posture_conf` |
-| Facing | Nose→sacrum body-axis vector projected onto frame axes; lateral dominance ratio separates left/right from toward/away | `facing` ∈ {left, right, toward, away, uncertain}, `facing_conf` |
+| Posture | Bbox aspect ratio (AR ≤ `standing_max_ar` 0.85 → standing, ≥ `lying_min_ar` 1.10 → lying, band = uncertain) + kps_coverage gate — `params.yaml vision.posture` | `posture` ∈ {standing, lying, uncertain}, `posture_conf` |
+| Facing | Spine axis from `schema.BACK_KPS` (withers→tail base); angle zones `toward_center`/`away_center` ± `depth_half_width` — `params.yaml vision.facing` | `facing` ∈ {left, right, toward, away, uncertain}, `facing_conf` |
 
 **Window aggregates written to `resolved_cow_timeline`:**
 
@@ -228,24 +226,25 @@ vision_features/
 **Pose-conditioned gallery:**
 - Extends `reid_gallery/` with two new files: `gallery_pose_day.npy` and `gallery_pose_night.npy`
 - Each stores shape `(N_cows, 8, 128)` — 8 slots = {standing, lying} × {left, right, toward, away}
-- Only confident frames (both posture_conf and facing_conf ≥ threshold) contribute to a slot
+- Only confident frames (both posture_conf and facing_conf ≥ `vision.min_slot_conf`, 0.30) contribute to a slot; window aggregates count frames ≥ `vision.aggregate_min_conf` (0.30)
 - Slot query uses a 3-level fallback chain: exact slot → same posture any facing → all populated slots
 - EMA update rule same as flat gallery (full α for kinetic-confirmed, α/2 for cosine-only)
 
-**Also used by `track_and_dump.py`** for `--crop_tags`: classifiers are imported at startup (optional; graceful fallback to `_unk_unk` if unavailable) and run per-detection at crop-save time to append `_<posture>_<facing>` to crop filenames.
+**Also used by `track_and_dump.py`** for `crop_tags` (cli.yaml): classifiers are imported at startup (optional; graceful fallback to `_unk_unk` if unavailable) and run per-detection at crop-save time to append `_<posture>_<facing>` to crop filenames.
 
 **Adding a new feature:**
 1. Create `vision_features/features/my_feature.py` with `extract_my_feature()` and `aggregate_my_feature()`
 2. Add output columns to `schema.py` (`TIMELINE_VISION_COLS` and `TIMELINE_ALTER_SQLS`)
 3. Call both functions in `extractor.py` (two marked locations)
+4. Put its thresholds under `vision:` in `params.yaml` and add the matching dataclass fields in `config.py` (read them with `config.params()` inside the function, never at import)
 
 ---
 
 ### `cross_camera.py`
 - Boundary Rendezvous — triggered cross-camera reconcile
 - Not a standalone CLI; called by `reconcile.py` once per session, after Cosine Resolver and before Duplicate Resolver
-- Must be in the same directory as `reconcile.py` — `from cross_camera import run_boundary_rendezvous, CrossCameraConfig`
-- `CAMERA_TOPOLOGY` — a static, hand-annotated config of which camera pairs share a physical boundary and the rough pixel polygon marking that zone in each camera's own frame. Currently: `רפת 26`↔`רפת 38` and `רפת 33`↔`רפת 38` (38 is the hub; 26 and 33 don't overlap directly). No calibration/homography — polygons are rough regions, not precise boundaries.
+- Must be in the same directory as `reconcile.py` — `from cross_camera import run_boundary_rendezvous, CrossCameraConfig`; reconcile builds the config with `CrossCameraConfig.from_params(P)`
+- `camera_topology` in `params.yaml` — a static, hand-annotated config of which camera pairs share a physical boundary and the rough pixel polygon marking that zone in each camera's own frame. Currently: `רפת 26`↔`רפת 38` and `רפת 33`↔`רפת 38` (38 is the hub; 26 and 33 don't overlap directly). No calibration/homography — polygons are rough regions, not precise boundaries.
 - **Staging:** for each temp_id, computes cumulative dwell time inside any zone shared with another camera (point-in-polygon on bbox centroid). Past `boundary_dwell_seconds` (and a `boundary_dwell_min_frames` noise floor), writes a row to `boundary_observations` — camera, zone, time range, flat embedding, current resolution state.
 - **Triggering:** that write immediately checks `boundary_observations` for a pending row from the zone's *other* camera with an overlapping time range. Found → resolve now. Not found → the row waits, matchable by any future session on any camera, in any order.
 - **Matching, when multiple candidates are in the zone on both sides:** scores every candidate pair, takes the globally best non-conflicting set of pairings (not a naive one-at-a-time waterfall), using a 4-tier hierarchy — mirrors reconcile's own trust order, with two new tiers appended at the bottom:
@@ -254,10 +253,10 @@ vision_features/
   3. Motion-magnitude correlation ≥ `motion_corr_threshold` — both tracks are read from `raw_tracks` (every camera's tracks share the DB), over the dwell overlap padded by `motion_window_pad_seconds`. Each becomes a speed curve in body-heights per second (1-second bins), and the two are compared with Pearson r, allowing a small time shift for clock offset. Speed only, never direction, since 33 faces opposite to 26/38. No score (tier skipped, not a mismatch) when there are too few shared bins or either cow barely moved, because two near-still curves are just detection jitter. Only computed for pairs tiers 1–2 didn't match. Default scorer is `make_motion_corr_fn`; `run_boundary_rendezvous(motion_corr_fn=...)` can override it.
   4. Only one cow in the zone on each side, gated by a `single_cow_sanity_floor` cosine score (rejects a stray false-positive detection)
 - **Resolving a pairing:** zone-consistent (expected — both tracks plausibly near the shared boundary) → corroboration, no conflict. Zone-inconsistent (same AnimalId claimed somewhere that isn't physically plausible) → real conflict: auto-resolved by confidence if the gap ≥ `conflict_confidence_gap`, otherwise logged to `cross_camera_conflicts` for manual review instead of guessing.
-- **Priority:** follows `SOURCE_PRIORITY` in `reconcile.py` — manual > kinetic > boundary_rendezvous > cosine. Boundary Rendezvous can set an unassigned temp_id or replace a Cosine Resolver id (verified shared-zone + overlapping-time evidence beats appearance alone), but never overwrites a manual or kinetic id: `reconcile.py` passes those temp_ids as `protected_tids`, and a disagreeing boundary match is logged as `KEPT` instead.
+- **Priority:** follows `identity.source_priority` in `params.yaml` — manual > kinetic > boundary_rendezvous > cosine. Boundary Rendezvous can set an unassigned temp_id or replace a Cosine Resolver id (verified shared-zone + overlapping-time evidence beats appearance alone), but never overwrites a manual or kinetic id: `reconcile.py` passes those temp_ids as `protected_tids`, and a disagreeing boundary match is logged as `KEPT` instead.
 - **Gallery enrichment:** no special handling. When two cameras see the same cow at the boundary, each session updates the pose-conditioned gallery normally through `_update_pose_gallery`. Different posture/facing slots land in different rows of the cow's `(8,128)` array, so both views are kept. Same-slot overlap is left to the regular EMA blend — see Key Design Decision 22 for why a "keep only the better view" rule was considered and dropped.
 - **Known gap, deferred:** a pairing's result isn't checked against an independent identity claim already on record elsewhere (e.g. a non-adjacent camera's own kinetic claim on the same AnimalId at an overlapping time) — a real conflict that can't currently arise, by construction, from the pairing logic itself. Explicitly punted; needs its own pass before relying on this for anything adjacent-camera-sensitive.
-- Key config (defaults live in `CrossCameraConfig`, same pattern as reconcile's other thresholds):
+- Key config — `params.yaml` `cross_camera:` (tier-3 keys under `cross_camera.motion:`; table shows the `CrossCameraConfig` field names):
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -271,7 +270,7 @@ vision_features/
 | `motion_min_std` | 0.05 | Tier-3 minimum speed variation (body-heights/s); below it the cow barely moved and r is noise |
 | `motion_max_lag_bins` | 2 | Tier-3 tolerated clock offset between cameras, in bins |
 | `single_cow_sanity_floor` | 0.40 | Tier-4 minimum cosine score even with only one candidate on each side |
-| `cosine_threshold` | 0.75 | Mirrors `reconcile.py`'s own — tier-2 matching |
+| `cosine_threshold` | 0.75 | Not a separate key: `cosine_resolver.threshold`, the same value the Cosine Resolver uses (before the config migration this was a separate 0.75 that ignored reconcile's flag) |
 
 ---
 
@@ -280,21 +279,21 @@ vision_features/
 - Streams annotated video as MJPEG via Flask; sensor charts rendered server-side as PNG via matplotlib
 - Opens `http://localhost:5000` automatically in the Windows browser (via `cmd.exe /c start`)
 - Pulls canonical DB from Drive via `drive_manager` at startup; checks `db` dirty flag
-- Imports `match_identity` for live kinetic matching; draws score table overlay (temp_id × AnimalId)
 - Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
-- **`--draw_masks` (QA/visualization only):** overlays segmentation mask polygons as a translucent fill + outline, drawn beneath the bbox/label pills so text stays legible. Reads `outputs/<session_id>/qa_masks/masks_part*.parquet` — the file `track_and_dump.py --save_masks` produces. No-op with a log warning if that file doesn't exist for the session (re-run `track_and_dump.py` with `--save_masks` first). Toggleable live in-browser ("🎭 Mask" button), same generic toggle mechanism as Bbox/Pose/Direction — flips `STATE.show_mask` via `POST /api/control {action: "toggle_mask"}`.
+- **`draw_masks` (cli.yaml; QA/visualization only):** overlays segmentation mask polygons as a translucent fill + outline, drawn beneath the bbox/label pills so text stays legible. Reads `outputs/<session_id>/qa_masks/masks_part*.parquet` — the file `track_and_dump.py` produces with `save_masks: true`. No-op with a log warning if that file doesn't exist for the session (re-run `track_and_dump.py` with `save_masks: true` first). Toggleable live in-browser ("🎭 Mask" button), same generic toggle mechanism as Bbox/Pose/Direction — flips `STATE.show_mask` via `POST /api/control {action: "toggle_mask"}`.
 - Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s; feature toggles: Bbox, ID, Keypoints, Pose, Direction, Mask
-- Accepts `--bypass_upload_check` to proceed when DB flag is dirty
+- CLI: `--video`, `--session_id` (override), `--bypass_upload_check`, `--params`. All overlay options (`draw_pose`, `draw_masks`, `kp_index`, `kp_conf_thresh`, `hide_occluded`, `port`, `start`, `limit`, …) are in `cli.yaml` → `display_tracks:`. Its `kp_conf_thresh` is a display filter only, independent of `params pose.kp_conf_thresh`.
 - Requires: `pip install flask`
 
 ---
 
 ### `match_identity.py`
 - Kinetic matching: bbox centroid speed ↔ collar ΔKineticsCountR
-- Pearson correlation per 15-min bin, Hungarian assignment
+- Pearson correlation per `timeline.bin_minutes` bin, greedy assignment
 - Does not use drive_manager — never touches the DB; reads CSVs passed directly as arguments
-- `score_up_to(tracks_df, kinetics_df, up_to_datetime, bin_minutes, ...)` → assignment dict + scores_df (used by `display_tracks.py` for live overlays)
-- Standalone CLI: `python3 match_identity.py --tracks tracks.csv --kinetics ... --output ...`
+- Thresholds from `params.yaml kinetic_match:` — the same values reconcile's inline Kinetic Matcher uses
+- `score_up_to(tracks_df, kinetics_df, up_to_datetime)` → assignment dict + scores_df, using `kinetic_match.live_min_active_bins`. Nothing calls it at the moment (display_tracks no longer imports this module).
+- Standalone CLI: `python3 match_identity.py --tracks tracks.csv --kinetics ... --output ... [--scores_json ...] [--params ...]`
 
 ---
 
@@ -303,22 +302,22 @@ vision_features/
 - Pulls canonical DB from Drive via `drive_manager` at startup; checks `db` dirty flag
 - Syncs DB back to Drive after writing assignments
 - Writes assignments to a `manual_assignments` table in SQLite; reconcile.py merges these in Manual Merge, with manual overriding kinetic on conflict
-- Can optionally call `reconcile.py` directly after writing (`--run_reconcile`)
+- Can optionally call `reconcile.py` directly after writing (`--run_reconcile`), with the thresholds from `params.yaml` (or `--params`) — no threshold flags of its own
 - Accepts `--bypass_upload_check` to proceed when DB flag is dirty
 - Key operations:
 
 ```bash
 # Assign temp_ids manually after watching display_tracks.py
-python3 assign_identity.py --db ... --session ... \
+python3 assign_identity.py --session ... \
     --assign 2:7507  1:6366  71:7513 \
     --note "manual — no kinetics coverage for Dec 21" \
     --run_reconcile
 
 # List current assignments for a session
-python3 assign_identity.py --db ... --session ... --list
+python3 assign_identity.py --session ... --list
 
 # Remove a specific temp_id assignment
-python3 assign_identity.py --db ... --session ... --remove 71
+python3 assign_identity.py --session ... --remove 71
 ```
 
 
@@ -579,45 +578,30 @@ gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_e
 python3 drive_manager.py upload-kinetics ~/thesis_workspace/raw_data/CollarData/
 python3 drive_manager.py upload-behavior ~/thesis_workspace/raw_data/CollarData/
 
-# 1a. Single video — inference + reconcile (collar CSVs auto-discovered)
+# 1a. Single video — inference + reconcile (collar CSVs auto-discovered;
+#     models + thresholds from config/params.yaml, QA output from config/cli.yaml)
 python3 track_and_dump.py \
-    --model      models/cow_detector/best.pt \
-    --source     ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts \
-    --pose_model models/cow_pose/best.pt \
-    --imgsz 960 --conf 0.30 --iou 0.60 \
-    --save_every 10 --flush_every 5
+    --source ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts
 
 # 1b. Batch — all videos in a directory (models loaded once, runs sequentially)
-python3 track_and_dump.py \
-    --model      models/cow_detector/best.pt \
-    --source     ~/thesis_workspace/raw_data/calving/ \
-    --pose_model models/cow_pose/best.pt \
-    --imgsz 960 --conf 0.30 --iou 0.60 \
-    --save_every 10 --flush_every 5
+python3 track_and_dump.py --source ~/thesis_workspace/raw_data/calving/
 
-# 2. Validate visually (opens http://localhost:5000 in browser)
+# 2. Validate visually (opens http://localhost:5000 in browser;
+#    overlays: config/cli.yaml → display_tracks:)
 python3 display_tracks.py \
-    --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts \
-    --db         ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-    --session_id cam33_6_S20260616100001_E20260616110000 \
-    --draw_pose --show_fps
+    --video ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts
 
 # 3. If kinetics unavailable — assign manually after watching display_tracks.py
 python3 assign_identity.py \
-    --db      ~/thesis_workspace/vcf-ctp/data/calving_project.db \
     --session cam33_6_S20260616100001_E20260616110000 \
     --assign  2:7507  1:6366  71:7513 \
     --note    "manual — no kinetics for this date" \
     --run_reconcile
 
-# 4. Re-run reconcile standalone (e.g. after tuning thresholds)
-python3 reconcile.py \
-    --db          ~/thesis_workspace/vcf-ctp/data/calving_project.db \
-    --session     cam33_6_S20260616100001_E20260616110000 \
-    --embed_parquet ~/thesis_workspace/vcf-ctp/data/outputs/cam33_6_S20260616100001_E20260616110000/embeds.parquet \
-    --corr_threshold 0.7 --cosine_threshold 0.75 --ema_alpha 0.15
+# 4. Re-run reconcile standalone (e.g. after tuning thresholds in params.yaml)
+python3 reconcile.py --session cam33_6_S20260616100001_E20260616110000
     # add --dry_run to test without writing
-    # add --kinetics /path/to/file.csv to override auto-discovery
+    # add --params config/params_strict.yaml to try other thresholds
 
 # 5. Ingest calving ledger (once per farm file — idempotent)
 python3 calving_ledger_ingest.py \
@@ -626,7 +610,10 @@ python3 calving_ledger_ingest.py \
     # add --dry_run to validate without writing
     # add --overwrite to re-ingest an already-loaded file
 
-# 6. Check sync status / recover from failures
+# 6. Validate config after editing
+python3 config.py
+
+# 7. Check sync status / recover from failures
 python3 drive_manager.py status
 python3 drive_manager.py retry-buffer
 ```
@@ -657,7 +644,8 @@ python3 drive_manager.py retry-buffer
 20. **Calving features split from ground truth** — `calving_ledger` holds only the label (outcome + identity + datetime). `calving_features` holds all model input features keyed on `event_id`. The two tables evolve independently: new farms can introduce new feature columns via auto-migration without touching existing rows or code.
 21. **Boundary rendezvous instead of a batch cross-camera pass** — processing is strictly serial but not time-ordered (a batch might process camera 33's whole day before camera 26 even starts, and a camera's feed can be entirely missing for a period). Rather than waiting for all three cameras to finish a shared time window, `cross_camera.py` stages qualifying boundary-zone tracks in `boundary_observations` and triggers a match the moment a partner observation shows up, however much later that is. A pending observation is only finalized as unmatched once the partner camera has an *actually-processed* session that fully covers it and still found nothing — proof of absence, not a timeout guess.
 22. **No "keep the better view" rule for same-slot boundary overlap** — considered and dropped. The idea: when two cameras see the same cow in the same posture/facing slot at the same moment, keep only the higher-quality view instead of blending both into the gallery. It doesn't fit how the gallery is built. `build_slot_embeds` averages every confident frame of a cow in a slot across the **whole session**, and `PoseGallery.update()` runs once per (cow, slot) per session — so the shared-zone moment is only a few seconds inside an average of minutes to hours of frames. Skipping the "worse" update would discard that camera's entire session of frames for the slot, not just the overlap. A frame-level version (drop only the overlapping frames) is possible, but serial processing means it only works one way: the later session can hold back its own frames, but can't remove an earlier session's update that's already blended in. The effect being corrected — a few seconds counted twice — is too small to justify that.
-23. **session_id = filename stem, camera name swapped for an ASCII code** — built in exactly one place, `make_session_id()` in `track_and_dump.py` (which `display_tracks.py` imports). `רפת 33_6_S20260616100001_E20260616110000.mp4` → `cam33_6_S20260616100001_E20260616110000`. One id per file, and the same id every time that file is processed, so re-running a video replaces its own rows and two files can never collide. ASCII with no spaces, so `--session $SES` works without quoting and nothing displays right-to-left. Camera codes live in `CAMERA_CODES` next to `KNOWN_CAMERA_IDS` (mirrored in `vision_features/schema.py`). An unrecognized camera still gets a unique id — unsafe characters are replaced and a short hash of the original name is appended — plus a warning to add it to the map. Replaced the old `<camera_id>_<start time>` format, which dropped the segment number, needed shell quoting, and fell back to `<camera>_unknown` for any filename without a timestamp — giving every such video from one camera the same id, so processing the second deleted the first one's tracks. session_id is an opaque key: nothing parses it, use `video_sessions.camera_id` / `start_dt` for camera and time.
+23. **session_id = filename stem, camera name swapped for an ASCII code** — built in exactly one place, `make_session_id()` in `track_and_dump.py` (which `display_tracks.py` imports). `רפת 33_6_S20260616100001_E20260616110000.mp4` → `cam33_6_S20260616100001_E20260616110000`. One id per file, and the same id every time that file is processed, so re-running a video replaces its own rows and two files can never collide. ASCII with no spaces, so `--session $SES` works without quoting and nothing displays right-to-left. Camera names and codes live in `params.yaml` → `cameras` (one list, shared with reconcile and cross_camera). An unrecognized camera still gets a unique id — unsafe characters are replaced and a short hash of the original name is appended — plus a warning to add it to the map. Replaced the old `<camera_id>_<start time>` format, which dropped the segment number, needed shell quoting, and fell back to `<camera>_unknown` for any filename without a timestamp — giving every such video from one camera the same id, so processing the second deleted the first one's tracks. session_id is an opaque key: nothing parses it, use `video_sessions.camera_id` / `start_dt` for camera and time.
+24. **Two config files, strict, no code defaults** — `params.yaml` (what is computed) and `cli.yaml` (how it runs / QA output), loaded by `config.py` into frozen typed objects; unknown or missing keys are errors. One value per concept: e.g. a single `cosine_resolver.threshold` used by both the Cosine Resolver and Boundary Rendezvous, a single `cameras` list. Structural constants that stored data depends on stay fixed in `schema.py`. Safety switches (`--dry_run`, `--bypass_upload_check`) stay one-shot flags so they can't be left on in a file. Each session keeps a copy of the params it ran with, and `processing_log.csv` records the hash.
 
 ---
 
@@ -684,7 +672,14 @@ python3 drive_manager.py retry-buffer
 ### Directory layout
 ```
 ~/thesis_workspace/vcf-ctp/
+  models/                                   # local model weights (params.yaml models:)
   scripts/
+    config.py                               # loader for config/*.yaml — import in all scripts
+    config/
+      params.yaml                           # algorithm / pipeline settings
+      cli.yaml                              # run behaviour, QA output, storage
+      bytetrack.yaml                        # ultralytics tracker configs
+      botsort.yaml
     drive_manager.py                        # Drive I/O layer — import in all scripts
     reconcile.py
     cross_camera.py                         # Boundary Rendezvous — called by reconcile.py, not standalone
@@ -713,9 +708,9 @@ python3 drive_manager.py retry-buffer
     outputs/<session_id>/
       embeds.parquet
       kps.parquet
-      crops/                                # optional — local only if --crops_local
-      qa_masks/                             # optional — only if --save_masks; QA/visualization
-        masks_part*.parquet                 #   only, NEVER uploaded to Drive, read by display_tracks.py --draw_masks
+      crops/                                # optional — local only if crops_local
+      qa_masks/                             # optional — only if save_masks; QA/visualization
+        masks_part*.parquet                 #   only, NEVER uploaded to Drive, read by display_tracks.py draw_masks
     reid_gallery/                           # pulled from Drive before reconcile
     collar_data/                            # local copies of auto-discovered collar CSVs
   .buffer/                                  # LOCAL only — never uploaded
@@ -735,7 +730,9 @@ thesis_google_drive:vcf_ctp_data/           # Google Drive (source of truth)
   outputs/<session_id>/
     embeds.parquet
     kps.parquet
-    crops/                                  # uploaded unless --crops_local
+    params_track.yaml                       # params used by track_and_dump.py
+    params_reconcile.yaml                   # params used by the latest reconcile run
+    crops/                                  # uploaded unless crops_local
     # qa_masks/ is intentionally NEVER here — local-only QA artifact, see track_and_dump.py
   reid_gallery/
     gallery_day.npy
@@ -788,7 +785,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] what to do about bbox overpopulation?
 - [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
-- [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `SOURCE_PRIORITY` in `reconcile.py`
+- [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `identity.source_priority` in `params.yaml`
 - [x] drop camera_id restriction in TempPoseGallery
 - [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
@@ -798,11 +795,11 @@ raw_data/videos/                            # LOCAL ONLY — never synced
   - [ ] Tune `boundary_dwell_seconds` / `boundary_dwell_min_frames` against real crossing durations once more footage is annotated
 - [x] Reset the tracker between videos in batch mode.
 - [ ] Collapse match_identity.py and reconcile's inline correlation logic into one implementation.
-- [ ] Move vision-feature constants into the config file, including CLI plumbing.
+- [x] Move vision-feature constants into the config file, including CLI plumbing — `config/params.yaml` + `config/cli.yaml`, see Configuration
 - [ ] Move from strict hierarchical override to a fused confidence score once ≥3–4 matching signals exist, keeping manual as a hard override.
 - [ ] Short-gap tracklet stitching before Cosine Resolver — position-extrapolation-based merge of brief tracker dropouts, independent of detector type.
 - [ ] Minimum-occurrence-count filter
-- [ ] Config file for constants/thresholds, migrated incrementally.
+- [x] Config file for constants/thresholds — done in one pass, not incrementally (all scripts)
 - [ ] Configurable ID-matching hierarchy (e.g. manual > kinetic = cosine > ocr) with tie-break rules.
 - [ ] Persist per-session cosine drift and populate embed_mean (computes how similar this session's embedding is to the cow's previous gallery embedding)
 
@@ -814,7 +811,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
   - [x] Labeled ~858 images via Roboflow (autolabeling / Smart Polygon, SAM-assisted), pre-split train/valid/test by Roboflow export
   - [x] Trained YOLOv8n-seg locally via Ultralytics (not Roboflow-hosted training — avoids version-pinning/export-format uncertainty; see training notes). Validation mask mAP50 ≈ 0.93, mAP50-95 ≈ 0.75 on the general val split
   - [x] Integrated into `track_and_dump.py` — segmentation masks build background-removed crops for the **embedder only** (Problem A: background contamination); pose input and saved crops unaffected
-  - [x] QA/visualization path added: `--save_masks` (track_and_dump.py, local-only, never on Drive) + `--draw_masks` (display_tracks.py, toggleable overlay)
+  - [x] QA/visualization path added: `save_masks` (track_and_dump.py, local-only, never on Drive) + `draw_masks` (display_tracks.py, toggleable overlay)
   - [ ] **No dedicated held-out clumped/touching-cow eval set was built** (explicit decision, not an oversight) — the standard random `test` split (~86 images) is the only current signal on clumping performance, and it may under-represent clumped frames since they're rare in the data. **Clumping-fix quality is therefore still unverified** — this is the open item blocking "decide what to do with clumping" above
   - [ ] Tracker mask-IoU — still box-IoU only (ByteTrack/BoT-SORT default); only worth escalating if ID-switch rate is still bad after the segmentation swap, per original plan
   - [ ] Coat-pattern fingerprinting

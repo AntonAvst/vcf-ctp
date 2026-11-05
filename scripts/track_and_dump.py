@@ -27,14 +27,20 @@ import torch
 import torch.nn as nn
 import torchvision.models as tv
 
+import config
+
 # Drive I/O layer
 from drive_manager import DriveManager, DriveUnavailableError
+
+# Structural constants (fixed — see vision_features/schema.py). Required, unlike
+# the optional classifier import below: these define the stored data layout.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from vision_features.schema import EMBED_DIM, N_KP, IMAGENET_MEAN, IMAGENET_STD
 
 # Vision classifiers for crop tagging — optional (graceful fallback if absent)
 _VISION_IMPORT_ERROR = None
 try:
-    import sys as _sys, os as _os
-    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     from vision_features.features.posture import extract_posture
     from vision_features.features.facing  import extract_facing
     from vision_features.schema import Posture, Facing, POSTURE_NAMES, FACING_NAMES
@@ -43,20 +49,14 @@ except Exception as _e:
     _VISION_AVAILABLE = False
     _VISION_IMPORT_ERROR = _e
 
-EXPECTED_KP = 19
 DRIVE_BATCH_LOG = "processing_log.csv"   # append-only log on Drive
+BATCH_LOG_HEADER = ("timestamp,session_id,filename,status,"
+                    "frames,duration_s,fps_processed,error,params_hash")
 VIDEO_EXTENSIONS = {".mp4", ".ts", ".avi", ".mov", ".mkv"}
 
-# Cameras monitoring the enclosure. Mirrored from vision_features.schema.
-# CAMERA_IDS (same convention as EXPECTED_KP above mirroring schema.KP) so
-# this file keeps working even when the optional vision_features import
-# below fails. Keep both lists in sync when a camera is added/renamed/removed.
-KNOWN_CAMERA_IDS = ["רפת 26", "רפת 33", "רפת 38"]
-
-# Short ASCII code per camera, used only to build session_id (see
-# make_session_id). camera_id itself keeps the real name everywhere else.
-# Mirrored from vision_features.schema.CAMERA_CODES — keep both in sync.
-CAMERA_CODES = {"רפת 26": "cam26", "רפת 33": "cam33", "רפת 38": "cam38"}
+# Cameras (names as they appear in filenames + ASCII session-id codes) come
+# from config/params.yaml `cameras` — the single list shared with
+# reconcile.py and cross_camera.py.
 
 # Filenames look like:
 #   <camera_name>_<segment>_S<YYYYMMDDHHmmss>[_E<YYYYMMDDHHmmss>]
@@ -74,7 +74,7 @@ def parse_filename(video_path: str):
     Returns (camera_id: str, start_dt: datetime|None, end_dt: datetime|None).
 
     The camera name is resolved in two steps:
-      1. Exact match (or exact match + "_<segment>") against KNOWN_CAMERA_IDS
+      1. Exact match (or exact match + "_<segment>") against params.yaml cameras
          — the reliable path for every camera we actually operate.
       2. Fallback for an unrecognized camera: strip a trailing "_<digits>"
          token (the segment/chunk number) from whatever precedes "_S...".
@@ -92,8 +92,9 @@ def parse_filename(video_path: str):
 
     prefix = stem[:ts_match.start()].rstrip("_")
 
+    known_ids = config.params().camera_ids
     camera_id = None
-    for known in KNOWN_CAMERA_IDS:
+    for known in known_ids:
         if prefix == known or prefix.startswith(known + "_"):
             camera_id = known
             break
@@ -101,11 +102,10 @@ def parse_filename(video_path: str):
     if camera_id is None:
         stripped = _TRAILING_SEGMENT_RE.sub("", prefix)
         camera_id = stripped if stripped else prefix
-        log(f"parse_filename: '{prefix}' didn't match any KNOWN_CAMERA_IDS "
-            f"{KNOWN_CAMERA_IDS} — guessed camera_id='{camera_id}' by "
+        log(f"parse_filename: '{prefix}' didn't match any known camera "
+            f"{known_ids} — guessed camera_id='{camera_id}' by "
             f"stripping a trailing segment number. Verify this is correct "
-            f"(and add it to KNOWN_CAMERA_IDS / vision_features.schema."
-            f"CAMERA_IDS if it's a real camera).")
+            f"(and add it to `cameras` in config/params.yaml if it's a real camera).")
 
     try:
         start_dt = datetime.strptime(ts_match.group("start"), "%Y%m%d%H%M%S")
@@ -145,17 +145,18 @@ def make_session_id(video_path: str) -> str:
     """
     stem = Path(video_path).stem
 
-    for name, code in CAMERA_CODES.items():
+    camera_codes = config.params().camera_codes
+    for name, code in camera_codes.items():
         if stem == name or stem.startswith(name + "_"):
             stem = code + stem[len(name):]
             break
     else:
         # Unrecognized camera: still produce a unique, safe id, but warn —
-        # the camera should be added to KNOWN_CAMERA_IDS / CAMERA_CODES.
+        # the camera should be added to `cameras` in config/params.yaml.
         if not stem.isascii() or " " in stem:
             log(f"make_session_id: '{stem}' doesn't start with a known camera "
-                f"name {list(CAMERA_CODES)} — sanitizing the raw filename. "
-                f"Add this camera to CAMERA_CODES for a readable id.")
+                f"name {list(camera_codes)} — sanitizing the raw filename. "
+                f"Add this camera to `cameras` in config/params.yaml for a readable id.")
 
     safe = _UNSAFE_CHARS_RE.sub("-", stem).strip("-")
     if safe == stem:
@@ -176,7 +177,7 @@ def log(msg: str) -> None:
 
 # ── Embedding backbone ────────────────────────────────────────────────────────
 class Embedder128(nn.Module):
-    def __init__(self, pretrained=True, out_dim=128):
+    def __init__(self, pretrained=True, out_dim=EMBED_DIM):
         super().__init__()
         m = tv.mobilenet_v3_small(
             weights=tv.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
@@ -194,60 +195,19 @@ class Embedder128(nn.Module):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model",      required=True, help="Detector .pt")
-    ap.add_argument("--source",     required=True,
+    ap = argparse.ArgumentParser(
+        description="Detect + track + pose + embed, then reconcile. Models and all "
+                    "thresholds come from config/params.yaml; crop/mask QA output "
+                    "from config/cli.yaml.")
+    ap.add_argument("--source", required=True,
                     help="Path to a single video file OR a directory of video files. "
                          "Supported extensions: .mp4 .ts .avi .mov .mkv. "
                          "Videos are local only — never uploaded to Drive.")
-    # session_id and camera_id are now derived from the filename automatically
-    ap.add_argument("--tracker",    default="bytetrack.yaml")
-    ap.add_argument("--imgsz",      type=int,   default=960)
-    ap.add_argument("--conf",       type=float, default=0.25)
-    ap.add_argument("--iou",        type=float, default=0.45)
-    ap.add_argument("--save_crops", action="store_true")
-    ap.add_argument("--crops_local", action="store_true",
-                    help="Keep crops on local disk only — do not upload to Drive. "
-                         "Has no effect unless --save_crops is also set.")
-    ap.add_argument("--crop_tags", action="store_true",
-                    help="Append posture (standing/lying) and facing (left/right/toward/away) "
-                         "tags to crop filenames. Requires --pose_model and vision_features/. "
-                         "Falls back to 'unk' tags if classifiers are unavailable.")
-    ap.add_argument("--crop_every", type=int, default=1,
-                    help="Save crop every N-th sample frame per track ID (default: 1). "
-                         "Note: counts sample frames (i.e. every save_every frames), "
-                         "not raw video frames.")
-    ap.add_argument("--min_crop_wh", type=int, nargs=2, metavar=("W","H"), default=(0,0))
-    ap.add_argument("--save_masks", action="store_true",
-                    help="Save segmentation mask polygons (when using a -seg model) to a "
-                         "separate local-only Parquet file, purely for visualization/QA — "
-                         "e.g. overlaying masks in display_tracks.py. Written to "
-                         "outputs/<session_id>/qa_masks/ and NEVER uploaded to Drive, "
-                         "never touches raw_tracks/embeds.parquet/kps.parquet, and has no "
-                         "effect on the main pipeline. No-op if the loaded model has no "
-                         "segmentation head (plain detector).")
-    ap.add_argument("--embed_size", type=int, default=128)
-    ap.add_argument("--pose_model", default="", help="YOLO-Pose .pt (optional)")
-    ap.add_argument("--pose_imgsz", type=int,   default=384)
-    ap.add_argument("--pose_conf",  type=float, default=0.25)
-    ap.add_argument("--pose_kp_conf_thresh", type=float, default=0.30,
-                    help="Keypoint conf: >=thresh v=2, <thresh v=1 (default: 0.30)")
-    ap.add_argument("--save_every", type=int, default=10,
-                    help="Sample interval: keep only the most recent detection per "
-                         "temp_id within each N-frame window (default: 10). "
-                         "Higher = sparser data.")
-    ap.add_argument("--flush_every", type=int, default=5,
-                    help="Flush to SQLite + Parquet every M windows, i.e. every "
-                         "save_every * flush_every frames (default: 5).")
-    # ── reconcile.py integration ──────────────────────────────────────────────
-    # NOTE: kinetics and gallery_dir are NOT arguments — reconcile.py (called
-    # automatically below) resolves both via drive_manager, keyed off session_id.
-    ap.add_argument("--corr_threshold",   type=float, default=0.7)
-    ap.add_argument("--cosine_threshold", type=float, default=0.75)
-    ap.add_argument("--ema_alpha",        type=float, default=0.15)
+    # session_id and camera_id are derived from the filename automatically
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
+    config.add_params_arg(ap)
     return ap.parse_args()
 
 
@@ -256,14 +216,14 @@ def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def to_tensor_bchw(img_bgr, size=224):
+def to_tensor_bchw(img_bgr, size: int):
     x    = cv2.resize(img_bgr, (size, size), interpolation=cv2.INTER_LINEAR)
     x    = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    mean = np.array(IMAGENET_MEAN, dtype=np.float32)
+    std  = np.array(IMAGENET_STD,  dtype=np.float32)
     return ((x - mean) / std).transpose(2, 0, 1)
 
-def crops_from_bboxes(frame, bboxes, margin=0.1):
+def crops_from_bboxes(frame, bboxes, margin: float):
     H, W = frame.shape[:2]
     crops, used = [], []
     for (x1, y1, x2, y2) in bboxes:
@@ -363,15 +323,15 @@ EMBED_SCHEMA = pa.schema([
     pa.field("session_id",  pa.string()),
     pa.field("frame_index", pa.int32()),
     pa.field("temp_id",     pa.int32()),
-    pa.field("embed",       pa.list_(pa.float32(), 128)),
+    pa.field("embed",       pa.list_(pa.float32(), EMBED_DIM)),
 ])
 
 KPS_SCHEMA = pa.schema([
     pa.field("session_id",  pa.string()),
     pa.field("frame_index", pa.int32()),
     pa.field("temp_id",     pa.int32()),
-    pa.field("kps",         pa.list_(pa.float32(), 57)),
-    pa.field("kps_kconf",   pa.list_(pa.float32(), 19)),
+    pa.field("kps",         pa.list_(pa.float32(), N_KP * 3)),
+    pa.field("kps_kconf",   pa.list_(pa.float32(), N_KP)),
 ])
 
 # QA-only — deliberately NOT part of the canonical outputs (raw_tracks / embeds /
@@ -394,7 +354,7 @@ class EmbedWriter:
     `rows_per_part` rows.  Each rollover releases the Arrow memory pool
     so WSL doesn't accumulate a high-water mark across the whole session.
     """
-    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+    def __init__(self, outdir: Path, rows_per_part: int):
         self.outdir        = outdir
         self.rows_per_part = rows_per_part
         self._part         = 0
@@ -451,7 +411,7 @@ class EmbedWriter:
 
 class KpsWriter:
     """Rolling multi-part Parquet writer — mirrors EmbedWriter logic."""
-    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+    def __init__(self, outdir: Path, rows_per_part: int):
         self.outdir        = outdir
         self.rows_per_part = rows_per_part
         self._part         = 0
@@ -520,7 +480,7 @@ class MaskWriter:
     uploaded — visualization/QA data only, local disk, never touches Drive,
     raw_tracks, or any other pipeline stage.
     """
-    def __init__(self, outdir: Path, rows_per_part: int = 50_000):
+    def __init__(self, outdir: Path, rows_per_part: int):
         self.outdir        = outdir / "qa_masks"
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.rows_per_part = rows_per_part
@@ -573,7 +533,7 @@ class MaskWriter:
 
 def _log_to_batch_log(dm, video_path: "Path", session_id: str,
                        status: str, frames: int, duration_s: float,
-                       error: str = "") -> None:
+                       error: str = "", params_hash: str = "") -> None:
     """Append one row to processing_log.csv on Drive (batch-mode, single flush)."""
     from drive_manager import LOCAL_UPLOAD_LOG, _flush_upload_log, BUFFER_DIR
     import drive_manager as _dm_mod
@@ -583,13 +543,32 @@ def _log_to_batch_log(dm, video_path: "Path", session_id: str,
     header_needed = not local_log.exists() or local_log.stat().st_size == 0
     ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     fps_proc = f"{frames/max(duration_s,1e-6):.1f}" if frames else "0"
+    error = error.replace(",", ";").replace("\n", " ")   # keep the CSV row intact
     row = (f"{ts},{session_id},{video_path.name},{status},"
-           f"{frames},{duration_s:.1f},{fps_proc},{error}\n")
+           f"{frames},{duration_s:.1f},{fps_proc},{error},{params_hash}\n")
     with open(local_log, "a") as f:
         if header_needed:
-            f.write("timestamp,session_id,filename,status,"
-                    "frames,duration_s,fps_processed,error\n")
+            f.write(BATCH_LOG_HEADER + "\n")
         f.write(row)
+
+
+def _upgrade_batch_log(path: "Path") -> None:
+    """processing_log.csv written before params_hash existed has 8 columns.
+    Rewrite its header to the current one and pad old rows with an empty
+    params_hash, so every row keeps the same column count."""
+    lines = path.read_text().splitlines()
+    if not lines or lines[0] == BATCH_LOG_HEADER:
+        return
+    n_cols = BATCH_LOG_HEADER.count(",") + 1
+    out = [BATCH_LOG_HEADER]
+    for l in lines[1:]:
+        if not l:
+            continue
+        missing = n_cols - (l.count(",") + 1)
+        out.append(l + "," * max(missing, 0))
+    path.write_text("\n".join(out) + "\n")
+    log(f"processing_log.csv: upgraded header to include params_hash "
+        f"({len(out) - 1} existing row(s) padded)")
 
 
 def _flush_batch_log(dm) -> None:
@@ -603,14 +582,14 @@ def _flush_batch_log(dm) -> None:
 
     drive_dest    = f"{DRIVE_ROOT}/{DRIVE_BATCH_LOG}"
     local_full    = BUFFER_DIR / "_batch_log_full.csv"
-    header        = ("timestamp,session_id,filename,status,"
-                     "frames,duration_s,fps_processed,error\n")
     try:
         subprocess.run(["rclone", "copyto", drive_dest, str(local_full)],
                        capture_output=True, timeout=30)
         if not local_full.exists() or local_full.stat().st_size == 0:
             with open(local_full, "w") as f:
-                f.write(header)
+                f.write(BATCH_LOG_HEADER + "\n")
+        else:
+            _upgrade_batch_log(local_full)
         staged_lines = [l for l in local_staging.read_text().splitlines()
                         if l and not l.startswith("timestamp,")]
         if staged_lines:
@@ -638,6 +617,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     """
     result = {"status": "error", "session_id": "", "frames": 0,
               "duration_s": 0.0, "error": ""}
+    P = config.params()                      # algorithm settings
+    C = config.cli().track_and_dump          # QA output settings
 
     # ── derive session metadata from filename ─────────────────────────────────
     camera_id, start_dt, end_dt = parse_filename(str(video_path))
@@ -664,7 +645,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             (shutil.rmtree if item.is_dir() else item.unlink)(item if item.is_dir() else item)
         log(f"Cleared output directory: {outdir}")
 
-    crops_dir = ensure_dir(outdir / "crops") if args.save_crops else None
+    crops_dir = ensure_dir(outdir / "crops") if C.save_crops else None
     # Parquet writers use the session outdir; part files are named automatically.
     # embed_pq_path / kps_pq_path are gone — use embed_writer._parts / kps_writer._parts.
 
@@ -694,11 +675,11 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     log(f"  start_dt     : {start_dt.isoformat() if start_dt else 'unknown'}")
     log(f"  end_dt       : {end_dt.isoformat()   if end_dt   else 'unknown'}")
     log(f"  outdir       : {outdir}")
-    _save_every  = args.save_every
-    _flush_every = args.flush_every
+    _save_every  = P.sampling.save_every
+    _flush_every = P.sampling.flush_every
     log(f"  save_every   : {_save_every}  flush_every={_flush_every}  "
         f"(flush each {_save_every*_flush_every} frames)")
-    if args.crop_tags:
+    if C.crop_tags:
         if _VISION_AVAILABLE:
             log("  crop_tags    : ON (posture+facing classifiers loaded)")
         else:
@@ -733,9 +714,11 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     kps_rows:   list = []
     mask_rows:  list = []
 
-    embed_writer = EmbedWriter(outdir)
-    kps_writer   = KpsWriter(outdir)
-    mask_writer  = MaskWriter(outdir) if args.save_masks else None
+    rows_per_part = P.sampling.parquet_rows_per_part
+    embed_writer = EmbedWriter(outdir, rows_per_part)
+    kps_writer   = KpsWriter(outdir, rows_per_part)
+    mask_writer  = MaskWriter(outdir, rows_per_part) if C.save_masks else None
+    tracker_cfg  = config.tracker_path()
 
     crop_occurrence    = defaultdict(int)
     warned_kp_mismatch = False
@@ -828,8 +811,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             frame_datetime_str = frame_wall.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
         results = det_model.track(
-            source=frame, imgsz=args.imgsz, conf=args.conf, iou=args.iou,
-            tracker=args.tracker, persist=True, verbose=False,
+            source=frame, imgsz=P.detection.imgsz, conf=P.detection.conf,
+            iou=P.detection.iou, tracker=tracker_cfg, persist=True, verbose=False,
         )
 
         if (not results or results[0].boxes is None
@@ -898,7 +881,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             }
 
         if is_sample:
-            crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=0.10)
+            crops, used_boxes = crops_from_bboxes(frame, xyxy, margin=P.embedder.crop_margin)
 
             # Embedder gets background-removed crops when masks are available
             # (segmentation model) — pose model and saved crop JPEGs below
@@ -911,7 +894,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             embed_vecs = [None] * len(embed_crops)
             if embed_crops:
                 X = torch.from_numpy(
-                    np.stack([to_tensor_bchw(c) for c in embed_crops])
+                    np.stack([to_tensor_bchw(c, P.embedder.input_size) for c in embed_crops])
                 ).to(device)
                 with torch.no_grad():
                     Z = embedder(X).cpu().numpy()
@@ -923,8 +906,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
             if pose_model and crops:
                 for i, pres in enumerate(pose_model.predict(
-                        source=crops, imgsz=args.pose_imgsz,
-                        conf=args.pose_conf, verbose=False, stream=False)):
+                        source=crops, imgsz=P.pose.imgsz,
+                        conf=P.pose.conf, verbose=False, stream=False)):
                     if (pres.keypoints is None or pres.keypoints.data is None
                             or not len(pres.keypoints.data)):
                         continue
@@ -932,10 +915,10 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                     xy = k.xy[0].cpu().numpy()
                     sc = k.conf[0].cpu().numpy() if k.conf is not None else None
                     Kn = xy.shape[0]
-                    if EXPECTED_KP and Kn != EXPECTED_KP and not warned_kp_mismatch:
-                        log(f"Warning: pose model returned {Kn} kps, expected {EXPECTED_KP}")
+                    if Kn != N_KP and not warned_kp_mismatch:
+                        log(f"Warning: pose model returned {Kn} kps, expected {N_KP}")
                         warned_kp_mismatch = True
-                    vis = (np.where(sc >= args.pose_kp_conf_thresh, 2, 1).astype(int)
+                    vis = (np.where(sc >= P.pose.kp_conf_thresh, 2, 1).astype(int)
                            if sc is not None else np.ones(Kn, dtype=int) * 2)
                     cx1, cy1, cx2, cy2 = used_boxes[i]
                     sx = max(1, cx2-cx1) / max(1, pres.orig_img.shape[1])
@@ -953,8 +936,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                 kps_mean = None; kps_arr = None; kconf_arr = None
                 if kps_flat_list[j] is not None:
                     kps_mean  = kps_mean_list[j]
-                    kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (57,))
-                    kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (19,))
+                    kps_arr   = np.resize(np.array(kps_flat_list[j],  np.float32), (N_KP * 3,))
+                    kconf_arr = np.resize(np.array(kps_kconf_list[j], np.float32), (N_KP,))
                 mask_poly_json = None
                 if mask_writer is not None and mask_polys is not None and j < len(mask_polys):
                     poly = mask_polys[j]
@@ -974,16 +957,16 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                 if crops_dir is not None:
                     tid_i = int(tid)
                     crop_occurrence[tid_i] += 1
-                    if crop_occurrence[tid_i] % max(1, args.crop_every) == 0:
+                    if crop_occurrence[tid_i] % C.crop_every == 0:
                         cx1,cy1,cx2,cy2 = used_boxes[j]
                         cw,ch = int(cx2-cx1), int(cy2-cy1)
-                        mw,mh = args.min_crop_wh
+                        mw,mh = C.min_crop_wh
                         if cw >= int(mw) and ch >= int(mh):
                             tag = ""
-                            if args.crop_tags and _VISION_AVAILABLE and kps_arr is not None:
+                            if C.crop_tags and _VISION_AVAILABLE and kps_arr is not None:
                                 try:
-                                    _kps  = kps_arr.reshape(1, 19, 3)
-                                    _kc   = kconf_arr.reshape(1, 19)
+                                    _kps  = kps_arr.reshape(1, N_KP, 3)
+                                    _kc   = kconf_arr.reshape(1, N_KP)
                                     _bbox = np.array([[x1, y1, x2, y2]], dtype=np.float32)
                                     _det  = np.array([float(conf_j)], dtype=np.float32)
                                     p_out = extract_posture(_kps, _kc, _bbox, _det)
@@ -998,7 +981,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                                     tag = f"_{p_tag}_{f_tag}"
                                 except Exception:
                                     tag = "_unk_unk"
-                            elif args.crop_tags:
+                            elif C.crop_tags:
                                 tag = "_unk_unk"
                             cv2.imwrite(
                                 str(crops_dir/f"{camera_id}_id{tid_i:04d}_f{frame_idx:06d}{tag}.jpg"),
@@ -1039,6 +1022,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     # ── Upload outputs to Drive ───────────────────────────────────────────────
     log("Uploading session outputs to Drive...")
     dm.sync_db(session_id=session_id)
+    # Reproducibility: the exact params.yaml used for this tracking run
+    config.save_params_snapshot(dm, session_id, "track")
     remote_dir = f"outputs/{session_id}"
     pq_files = [p for p in sorted(outdir.glob("embeds_part*.parquet")) +
                            sorted(outdir.glob("kps_part*.parquet")) if p.exists()]
@@ -1049,7 +1034,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
     uploaded_crops: list[str] = []
     crops_all_uploaded = True
-    if crops_dir and crops_dir.exists() and not args.crops_local:
+    if crops_dir and crops_dir.exists() and not C.crops_local:
         crop_files = sorted(crops_dir.glob("*.jpg"))
         if crop_files:
             log(f"Uploading {len(crop_files)} crop(s) to Drive...")
@@ -1063,7 +1048,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
             finally:
                 _wf._batch_mode = False
             _flush_upload_log()
-    elif crops_dir and args.crops_local:
+    elif crops_dir and C.crops_local:
         log(f"crops_local=True — crops kept locally only: {crops_dir}")
 
     # ── Remove leftovers from an earlier run of this same video ───────────────
@@ -1081,7 +1066,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     else:
         log("Some parquet uploads were buffered — skipping stale-part cleanup on Drive.")
     if crops_all_uploaded:
-        # Crops not uploaded this run (no --save_crops, or --crops_local) are
+        # Crops not uploaded this run (save_crops off, or crops_local on — cli.yaml) are
         # still stale if left on Drive from an earlier run: keep=[] removes them.
         dm.remove_stale_remote_files(
             f"{remote_dir}/crops", keep=uploaded_crops, patterns=["*.jpg"])
@@ -1094,29 +1079,16 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     log("=" * 60)
     try:
         import importlib.util
-        import argparse as _ap
         reconcile_path = Path(__file__).parent / "reconcile.py"
         if not reconcile_path.exists():
             raise FileNotFoundError(f"reconcile.py not found at {reconcile_path}")
         spec  = importlib.util.spec_from_file_location("reconcile", reconcile_path)
         r_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(r_mod)
-        r_args = _ap.Namespace(
-            session            = session_id,
-            corr_threshold     = args.corr_threshold,
-            min_active_bins    = 3,
-            min_temp_id_frames = 0.10,
-            activity_pct       = 0.25,
-            bin_minutes        = 15,
-            ema_alpha          = args.ema_alpha,
-            min_embeds_gallery = 10,
-            cosine_threshold   = args.cosine_threshold,
-            cosine_min_embeds  = 5,
-            dry_run            = False,
-            verbose            = False,
-            bypass_upload_check = getattr(args, "bypass_upload_check", False),
-        )
-        r_mod.run(r_args)
+        # Same process → same loaded params (including any --params override);
+        # nothing to pass through but the session and the safety switch.
+        r_mod.run(session_id, dry_run=False,
+                  bypass_upload_check=getattr(args, "bypass_upload_check", False))
     except Exception as exc:
         log(f"reconcile.py failed: {exc}")
         log("Tracking output is intact — run reconcile.py manually to retry.")
@@ -1128,6 +1100,18 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
 def main():
     args = parse_args()
+    P = config.init(args.params)
+    C = config.cli().track_and_dump
+    _, params_hash = config.params_snapshot()
+    log(f"params       : {config.params_path()}  (sha256 {params_hash})")
+
+    det_path  = config.resolve_path(P.models.detector)
+    pose_path = config.resolve_path(P.models.pose) if P.models.pose else None
+    for label, pth in (("models.detector", det_path), ("models.pose", pose_path)):
+        if pth is not None and not pth.exists():
+            print(f"[track] ERROR: {label} not found: {pth} "
+                  f"(set it in {config.params_path()})")
+            raise SystemExit(1)
 
     # ── Drive setup ───────────────────────────────────────────────────────────
     dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
@@ -1161,22 +1145,24 @@ def main():
 
     # ── Load models once ──────────────────────────────────────────────────────
     log(f"Loading models...")
-    log(f"  detector     : {args.model}")
+    log(f"  detector     : {det_path}")
     device    = "cuda" if torch.cuda.is_available() else "cpu"
-    det_model = YOLO(args.model); det_model.fuse()
+    det_model = YOLO(str(det_path)); det_model.fuse()
     is_seg_model = getattr(det_model, "task", None) == "segment"
     log(f"  det. task    : {getattr(det_model, 'task', 'unknown')}"
         + ("  (masks -> masked embedder crops)" if is_seg_model
            else "  (no masks — embedder uses raw bbox crops)"))
-    if args.save_masks and not is_seg_model:
+    if C.save_masks and not is_seg_model:
         log("  save_masks   : requested but model has no segmentation head — no-op")
-    elif args.save_masks:
+    elif C.save_masks:
         log("  save_masks   : ON (QA-only, local disk, never uploaded to Drive)")
-    embedder  = Embedder128(pretrained=True, out_dim=args.embed_size).to(device).eval()
+    embedder  = Embedder128(pretrained=True, out_dim=EMBED_DIM).to(device).eval()
     pose_model = None
-    if args.pose_model:
-        log(f"  pose         : {args.pose_model}")
-        pose_model = YOLO(args.pose_model); pose_model.fuse()
+    if pose_path is not None:
+        log(f"  pose         : {pose_path}")
+        pose_model = YOLO(str(pose_path)); pose_model.fuse()
+    else:
+        log("  pose         : none (models.pose is null)")
     log(f"  device       : {device}")
 
     # ── Graceful stop shared across all videos ────────────────────────────────
@@ -1198,7 +1184,7 @@ def main():
                 "duration_s": 0.0, "error": "batch interrupted"
             })
             _log_to_batch_log(dm, video_path, "", "skipped", 0, 0.0,
-                              "batch interrupted by Ctrl+C")
+                              "batch interrupted by Ctrl+C", params_hash)
             continue
 
         log(f"\n{'='*60}")
@@ -1220,7 +1206,7 @@ def main():
         _log_to_batch_log(dm, video_path,
                           result["session_id"], result["status"],
                           result["frames"],     result["duration_s"],
-                          result.get("error", ""))
+                          result.get("error", ""), params_hash)
 
     # ── Flush batch log to Drive ──────────────────────────────────────────────
     _flush_batch_log(dm)
@@ -1250,36 +1236,20 @@ if __name__ == "__main__":
 # Example usage
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Paths
-# SEG=~/thesis_workspace/vcf-ctp/models/cow_seg/run14/weights/best.pt
-# POSE=~/thesis_workspace/vcf-ctp/models/cow_pose/best.pt
+# Models, detection/pose/sampling settings → config/params.yaml
+# Crops / masks (QA output)                 → config/cli.yaml (track_and_dump:)
+#
 # VID=~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.ts
 #
 # ── Single video ─────────────────────────────────────────────────────────────
-# python3 track_and_dump.py \
-#   --model      "$SEG" \
-#   --source     "$VID" \
-#   --pose_model "$POSE" \
-#   --imgsz 960 --conf 0.30 --iou 0.45 \
-#   --pose_imgsz 384 --pose_conf 0.25 \
-#   --save_every 5 --flush_every 10
+# python3 track_and_dump.py --source "$VID"
 #
 # ── Batch — all videos in a directory ────────────────────────────────────────
-# python3 track_and_dump.py \
-#   --model      "$SEG" \
-#   --source     "$SOURCE" \
-#   --pose_model "$POSE" \
-#   --imgsz 960 --conf 0.30 --iou 0.60 \
-#   --pose_imgsz 384 --pose_conf 0.25 \
-#   --save_every 10 --flush_every 5
+# python3 track_and_dump.py --source ~/thesis_workspace/raw_data/calving/
 #
-# ── With crops ───────────────────────────────────────────────────────────────
-# python3 track_and_dump.py ... \
-#   --save_crops --crop_every 300 --min_crop_wh 100 100 --crop_tags
-#   # add --crops_local to skip uploading crops to Drive
-#
-# ── With masks ───────────────────────────────────────────────────────────────
-# --save_masks
+# ── Threshold sweep without editing the main file ────────────────────────────
+# cp config/params.yaml config/params_strict.yaml   # edit the copy
+# python3 track_and_dump.py --source "$VID" --params config/params_strict.yaml
 
 
 # ── Re-run reconcile manually on an existing session ─────────────────────────

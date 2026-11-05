@@ -17,13 +17,10 @@ Steps (in order):
   Timeline Writer        — write resolved_cow_timeline rows
 
 Usage:
-    python3 reconcile.py \\
-        --session   session_001 \\
-        [--corr_threshold 0.7] \\
-        [--min_active_bins 3] \\
-        [--cosine_threshold 0.75] \\
-        [--ema_alpha 0.15] \\
-        [--dry_run]
+    python3 reconcile.py --session <session_id> [--dry_run] [--params my.yaml]
+
+All thresholds (kinetic matching, gallery, cosine, co-occurrence, vision,
+cross-camera) come from config/params.yaml — see config.py.
 
 Note: --db, --kinetics, --gallery_dir, and --embed_parquet are NOT arguments.
 All data paths (DB, collar CSVs, gallery, parquet) are resolved exclusively
@@ -50,7 +47,9 @@ from vision_features.gallery import (
     TempPoseGallery, TempKey, PoseGallery,
     mint_synthetic_id, is_synthetic, backpropagate_resolution,
 )
-from vision_features.schema import CAMERA_IDS
+from vision_features.schema import EMBED_DIM
+
+import config
 
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
@@ -85,38 +84,13 @@ def parse_args() -> argparse.Namespace:
     # NOT arguments. Every data path is resolved through drive_manager.py,
     # keyed off --session, so there is exactly one source of truth (Drive).
 
-    # --- step A: kinetic matching ---
-    ap.add_argument("--corr_threshold",   type=float, default=0.7,
-                    help="Min Pearson r for kinetic match (default: 0.7)")
-    ap.add_argument("--min_active_bins",  type=int,   default=3,
-                    help="Min active kinetics bins required (default: 3)")
-    ap.add_argument("--min_temp_id_frames", type=float, default=0.10,
-                    help="Min fraction of frames a temp_id must appear in (default: 0.10)")
-    ap.add_argument("--activity_pct",     type=float, default=0.25,
-                    help="Percentile threshold for 'active' kinetics bins (default: 0.25)")
-    ap.add_argument("--bin_minutes",      type=int,   default=15,
-                    help="Kinetics bin width in minutes (default: 15)")
-
-    # --- step B: gallery builder ---
-    ap.add_argument("--ema_alpha",       type=float, default=0.15,
-                    help="EMA decay for gallery update — α for kinetic-confirmed, α/2 for cosine-only (default: 0.15)")
-    ap.add_argument("--min_embeds_gallery", type=int, default=10,
-                    help="Min embed rows per temp_id to contribute to gallery (default: 10)")
-
-    # --- step C: cosine resolver ---
-    ap.add_argument("--cosine_threshold",    type=float, default=0.75,
-                    help="Min cosine similarity for cross-video / switch-healing match (default: 0.75)")
-    ap.add_argument("--cosine_min_embeds",   type=int,   default=5,
-                    help="Min embed rows for a temp_id to be queried via cosine (default: 5)")
-
     # --- misc ---
     ap.add_argument("--dry_run", action="store_true",
                     help="Run all steps but do not write to the database")
-    ap.add_argument("--verbose", action="store_true",
-                    help="Print extra diagnostic output")
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
+    config.add_params_arg(ap)
 
     return ap.parse_args()
 
@@ -310,7 +284,8 @@ def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
     """
     Heuristic: night/IR footage has near-zero variance between colour channels.
     Since we don't have pixel data here, fall back to time-of-day from frame_datetime.
-    Night = any session where >50% of frames fall between 20:00 and 06:00 local.
+    Night = more than session.night_fraction of frames fall in
+    [night_start_hour, 24) ∪ [0, night_end_hour) local (params.yaml).
     (Proper version uses per-channel variance on sampled frames — see architecture doc.)
     """
     if "frame_datetime" not in tracks_df.columns:
@@ -318,9 +293,10 @@ def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
     dt_col = pd.to_datetime(tracks_df["frame_datetime"], errors="coerce").dropna()
     if dt_col.empty:
         return False
+    sp = config.params().session
     hours = dt_col.dt.hour
-    night_mask = (hours >= 20) | (hours < 6)
-    return bool(night_mask.mean() > 0.5)
+    night_mask = (hours >= sp.night_start_hour) | (hours < sp.night_end_hour)
+    return bool(night_mask.mean() > sp.night_fraction)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,8 +383,7 @@ def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
 
 
 def kinetic_matcher(tracks_df: pd.DataFrame,
-                          kinetics_df: pd.DataFrame,
-                          args: argparse.Namespace) -> tuple[dict, dict]:
+                          kinetics_df: pd.DataFrame) -> tuple[dict, dict]:
     """
     Returns (assignment, kinetic_corr):
         assignment   : {temp_id (int) -> AnimalId (int)}
@@ -419,20 +394,22 @@ def kinetic_matcher(tracks_df: pd.DataFrame,
                        this was computed into `scores` but never returned.
     """
     section("Kinetic Matcher")
+    km  = config.params().kinetic_match
+    bin_minutes = config.params().timeline.bin_minutes
 
     total_frames = tracks_df["frame_index"].nunique()
     tid_counts = tracks_df.groupby("temp_id")["frame_index"].nunique()
     stable_tids = tid_counts[
-        tid_counts / total_frames >= args.min_temp_id_frames
+        tid_counts / total_frames >= km.min_temp_id_frames
     ].index.tolist()
-    log(f"Stable temp_ids (≥{args.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
+    log(f"Stable temp_ids (≥{km.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
 
     tracks_filt = tracks_df[tracks_df["temp_id"].isin(stable_tids)].copy()
 
-    t_start = tracks_filt["frame_datetime"].min().floor(f"{args.bin_minutes}min")
-    t_end   = tracks_filt["frame_datetime"].max().ceil(f"{args.bin_minutes}min")
-    bins    = pd.date_range(start=t_start, end=t_end, freq=f"{args.bin_minutes}min")
-    log(f"Time bins: {len(bins)-1} × {args.bin_minutes}-min from {t_start} to {t_end}")
+    t_start = tracks_filt["frame_datetime"].min().floor(f"{bin_minutes}min")
+    t_end   = tracks_filt["frame_datetime"].max().ceil(f"{bin_minutes}min")
+    bins    = pd.date_range(start=t_start, end=t_end, freq=f"{bin_minutes}min")
+    log(f"Time bins: {len(bins)-1} × {bin_minutes}-min from {t_start} to {t_end}")
 
     if len(bins) < 3:
         log("WARNING: fewer than 2 complete bins — correlation will be unreliable.")
@@ -444,7 +421,7 @@ def kinetic_matcher(tracks_df: pd.DataFrame,
         log("WARNING: empty displacement or kinetics signal — no matches possible.")
         return {}, {}
 
-    scores = _compute_scores(cam_disp, kin_delta, args.activity_pct, args.min_active_bins)
+    scores = _compute_scores(cam_disp, kin_delta, km.activity_pct, km.min_active_bins)
 
     # print correlation matrix
     if not scores.empty:
@@ -454,7 +431,7 @@ def kinetic_matcher(tracks_df: pd.DataFrame,
         print(pivot.to_string())
         print()
 
-    assignment = _greedy_assign(scores, args.corr_threshold)
+    assignment = _greedy_assign(scores, km.corr_threshold)
 
     kinetic_corr = {}
     for tid, aid in assignment.items():
@@ -469,7 +446,7 @@ def kinetic_matcher(tracks_df: pd.DataFrame,
                 f"(r={row['correlation']:.3f}, n_bins={int(row['n_bins'])})")
     else:
         log("  No confident kinetic matches. "
-            "Try lowering --corr_threshold or using a longer video.")
+            "Try lowering kinetic_match.corr_threshold in params.yaml or using a longer video.")
 
     unmatched = set(stable_tids) - set(assignment.keys())
     if unmatched:
@@ -523,7 +500,7 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
             continue
         try:
             arr = np.array(json.loads(raw), dtype=np.float32)
-            if arr.shape == (128,):
+            if arr.shape == (EMBED_DIM,):
                 rows.append({"temp_id": row["temp_id"], "embed": arr})
         except Exception:
             pass
@@ -579,7 +556,6 @@ def gallery_builder(
     kinetic_assignment: dict,       # {temp_id -> AnimalId}
     is_night: bool,
     conn: sqlite3.Connection,
-    args: argparse.Namespace,
     gallery_dir: str,
     dry_run: bool = False,
 ) -> dict:
@@ -601,13 +577,14 @@ def gallery_builder(
         log("No embeds available — skipping gallery update.")
         return gallery
 
+    gp = config.params().gallery
     updates = 0
-    alpha = args.ema_alpha
+    alpha = gp.ema_alpha
 
     for tid, aid in kinetic_assignment.items():
         tid_embeds = embed_df[embed_df["temp_id"] == tid]
-        if len(tid_embeds) < args.min_embeds_gallery:
-            log(f"  temp_id {tid}: only {len(tid_embeds)} embeds (< {args.min_embeds_gallery}) — skip")
+        if len(tid_embeds) < gp.min_embeds:
+            log(f"  temp_id {tid}: only {len(tid_embeds)} embeds (< {gp.min_embeds}) — skip")
             continue
 
         session_mean = compute_mean_embed(tid_embeds)
@@ -713,12 +690,17 @@ def _nearest_box(frame_boxes: pd.DataFrame, target_frame: int):
     return (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
 
 
-def _estimate_frame_tolerance(tracks_df: pd.DataFrame, default: int = 20) -> int:
+def _estimate_frame_tolerance(tracks_df: pd.DataFrame) -> int:
     """Approximate the per-tid sampling cadence (roughly save_every from
     track_and_dump.py) directly from the data, so co-occurrence tolerance
     isn't a guessed constant. Uses the median consecutive-frame gap of
     whichever temp_id has the most rows (most likely to be continuously
-    tracked, giving a clean estimate of the commit cadence)."""
+    tracked, giving a clean estimate of the commit cadence).
+
+    params.yaml cooccurrence: tolerance = max(frame_tolerance_min,
+    gap_multiplier × median gap); frame_tolerance_min also when no estimate."""
+    co = config.params().cooccurrence
+    default = co.frame_tolerance_min
     counts = tracks_df["temp_id"].value_counts()
     if counts.empty:
         return default
@@ -730,9 +712,9 @@ def _estimate_frame_tolerance(tracks_df: pd.DataFrame, default: int = 20) -> int
     gaps = gaps[gaps > 0]
     if len(gaps) == 0:
         return default
-    # 2x safety margin for jitter in exactly which frame within a window
-    # ends up being the one committed.
-    return max(int(2 * np.median(gaps)), default)
+    # Safety margin (gap_multiplier, 2x by default) for jitter in exactly
+    # which frame within a window ends up being the one committed.
+    return max(int(co.gap_multiplier * np.median(gaps)), default)
 
 
 def _min_frame_dist(arr_a: np.ndarray, arr_b: np.ndarray) -> float:
@@ -762,7 +744,6 @@ def cosine_resolver(
     gallery: dict,                  # {real_id: np.ndarray} flat gallery from step B
     is_night: bool,
     conn: sqlite3.Connection,
-    args: argparse.Namespace,
     gallery_dir: str,
     session_id: str,
     camera_id: str = "cam0",
@@ -795,6 +776,9 @@ def cosine_resolver(
     previously a synthetic id, all timeline rows are updated.
     """
     section("Cosine Resolver")
+    P  = config.params()
+    cr = P.cosine_resolver
+    gp = P.gallery
 
     modality = "night" if is_night else "day"
 
@@ -809,10 +793,10 @@ def cosine_resolver(
     embed_counts   = embed_df.groupby("temp_id").size()
     queryable_tids = [
         tid for tid in unresolved_tids
-        if embed_counts.get(tid, 0) >= args.cosine_min_embeds
+        if embed_counts.get(tid, 0) >= cr.min_embeds
     ]
     log(f"Unresolved temp_ids: {len(unresolved_tids)}  "
-        f"Queryable (≥{args.cosine_min_embeds} embeds): {len(queryable_tids)}")
+        f"Queryable (≥{cr.min_embeds} embeds): {len(queryable_tids)}")
 
     # Load pose galleries
     pose_gallery = PoseGallery.load(gallery_dir, modality)
@@ -836,7 +820,8 @@ def cosine_resolver(
     tid_frames   = _tid_frame_arrays(tracks_df)
     tid_boxes    = _tid_frame_boxes(tracks_df)
     cooccur_tol  = _estimate_frame_tolerance(tracks_df)
-    IOU_SAME_ANIMAL = 0.3   # above this, same screen location -> handoff artifact, not a real conflict
+    # above this, same screen location -> handoff artifact, not a real conflict
+    IOU_SAME_ANIMAL = config.params().cooccurrence.iou_same_animal
     aid_claims: dict = {}
     for k_tid, k_aid in kinetic_assignment.items():
         aid_claims.setdefault(k_aid, []).append((k_tid, tid_frames.get(k_tid, np.array([]))))
@@ -925,7 +910,7 @@ def cosine_resolver(
             if sim > best_sim:
                 best_sim, best_aid = sim, aid
 
-        if best_aid is not None and best_sim >= args.cosine_threshold:
+        if best_aid is not None and best_sim >= cr.threshold:
             cosine_assignment[tid] = best_aid
             cosine_scores[tid] = float(best_sim)
             aid_claims.setdefault(best_aid, []).append((tid, tid_frames.get(tid, np.array([]))))
@@ -939,7 +924,7 @@ def cosine_resolver(
 
         # ── Step 2: pose-conditioned real_id gallery ─────────────────────────
         p_id, p_cos, _ = pose_gallery.query(
-            query_vec, posture=None, facing=None, threshold=args.cosine_threshold
+            query_vec, posture=None, facing=None, threshold=cr.threshold
         )
         if p_cos is not None:
             near_miss.append(("pose-slot", p_id, p_cos))
@@ -963,10 +948,10 @@ def cosine_resolver(
                 query_embed     = query_vec,
                 posture         = None,
                 facing          = None,
-                threshold       = args.cosine_threshold,
+                threshold       = cr.threshold,
                 exclude_session = session_id,   # don't match against self
             )
-            for cam in CAMERA_IDS
+            for cam in P.camera_ids
         ]
 
         matched = [r for r in cam_results if r[1] is not None]
@@ -1025,9 +1010,9 @@ def cosine_resolver(
         else:
             source, candidate, score = max(near_miss, key=lambda x: x[2])
             if candidate is None:
-                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
                     f"(closest: {source} @ {score:.3f}, no candidate id)")
-            elif score >= args.cosine_threshold and source in ("flat", "pose-slot"):
+            elif score >= cr.threshold and source in ("flat", "pose-slot"):
                 # Cleared the cosine threshold but still ended up unresolved
                 # -> it was blocked by the overlap check, not by similarity.
                 # Report exactly what blocked it so a real conflict can be
@@ -1043,10 +1028,10 @@ def cosine_resolver(
                 else:
                     # Shouldn't normally happen (if not blocked it should have
                     # been accepted above) — log plainly rather than guess why.
-                    log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                    log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
                         f"(closest: {source} candidate {candidate} @ {score:.3f})")
             else:
-                log(f"  t{tid}: no match above {args.cosine_threshold} — unresolved  "
+                log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
                     f"(closest: {source} candidate {candidate} @ {score:.3f})")
 
     if not cosine_assignment:
@@ -1054,12 +1039,12 @@ def cosine_resolver(
 
     # ── Soft gallery update for real_id cosine matches (α/2) ─────────────────
     if not dry_run:
-        alpha_half = args.ema_alpha / 2
+        alpha_half = gp.ema_alpha / 2
         for tid, aid in cosine_assignment.items():
             if is_synthetic(aid):
                 continue   # don't update real_id gallery with unconfirmed embeddings
             tid_embeds = embed_df[embed_df["temp_id"] == tid]
-            if len(tid_embeds) < args.min_embeds_gallery:
+            if len(tid_embeds) < gp.min_embeds:
                 continue
             session_mean = compute_mean_embed(tid_embeds)
             if aid in gallery:
@@ -1132,7 +1117,7 @@ def sensor_sequencer(
     kinetics_df: pd.DataFrame,
     behavior_df: pd.DataFrame | None,
     assignment: dict,
-    bin_minutes: int = 15,
+    bin_minutes: int,                 # params timeline.bin_minutes
 ) -> pd.DataFrame:
     """
     Forward-fill behavior (~90s) and kinetics (~15min) signals onto the video time grid.
@@ -1321,26 +1306,19 @@ def write_timeline(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Which step produced a temp_id's current AnimalId, and how much to trust it
-# when two temp_ids in one session claim the same AnimalId. Lower wins.
-# Mirrors the README's trust order: operator > collar ground truth >
-# cross-camera boundary match > appearance alone.
-SOURCE_PRIORITY = {
-    "manual":              0,
-    "kinetic":             1,
-    "boundary_rendezvous": 2,
-    "cosine":              3,
-}
-# Sources Boundary Rendezvous is not allowed to overwrite.
-PROTECTED_SOURCES = {"manual", "kinetic"}
-
-# Same threshold the Cosine Resolver uses: two temp_ids on screen at the same
-# moment with box IoU at or above this are one animal whose box briefly had
-# two ids (handoff artifact); below it, they are two different animals.
-IOU_SAME_ANIMAL = 0.3
+# when two temp_ids in one session claim the same AnimalId: params.yaml
+# identity.source_priority, highest trust first (lower rank wins) — operator >
+# collar ground truth > cross-camera boundary match > appearance alone.
+# identity.protected_sources: sources Boundary Rendezvous may not overwrite.
+#
+# Same-animal IoU: params.yaml cooccurrence.iou_same_animal, shared with the
+# Cosine Resolver — two temp_ids on screen at the same moment with box IoU at
+# or above it are one animal whose box briefly had two ids (handoff
+# artifact); below it, they are two different animals.
 
 
 def _pair_conflict(frames_a: np.ndarray, boxes_a, frames_b: np.ndarray, boxes_b,
-                   tol: int, iou_same: float = IOU_SAME_ANIMAL) -> tuple:
+                   tol: int, iou_same: float) -> tuple:
     """Are temp_ids A and B two different animals? Same rule as the Cosine
     Resolver's _aid_block_reason: they conflict only if they were on screen
     within `tol` frames of each other AND, at that closest moment, their
@@ -1418,7 +1396,7 @@ def update_known_temp_ids(conn: sqlite3.Connection,
 
 def resolve_duplicate_assignments(
     assignment: dict,               # {temp_id -> real_id}  — may contain duplicates
-    provenance: dict,               # {temp_id -> source}, see SOURCE_PRIORITY
+    provenance: dict,               # {temp_id -> source}, see identity.source_priority
     tracks_df: pd.DataFrame,        # for frame counts and co-occurrence
     conn: sqlite3.Connection,
     session_id: str,
@@ -1428,7 +1406,7 @@ def resolve_duplicate_assignments(
     Resolve AnimalIds claimed by more than one temp_id in this session.
 
     Each duplicate group is ranked by:
-      1. Source of the id (SOURCE_PRIORITY): manual > kinetic >
+      1. Source of the id (params identity.source_priority): manual > kinetic >
          boundary_rendezvous > cosine
       2. More frames in raw_tracks
       3. Lower temp_id
@@ -1464,13 +1442,16 @@ def resolve_duplicate_assignments(
     tid_frames   = _tid_frame_arrays(tracks_df)
     tid_boxes    = _tid_frame_boxes(tracks_df)
     cooccur_tol  = _estimate_frame_tolerance(tracks_df)
+    P            = config.params()
+    priority     = P.source_priority          # {source -> rank}, lower wins
+    iou_same     = P.cooccurrence.iou_same_animal
 
     def source(tid):
         return provenance.get(tid, "unknown")
 
     def rank(tid):
         """Lower sorts first (wins)."""
-        return (SOURCE_PRIORITY.get(source(tid), len(SOURCE_PRIORITY)),
+        return (priority.get(source(tid), len(priority)),
                 -frame_counts.get(tid, 0), tid)
 
     def describe(tid):
@@ -1513,7 +1494,7 @@ def resolve_duplicate_assignments(
                 conflict, dist, iou = _pair_conflict(
                     tid_frames.get(tid, np.array([])), tid_boxes.get(tid),
                     tid_frames.get(k,   np.array([])), tid_boxes.get(k),
-                    cooccur_tol,
+                    cooccur_tol, iou_same,
                 )
                 if conflict:
                     conflict_with = (k, dist, iou)
@@ -1568,19 +1549,26 @@ def load_manual_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run(args) -> None:
+def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) -> None:
     """
-    Core pipeline entry point. Callable from CLI (via main()) or directly when
-    imported by track_and_dump.py. args is an argparse.Namespace with all fields
-    from parse_args() — no --tracks needed; tracks are loaded from the DB.
+    Core pipeline entry point. Callable from CLI (via main()) or directly by
+    track_and_dump.py / assign_identity.py. Every threshold comes from
+    config.params() — the caller only says which session and the two one-shot
+    safety switches. Tracks are loaded from the DB.
     """
+    args = argparse.Namespace(session=session, dry_run=dry_run,
+                              bypass_upload_check=bypass_upload_check)
+    P = config.params()
+    _, params_hash = config.params_snapshot()
+
     section("reconcile.py — ReID pipeline")
     log(f"session_id  : {args.session}")
     log("All data paths (db, kinetics, behavior, gallery, parquet) resolved via drive_manager")
+    log(f"params      : {config.params_path()}  (sha256 {params_hash})")
     log(f"dry_run     : {args.dry_run}")
 
     # ── Drive setup ───────────────────────────────────────────────────────────
-    bypass = getattr(args, "bypass_upload_check", False)
+    bypass = args.bypass_upload_check
     dm = DriveManager(bypass=bypass, caller=__file__)
 
     # Dirty-flag check: reconcile reads from DB and gallery — both must be clean
@@ -1676,11 +1664,11 @@ def run(args) -> None:
         log(f"  {len(behavior_df)} rows")
 
     # ── Kinetic Matcher ───────────────────────────────────────────────────────
-    kinetic_assignment, kinetic_corr = kinetic_matcher(tracks_df, kinetics_df, args)
+    kinetic_assignment, kinetic_corr = kinetic_matcher(tracks_df, kinetics_df)
 
     # provenance: {temp_id -> source of its current id}. Every step that sets
     # or changes an id records itself here, so the Duplicate Resolver can rank
-    # competing claims by SOURCE_PRIORITY and the audit trail is accurate.
+    # competing claims by identity.source_priority and the audit trail is accurate.
     provenance = {tid: "kinetic" for tid in kinetic_assignment}
 
     # ── Manual Merge ──────────────────────────────────────────────────────────
@@ -1707,7 +1695,6 @@ def run(args) -> None:
         kinetic_assignment = kinetic_assignment,
         is_night           = is_night,
         conn               = conn,
-        args               = args,
         gallery_dir        = gallery_dir,
         dry_run            = args.dry_run,
     )
@@ -1721,7 +1708,6 @@ def run(args) -> None:
         gallery            = gallery,
         is_night           = is_night,
         conn               = conn,
-        args               = args,
         gallery_dir        = gallery_dir,
         session_id         = args.session,
         camera_id          = camera_id,
@@ -1746,8 +1732,9 @@ def run(args) -> None:
         conn=conn, session_id=args.session, camera_id=camera_id,
         tracks_df=tracks_df, embed_df=embed_df,
         assignment=full_assignment, confidence=c5_confidence,
-        config=CrossCameraConfig(), dry_run=args.dry_run,
-        protected_tids={t for t, s in provenance.items() if s in PROTECTED_SOURCES},
+        config=CrossCameraConfig.from_params(P), dry_run=args.dry_run,
+        protected_tids={t for t, s in provenance.items()
+                        if s in P.identity.protected_sources},
     )
     for line in c5_log:
         log(line)
@@ -1776,8 +1763,7 @@ def run(args) -> None:
             kinetic_assignment = full_assignment,
             is_night           = is_night,
             conn               = conn,
-            args               = args,
-            gallery_dir        = gallery_dir,
+                gallery_dir        = gallery_dir,
             dry_run            = args.dry_run,
         )
 
@@ -1800,7 +1786,7 @@ def run(args) -> None:
         kinetics_df = kinetics_df,
         behavior_df = behavior_df,
         assignment  = full_assignment,
-        bin_minutes = args.bin_minutes,
+        bin_minutes = P.timeline.bin_minutes,
     )
     if not timeline_df.empty:
         timeline_df["session_id"] = args.session
@@ -1823,9 +1809,7 @@ def run(args) -> None:
             kps_parquet   = str(dm.get_session_dir(args.session)),
             embed_parquet = embed_parquet_path,
             gallery_dir   = gallery_dir,
-            ema_alpha     = args.ema_alpha,
             dry_run       = args.dry_run,
-            bin_minutes   = args.bin_minutes,
             merge_map     = merge_map,
         )
 
@@ -1855,6 +1839,9 @@ def run(args) -> None:
         section("Drive sync")
         # DB
         dm.sync_db(session_id=args.session)
+        # Reproducibility: the exact params.yaml this run used
+        config.save_params_snapshot(dm, args.session, "reconcile")
+        log(f"params snapshot → outputs/{args.session}/params_reconcile.yaml")
         # Gallery .npy files
         modality = "night" if detect_is_night_from_tracks(tracks_df) else "day"
         gallery_files = [
@@ -1874,7 +1861,10 @@ def run(args) -> None:
 
 
 def main() -> None:
-    run(parse_args())
+    args = parse_args()
+    config.init(args.params)
+    run(args.session, dry_run=args.dry_run,
+        bypass_upload_check=args.bypass_upload_check)
 
 
 if __name__ == "__main__":
@@ -1885,12 +1875,8 @@ if __name__ == "__main__":
 # Example usage
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# python3 reconcile.py \
-#   --session    refet33_20241221 \
-#   --corr_threshold 0.7 \
-#   --min_active_bins 3 \
-#   --cosine_threshold 0.75 \
-#   --ema_alpha 0.15
+# python3 reconcile.py --session cam33_6_S20260616100001_E20260616110000
+#   thresholds: config/params.yaml   (sweep: --params config/params_strict.yaml)
 #
 # Dry run (no DB writes):
 #   --dry_run
@@ -1898,14 +1884,15 @@ if __name__ == "__main__":
 # After running, validate visually:
 #   python3 display_tracks.py \
 #     --video      ~/thesis_workspace/raw_data/calving/refet_33_S20241221070000_E20241221080000.mp4 \
-#     --session_id refet33_20241221 \
-#     --draw_pose --show_fps --sink ffplay
+#     --session_id cam33_6_S20260616100001_E20260616110000
+#   (overlays such as draw_pose: config/cli.yaml → display_tracks:)
 #
 # Pipeline notes:
 #   - Run once per session after track_and_dump.py completes
 #   - DB, kinetics, behavior, gallery, and parquet are all resolved through
 #     drive_manager.py — there is no local-path override for any of them
 #   - Gallery files accumulate across sessions — more sessions = better cosine matching
-#   - Kinetic matching requires ≥3 active 15-min bins (45+ minutes of video)
+#   - Kinetic matching requires kinetic_match.min_active_bins active bins
+#     (default 3 × 15 min → 45+ minutes of video)
 #   - Cosine resolver is a no-op on first run (empty gallery) — by design
 #   - Vision features (spine_angle etc.) will be NULL until pose extractor is added
