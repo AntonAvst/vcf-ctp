@@ -786,12 +786,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
   When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
 - [x] resolve session id logic (video name, time, etc...) — see Key Design Decision 23 / `make_session_id`
-- [ ] what to do about bbox overpopulation?
 - [x] change day-night logic to grayscale vs rgb — per-frame camera-mode detection in `track_and_dump.py`, stored in `raw_tracks.is_night`, routed per row everywhere downstream; see Key Design Decision 25
-  - [ ] Tune `camera_mode.chroma_tol` / `color_pixel_frac` on real footage — defaults were set on two screenshots (night 0.0 vs a washed-out day frame 0.21 at tol 6). Check the end-of-video percentile log line, especially on sessions that cross dusk/dawn.
-  - [ ] Galleries built before this change were routed by the clock rule, so sessions around the transition hours put some IR frames into day galleries (or the reverse). EMA can't remove that — rebuild galleries from scratch once sessions are re-tracked.
-  - [ ] Optional: decode-only backfill of `raw_tracks.is_night` for already-tracked sessions (re-reads the local video, no detector) instead of re-running track_and_dump.py. Until then those sessions use the clock fallback.
-  - [ ] Boundary Rendezvous (`cross_camera.py`) averages a track's flat embedding over all its frames regardless of mode; a crossing at dusk can compare an IR embedding with a colour one. Consider computing it from the dwell frames only and skipping tier 2 when the two sides' modes differ.
 - [ ] Gallery Builder runs twice when the Duplicate Resolver merges anything (second call after the remap): kinetic temp_ids get the EMA applied twice per session and cosine-resolved ones get a full α on top of α/2. Re-running a session likewise re-applies the PoseGallery EMA. Pre-existing — not caused by the day/night change.
 - [ ] The Cosine Resolver's soft update overwrites `reid_registry.match_method` (`'kinetic'` → `'cosine_day'`/`'cosine_night'`), so `assign_identity.py`'s "already kinetically confirmed" check (`match_method = 'kinetic'`) loses the cow after its first cosine sighting. Pre-existing.
 - [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `identity.source_priority` in `params.yaml`
@@ -799,7 +794,6 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
   - [x] Implement tier-3 motion-magnitude correlation — `make_motion_corr_fn` / `motion_magnitude_corr` in `cross_camera.py`. On synthetic tracks (same cow seen at different scales and opposite directions, 1 px jitter): same cow r≈0.998, different cows ≤0.48; still matches with up to ~1.5 s clock offset, fails at 10 s. `motion_corr_threshold` not yet checked against real crossings.
-  - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
 - [x] Reset the tracker between videos in batch mode.
 - [ ] Collapse match_identity.py and reconcile's inline correlation logic into one implementation.
 - [x] Move vision-feature constants into the config file, including CLI plumbing — `config/params.yaml` + `config/cli.yaml`, see Configuration
@@ -812,6 +806,7 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 
 ---
 - [ ] retrain pose estimator (open question: masked crops vs. raw crops as input — masked-crop training would be an out-of-distribution shift for the current pose model; not yet decided)
+- [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
 - [ ] decide what to do with clumping — **blocked on evaluation**, see below
 ---
 - [x] **convert yolo detector with yolo segmentor**
