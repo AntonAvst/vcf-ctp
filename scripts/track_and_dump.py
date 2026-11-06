@@ -257,6 +257,57 @@ def masked_crops_from_polys(frame, used_boxes, mask_polys, fallback_crops):
         out.append(crop_img)
     return out
 
+# ── Camera mode (day colour vs night IR grayscale) ────────────────────────────
+# The cameras switch themselves from colour to grayscale when light drops, and
+# back at dawn — possibly in the middle of a video. In grayscale mode every
+# pixel has R == G == B (up to compression noise); in colour mode a fraction of
+# pixels always carries chroma, even in a washed-out, low-saturation scene.
+#
+# The metric is the FRACTION of pixels whose max channel difference exceeds a
+# small absolute tolerance — not mean HSV saturation, which is (max-min)/max
+# and explodes on the dark pixels that dominate a night frame.
+
+def frame_color_fraction(frame, stride: int, chroma_tol: int) -> float:
+    """Fraction of (strided) pixels with max(|R-G|,|G-B|,|R-B|) > chroma_tol.
+    ~0 for a grayscale/IR frame, clearly > 0 for a colour frame."""
+    s = frame[::stride, ::stride].astype(np.int16)
+    b, g, r = s[..., 0], s[..., 1], s[..., 2]
+    chroma = np.maximum(np.maximum(np.abs(r - g), np.abs(g - b)), np.abs(r - b))
+    return float((chroma > chroma_tol).mean())
+
+
+class CameraModeTracker:
+    """Per-frame day/night label with debounce.
+
+    The raw per-frame decision can flicker for a few frames while the IR-cut
+    filter swaps and auto-exposure settles. A new mode is only recorded once
+    it has held for `hold_frames` consecutive frames; until then the previous
+    mode is kept (a lag of at most debounce_seconds at a real switch).
+    The very first frame sets the starting mode with no debounce.
+    """
+
+    def __init__(self, hold_frames: int):
+        self.hold_frames = max(1, int(hold_frames))
+        self.is_night: bool | None = None
+        self._pending = 0
+        self.transitions: list[tuple[int, bool]] = []   # (frame_idx, new is_night)
+
+    def update(self, raw_is_night: bool, frame_idx: int) -> bool:
+        if self.is_night is None:
+            self.is_night = raw_is_night
+            return self.is_night
+        if raw_is_night == self.is_night:
+            self._pending = 0
+        else:
+            self._pending += 1
+            if self._pending >= self.hold_frames:
+                self.is_night = raw_is_night
+                self._pending = 0
+                # the switch actually started hold_frames-1 frames earlier
+                self.transitions.append((frame_idx - self.hold_frames + 1, raw_is_night))
+        return self.is_night
+
+
 def flat_kps_xyv(kps_xyv):
     out = []
     for (x, y, v) in kps_xyv:
@@ -273,7 +324,8 @@ CREATE TABLE IF NOT EXISTS video_sessions (
     start_dt        TEXT,
     end_dt          TEXT,
     collar_csv_path TEXT,
-    is_night        INTEGER DEFAULT 0
+    is_night        INTEGER DEFAULT 0,  -- majority camera mode (summary only)
+    night_frame_fraction REAL           -- fraction of frames in grayscale/IR mode
 );
 
 CREATE TABLE IF NOT EXISTS raw_tracks (
@@ -289,7 +341,9 @@ CREATE TABLE IF NOT EXISTS raw_tracks (
     w  REAL, h  REAL,
     kps_conf           REAL,
     embed_parquet_row  INTEGER,
-    kps_parquet_row    INTEGER
+    kps_parquet_row    INTEGER,
+    is_night           INTEGER   -- camera mode at this frame: 1=grayscale/IR,
+                                 -- 0=colour, NULL=tracked before detection existed
 );
 
 CREATE INDEX IF NOT EXISTS idx_raw_tracks_session_frame
@@ -299,6 +353,13 @@ CREATE INDEX IF NOT EXISTS idx_raw_tracks_session_frame
 def init_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.executescript(SCHEMA_SQL)
+    # DBs created before per-frame camera-mode detection existed
+    for sql in ("ALTER TABLE raw_tracks ADD COLUMN is_night INTEGER",
+                "ALTER TABLE video_sessions ADD COLUMN night_frame_fraction REAL"):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass   # column already present
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.commit()
@@ -730,6 +791,15 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
 
     _window_latest: dict = {}
 
+    _cm          = P.camera_mode
+    _hold_frames = max(1, int(round(_cm.debounce_seconds * fps)))
+    mode_tracker = CameraModeTracker(_hold_frames)
+    color_fracs: list[float] = []      # per-frame metric, for the end-of-video log
+    night_frames = 0
+    log(f"  camera_mode  : chroma_tol={_cm.chroma_tol}  "
+        f"color_pixel_frac={_cm.color_pixel_frac}  "
+        f"debounce={_cm.debounce_seconds}s ({_hold_frames} frames)")
+
     pbar = tqdm(total=total_frames or None,
                 desc=f"Tracking {video_path.name}",
                 unit="frame", dynamic_ncols=True)
@@ -738,8 +808,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
         INSERT INTO raw_tracks
             (session_id, frame_index, frame_time_sec, frame_datetime,
              temp_id, det_conf, x1, y1, x2, y2, cx, cy, w, h,
-             kps_conf, embed_parquet_row, kps_parquet_row)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             kps_conf, embed_parquet_row, kps_parquet_row, is_night)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
     def _commit_window():
@@ -778,7 +848,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                 tid, det["conf"],
                 det["x1"], det["y1"], det["x2"], det["y2"],
                 det["cx"], det["cy"], det["w"], det["h"],
-                det["kps_mean"], ep_row, kp_row,
+                det["kps_mean"], ep_row, kp_row, det["is_night"],
             ))
         _window_latest.clear()
         windows_since_flush += 1
@@ -803,6 +873,13 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
         ok, frame = cap.read()
         if not ok:
             break
+
+        # Camera mode for this frame — cheap (strided numpy on an
+        # already-decoded frame) next to the detector pass below.
+        _cf = frame_color_fraction(frame, _cm.sample_stride, _cm.chroma_tol)
+        color_fracs.append(_cf)
+        frame_is_night = mode_tracker.update(_cf <= _cm.color_pixel_frac, frame_idx)
+        night_frames  += int(frame_is_night)
 
         t_sec              = frame_idx / max(1e-6, fps)
         frame_datetime_str = ""
@@ -868,6 +945,7 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
                 "frame_index":    frame_idx,
                 "t_sec":          round(t_sec, 3),
                 "frame_datetime": frame_datetime_str,
+                "is_night":       int(frame_is_night),
                 "conf":           float(conf_j),
                 "x1": float(x1), "y1": float(y1),
                 "x2": float(x2), "y2": float(y2),
@@ -997,6 +1075,12 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
         _commit_window()
     if db_batch:
         conn.executemany(INSERT_SQL, db_batch)
+    # Session-level camera-mode summary. Per-row raw_tracks.is_night is what
+    # reconcile uses; video_sessions.is_night is a majority-vote convenience.
+    night_frac = night_frames / frame_idx if frame_idx else 0.0
+    conn.execute("UPDATE video_sessions SET is_night=?, night_frame_fraction=? "
+                 "WHERE session_id=?",
+                 (int(night_frac > 0.5), round(night_frac, 4), session_id))
     if _epoch:
         conn.execute("UPDATE video_sessions SET end_dt=? WHERE session_id=?",
                      ((_epoch + timedelta(seconds=frame_idx/max(1e-6,fps))).isoformat(),
@@ -1012,6 +1096,21 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     if mask_writer is not None:
         mask_writer.flush(mask_rows); mask_rows.clear()
         mask_writer.close()
+
+    if color_fracs:
+        _cfa = np.asarray(color_fracs, dtype=np.float32)
+        log(f"Camera mode: {night_frac*100:.1f}% of frames grayscale/IR  "
+            f"(start={'night' if color_fracs and _cfa[0] <= _cm.color_pixel_frac else 'day'}, "
+            f"{len(mode_tracker.transitions)} switch(es))")
+        log(f"  colour-pixel fraction — p1={np.percentile(_cfa,1):.4f}  "
+            f"p5={np.percentile(_cfa,5):.4f}  median={np.median(_cfa):.4f}  "
+            f"p95={np.percentile(_cfa,95):.4f}  p99={np.percentile(_cfa,99):.4f}  "
+            f"[threshold {_cm.color_pixel_frac}]")
+        for f_i, to_night in mode_tracker.transitions:
+            _ts = ((_epoch + timedelta(seconds=f_i / max(1e-6, fps))).strftime("%H:%M:%S")
+                   if _epoch else f"{f_i / max(1e-6, fps):.1f}s")
+            log(f"  switch → {'NIGHT (grayscale)' if to_night else 'DAY (colour)'} "
+                f"at frame {f_i}  ({_ts})")
 
     t_total = time() - t_start
     log(f"Done. {frame_idx} frames in {t_total:.1f}s "

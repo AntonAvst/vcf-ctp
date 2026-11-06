@@ -102,6 +102,14 @@ class Timeline:
 
 
 @dataclass(frozen=True)
+class CameraMode:
+    chroma_tol: int
+    color_pixel_frac: float
+    debounce_seconds: float
+    sample_stride: int
+
+
+@dataclass(frozen=True)
 class Session:
     night_start_hour: int
     night_end_hour: int
@@ -211,6 +219,7 @@ class Params:
     pose: Pose
     embedder: Embedder
     sampling: Sampling
+    camera_mode: CameraMode
     timeline: Timeline
     session: Session
     kinetic_match: KineticMatch
@@ -388,6 +397,7 @@ def _validate_params(p: Params) -> None:
         ("gallery.ema_alpha", p.gallery.ema_alpha),
         ("gallery.synthetic_merge_alpha", p.gallery.synthetic_merge_alpha),
         ("session.night_fraction", p.session.night_fraction),
+        ("camera_mode.color_pixel_frac", p.camera_mode.color_pixel_frac),
         ("cooccurrence.iou_same_animal", p.cooccurrence.iou_same_animal),
         ("vision.aggregate_min_conf", p.vision.aggregate_min_conf),
         ("vision.min_slot_conf", p.vision.min_slot_conf),
@@ -400,6 +410,14 @@ def _validate_params(p: Params) -> None:
                      (p.session.night_end_hour, "session.night_end_hour")]:
         if not 0 <= h <= 23:
             raise ConfigError(f"{where}: must be 0..23, got {h}")
+
+    cm = p.camera_mode
+    if not 0 <= cm.chroma_tol <= 255:
+        raise ConfigError(f"camera_mode.chroma_tol: must be 0..255, got {cm.chroma_tol}")
+    if cm.debounce_seconds < 0:
+        raise ConfigError(f"camera_mode.debounce_seconds: must be >= 0, got {cm.debounce_seconds}")
+    if cm.sample_stride < 1:
+        raise ConfigError(f"camera_mode.sample_stride: must be >= 1, got {cm.sample_stride}")
 
     if p.vision.posture.standing_max_ar >= p.vision.posture.lying_min_ar:
         raise ConfigError("vision.posture: standing_max_ar must be < lying_min_ar "

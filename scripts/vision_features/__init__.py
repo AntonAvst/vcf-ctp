@@ -5,7 +5,7 @@ Place at: vision_features/__init__.py  (i.e. make a folder called vision_feature
 vision_features — Stage 2-B vision feature extraction for the calving prediction pipeline.
 
 Public API (all reconcile.py needs to import):
-    run_vision_features(session_id, timeline_df, conn, assignment, is_night, ...)
+    run_vision_features(session_id, timeline_df, conn, assignment, fallback_is_night=..., ...)
     migrate_timeline_schema(conn)
 
 Internal subpackages:

@@ -107,7 +107,10 @@ CREATE TABLE IF NOT EXISTS video_sessions (
     start_dt        TEXT,
     end_dt          TEXT,
     collar_csv_path TEXT,
-    is_night        INTEGER DEFAULT 0   -- 0=day, 1=night (auto-detected)
+    is_night        INTEGER DEFAULT 0,  -- majority camera mode, summary only (written by
+                                        -- track_and_dump.py; per-row raw_tracks.is_night
+                                        -- is what reconcile actually uses)
+    night_frame_fraction REAL           -- fraction of frames in grayscale/IR mode
 );
 
 CREATE TABLE IF NOT EXISTS cow_registry (
@@ -146,7 +149,8 @@ CREATE TABLE IF NOT EXISTS raw_tracks (
     kps            TEXT,   -- JSON flat list[57] or NULL
     kps_norm       TEXT,
     kps_conf       REAL,
-    kps_kconf      TEXT
+    kps_kconf      TEXT,
+    is_night       INTEGER   -- camera mode at this frame (1=IR/grayscale, 0=colour)
 );
 
 CREATE TABLE IF NOT EXISTS reid_registry (
@@ -225,10 +229,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
-    try:   # DBs created before temp_id_merges.action existed
-        conn.execute("ALTER TABLE temp_id_merges ADD COLUMN action TEXT DEFAULT 'merged'")
-    except sqlite3.OperationalError:
-        pass   # column already present
+    for sql in (
+        # DBs created before temp_id_merges.action existed
+        "ALTER TABLE temp_id_merges ADD COLUMN action TEXT DEFAULT 'merged'",
+        # DBs created before per-frame camera-mode detection existed
+        "ALTER TABLE raw_tracks ADD COLUMN is_night INTEGER",
+        "ALTER TABLE video_sessions ADD COLUMN night_frame_fraction REAL",
+    ):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass   # column already present
     conn.commit()
     log(f"Database ready: {db_path}")
     return conn
@@ -243,7 +254,8 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> dict | None:
 
 def upsert_session(conn: sqlite3.Connection, session_id: str,
                    tracks_path: str, is_night: bool) -> None:
-    """Register session if it doesn't exist yet (minimal fields)."""
+    """Register session if it doesn't exist yet (minimal fields). A session
+    registered by track_and_dump.py is left untouched (INSERT OR IGNORE)."""
     conn.execute("""
         INSERT OR IGNORE INTO video_sessions (session_id, video_path, is_night)
         VALUES (?, ?, ?)
@@ -277,16 +289,27 @@ def upsert_reid(conn: sqlite3.Connection, real_id: int, updates: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Detect is_night from tracks.csv (no video needed)
+# Camera mode (day colour / night IR) — per frame
+#
+# track_and_dump.py detects the mode from the pixels of every frame and stores
+# it per row in raw_tracks.is_night; the cameras can switch mid-video. Every
+# gallery step splits a session's rows by it, so one session can feed both the
+# day and the night galleries without ever mixing the two.
 # ─────────────────────────────────────────────────────────────────────────────
+
+MODALITIES = ("day", "night")
+
+
+def modality_of(is_night) -> str:
+    return "night" if bool(is_night) else "day"
+
 
 def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
     """
-    Heuristic: night/IR footage has near-zero variance between colour channels.
-    Since we don't have pixel data here, fall back to time-of-day from frame_datetime.
+    LEGACY FALLBACK — clock-based, only for sessions tracked before per-frame
+    camera-mode detection existed (raw_tracks.is_night is NULL).
     Night = more than session.night_fraction of frames fall in
     [night_start_hour, 24) ∪ [0, night_end_hour) local (params.yaml).
-    (Proper version uses per-channel variance on sampled frames — see architecture doc.)
     """
     if "frame_datetime" not in tracks_df.columns:
         return False
@@ -297,6 +320,38 @@ def detect_is_night_from_tracks(tracks_df: pd.DataFrame) -> bool:
     hours = dt_col.dt.hour
     night_mask = (hours >= sp.night_start_hour) | (hours < sp.night_end_hour)
     return bool(night_mask.mean() > sp.night_fraction)
+
+
+def raw_tracks_is_night_select(conn: sqlite3.Connection) -> str:
+    """SELECT expression for raw_tracks.is_night (NULL on a pre-migration table)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(raw_tracks)").fetchall()}
+    return "is_night" if "is_night" in cols else "NULL AS is_night"
+
+
+def resolve_camera_mode(tracks_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """
+    Turn tracks_df.is_night (raw per-row values, NULL for legacy sessions) into
+    a bool column. Rows without a per-frame value get the clock-based fallback.
+    Returns (tracks_df, fallback_is_night) — the fallback is also what
+    run_vision_features uses for its own NULL rows.
+    """
+    fallback = detect_is_night_from_tracks(tracks_df)
+    n_null = int(tracks_df["is_night"].isna().sum())
+    if n_null:
+        log(f"WARNING: {n_null}/{len(tracks_df)} raw_tracks rows have no per-frame "
+            f"camera mode (tracked before detection existed) — using the legacy "
+            f"clock-based fallback is_night={fallback}. Re-run track_and_dump.py on "
+            f"this video for per-frame labels.")
+    tracks_df = tracks_df.copy()
+    tracks_df["is_night"] = tracks_df["is_night"].fillna(int(fallback)).astype(bool)
+    return tracks_df, fallback
+
+
+def split_by_modality(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """{modality -> rows of df in that camera mode}, only modalities present."""
+    if df.empty or "is_night" not in df.columns:
+        return {}
+    return {modality_of(v): g for v, g in df.groupby("is_night")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,9 +518,32 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
                              embed_parquet: str,
                              session_id: str) -> pd.DataFrame:
     """
-    Returns DataFrame with columns [temp_id, embed_array (np.ndarray shape 128)].
-    Tries parquet first, falls back to 'embed' column in tracks_df.
+    Returns DataFrame with columns [frame_index, temp_id, embed (np.ndarray
+    shape 128), is_night (bool)]. Tries parquet first, falls back to an
+    'embed' column in tracks_df.
+
+    is_night comes from tracks_df (one row per committed (frame_index,
+    temp_id) — the same rows the embed parquet points at), so it must already
+    be resolved to bool by resolve_camera_mode().
     """
+    mode = tracks_df[["frame_index", "temp_id", "is_night"]].drop_duplicates(
+        ["frame_index", "temp_id"])
+
+    def _attach_mode(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.merge(mode, on=["frame_index", "temp_id"], how="left")
+        n_missing = int(df["is_night"].isna().sum())
+        if n_missing:
+            # Shouldn't happen (every embed row has a raw_tracks row); if it
+            # does, fall back to the session's majority mode rather than drop.
+            majority = bool(tracks_df["is_night"].mean() > 0.5)
+            log(f"WARNING: {n_missing} embed rows have no matching raw_tracks row — "
+                f"assigning majority camera mode is_night={majority}")
+            df["is_night"] = df["is_night"].fillna(majority)
+        df["is_night"] = df["is_night"].astype(bool)
+        return df
+
+    empty = pd.DataFrame(columns=["frame_index", "temp_id", "embed", "is_night"])
+
     if embed_parquet:
         ep = Path(embed_parquet)
         # Accept either a session directory (multi-part) or a single legacy file.
@@ -480,18 +558,20 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
             df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
             if "session_id" in df.columns:
                 df = df[df["session_id"] == session_id]
-            if "embed" in df.columns and isinstance(df["embed"].iloc[0], np.ndarray):
-                return df[["temp_id", "embed"]].copy()
-            elif "embed" in df.columns:
-                df["embed"] = df["embed"].apply(
-                    lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
-                )
-                return df[["temp_id", "embed"]].copy()
+            if "embed" in df.columns and not df.empty:
+                if not isinstance(df["embed"].iloc[0], np.ndarray):
+                    df["embed"] = df["embed"].apply(
+                        lambda x: np.array(json.loads(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
+                    )
+                df = _attach_mode(df[["frame_index", "temp_id", "embed"]].copy())
+                n_night = int(df["is_night"].sum())
+                log(f"  {len(df)} embed rows  ({len(df) - n_night} day, {n_night} night)")
+                return df
 
     # fall back to 'embed' column in tracks CSV
     if "embed" not in tracks_df.columns:
         log("WARNING: no 'embed' column in tracks and no parquet — gallery step will be skipped.")
-        return pd.DataFrame(columns=["temp_id", "embed"])
+        return empty
 
     rows = []
     for _, row in tracks_df[tracks_df["embed"].notna()].iterrows():
@@ -501,16 +581,17 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
         try:
             arr = np.array(json.loads(raw), dtype=np.float32)
             if arr.shape == (EMBED_DIM,):
-                rows.append({"temp_id": row["temp_id"], "embed": arr})
+                rows.append({"frame_index": row["frame_index"],
+                             "temp_id": row["temp_id"], "embed": arr})
         except Exception:
             pass
 
     if not rows:
         log("WARNING: no valid embeds found in tracks CSV — gallery step will be skipped.")
-        return pd.DataFrame(columns=["temp_id", "embed"])
+        return empty
 
     log(f"Loaded {len(rows)} embed rows from tracks CSV.")
-    return pd.DataFrame(rows)
+    return _attach_mode(pd.DataFrame(rows))
 
 
 def compute_mean_embed(embed_rows: pd.DataFrame) -> np.ndarray:
@@ -554,78 +635,89 @@ def gallery_builder(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
     kinetic_assignment: dict,       # {temp_id -> AnimalId}
-    is_night: bool,
     conn: sqlite3.Connection,
     gallery_dir: str,
     dry_run: bool = False,
 ) -> dict:
     """
-    For each kinetically-confirmed (temp_id → AnimalId) pair:
-      1. Pool all embeds for that temp_id into a session mean vector
-      2. EMA-blend with existing gallery entry (α = ema_alpha)
-      3. Write updated gallery to .npy and to reid_registry in SQLite
+    For each kinetically-confirmed (temp_id → AnimalId) pair, per camera mode:
+      1. Pool that temp_id's embeds IN THAT MODE into a session mean vector
+      2. EMA-blend with that mode's existing gallery entry (α = ema_alpha)
+      3. Write updated gallery to gallery_{mode}.npy and to reid_registry
 
-    Returns updated gallery dict {real_id: np.ndarray}.
+    embed_df.is_night is per frame (the camera can switch mid-video), so a
+    temp_id seen on both sides of a switch updates both galleries — each with
+    only its own frames, each gated by gallery.min_embeds separately.
+
+    Returns {"day": {real_id: vec}, "night": {real_id: vec}} — both
+    modalities' full galleries (loaded even if this session didn't touch one).
     """
     section("Gallery Builder")
 
-    modality = "night" if is_night else "day"
-    gallery = load_gallery(gallery_dir, modality)
-    log(f"Loaded {modality} gallery: {len(gallery)} existing entries")
+    galleries = {m: load_gallery(gallery_dir, m) for m in MODALITIES}
+    log("Loaded galleries: " + "  ".join(f"{m}={len(g)}" for m, g in galleries.items()))
 
     if embed_df.empty:
         log("No embeds available — skipping gallery update.")
-        return gallery
+        return galleries
 
     gp = config.params().gallery
-    updates = 0
     alpha = gp.ema_alpha
+    updates = {m: 0 for m in MODALITIES}
 
-    for tid, aid in kinetic_assignment.items():
-        tid_embeds = embed_df[embed_df["temp_id"] == tid]
-        if len(tid_embeds) < gp.min_embeds:
-            log(f"  temp_id {tid}: only {len(tid_embeds)} embeds (< {gp.min_embeds}) — skip")
-            continue
+    for modality, mdf in split_by_modality(embed_df).items():
+        gallery = galleries[modality]
+        for tid, aid in kinetic_assignment.items():
+            tid_embeds = mdf[mdf["temp_id"] == tid]
+            if len(tid_embeds) == 0:
+                continue
+            if len(tid_embeds) < gp.min_embeds:
+                log(f"  [{modality}] temp_id {tid}: only {len(tid_embeds)} embeds "
+                    f"(< {gp.min_embeds}) — skip")
+                continue
 
-        session_mean = compute_mean_embed(tid_embeds)
+            session_mean = compute_mean_embed(tid_embeds)
 
-        if aid in gallery:
-            old_vec     = gallery[aid]
-            updated_vec = alpha * session_mean + (1 - alpha) * old_vec
-            norm        = np.linalg.norm(updated_vec)
-            gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
-            log(f"  AnimalId {aid} (t{tid}): EMA update  α={alpha}  "
-                f"cosine(old,new)={float(np.dot(old_vec, session_mean)):.3f}")
-        else:
-            gallery[aid] = session_mean
-            log(f"  AnimalId {aid} (t{tid}): new gallery entry from {len(tid_embeds)} embeds")
+            if aid in gallery:
+                old_vec     = gallery[aid]
+                updated_vec = alpha * session_mean + (1 - alpha) * old_vec
+                norm        = np.linalg.norm(updated_vec)
+                gallery[aid] = updated_vec / norm if norm > 1e-8 else updated_vec
+                log(f"  [{modality}] AnimalId {aid} (t{tid}): EMA update  α={alpha}  "
+                    f"cosine(old,new)={float(np.dot(old_vec, session_mean)):.3f}")
+            else:
+                gallery[aid] = session_mean
+                log(f"  [{modality}] AnimalId {aid} (t{tid}): new gallery entry "
+                    f"from {len(tid_embeds)} embeds")
 
-        updates += 1
+            updates[modality] += 1
 
-        # update reid_registry in SQLite
-        if not dry_run:
-            col_emb   = f"gallery_embed_{modality}"
-            col_n     = f"gallery_n_{modality}"
-            col_upd   = f"last_updated_{modality}_dt"
-            ts        = pd.Timestamp.now().isoformat()
-            emb_json  = json.dumps(gallery[aid].tolist())
+            # update reid_registry in SQLite
+            if not dry_run:
+                col_emb   = f"gallery_embed_{modality}"
+                col_n     = f"gallery_n_{modality}"
+                col_upd   = f"last_updated_{modality}_dt"
+                ts        = pd.Timestamp.now().isoformat()
+                emb_json  = json.dumps(gallery[aid].tolist())
 
-            existing  = get_reid_row(conn, aid)
-            old_n     = (existing or {}).get(col_n, 0) or 0
+                existing  = get_reid_row(conn, aid)
+                old_n     = (existing or {}).get(col_n, 0) or 0
 
-            upsert_reid(conn, aid, {
-                col_emb: emb_json,
-                col_n:   old_n + 1,
-                col_upd: ts,
-                "match_method": "kinetic",
-            })
+                upsert_reid(conn, aid, {
+                    col_emb: emb_json,
+                    col_n:   old_n + 1,
+                    col_upd: ts,
+                    "match_method": "kinetic",
+                })
 
-    log(f"Gallery updated: {updates} entries  modality={modality}")
+    log("Gallery updated: " + "  ".join(f"{m}={n}" for m, n in updates.items()))
 
-    if not dry_run and updates > 0:
-        save_gallery(gallery_dir, modality, gallery)
+    if not dry_run:
+        for m, n in updates.items():
+            if n > 0:
+                save_gallery(gallery_dir, m, galleries[m])
 
-    return gallery
+    return galleries
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,8 +833,7 @@ def cosine_resolver(
     tracks_df: pd.DataFrame,
     embed_df: pd.DataFrame,
     kinetic_assignment: dict,       # {temp_id -> AnimalId} — already confirmed
-    gallery: dict,                  # {real_id: np.ndarray} flat gallery from step B
-    is_night: bool,
+    galleries: dict,                # {"day"|"night": {real_id: np.ndarray}} from Gallery Builder
     conn: sqlite3.Connection,
     gallery_dir: str,
     session_id: str,
@@ -774,13 +865,20 @@ def cosine_resolver(
 
     Also runs backpropagation: if any confirmed real_id in this session was
     previously a synthetic id, all timeline rows are updated.
+
+    Camera mode: embed_df.is_night is per frame, so a temp_id's embeds are
+    split by mode and each mode's mean is only ever compared against that
+    mode's galleries (a grayscale embedding never meets a colour gallery).
+    A temp_id is queryable if at least one of its modes has ≥ min_embeds;
+    modes are tried in order of how many embeds the temp_id has in each, and
+    the first mode whose 3-step chain produces a match wins. The α/2 soft
+    update then feeds every mode with enough embeds — so a match made in
+    daylight also teaches the night gallery that cow.
     """
     section("Cosine Resolver")
     P  = config.params()
     cr = P.cosine_resolver
     gp = P.gallery
-
-    modality = "night" if is_night else "day"
 
     already_resolved = set(kinetic_assignment.keys())
     all_tids = set(tracks_df["temp_id"].unique())
@@ -790,17 +888,23 @@ def cosine_resolver(
         log("No embeds available — cosine resolver skipped.")
         return dict(kinetic_assignment), {}
 
-    embed_counts   = embed_df.groupby("temp_id").size()
-    queryable_tids = [
-        tid for tid in unresolved_tids
-        if embed_counts.get(tid, 0) >= cr.min_embeds
-    ]
-    log(f"Unresolved temp_ids: {len(unresolved_tids)}  "
-        f"Queryable (≥{cr.min_embeds} embeds): {len(queryable_tids)}")
+    embeds_by_mode = split_by_modality(embed_df)            # {mode -> rows}
+    counts_by_mode = {m: df.groupby("temp_id").size() for m, df in embeds_by_mode.items()}
 
-    # Load pose galleries
-    pose_gallery = PoseGallery.load(gallery_dir, modality)
-    temp_gallery = TempPoseGallery.load(gallery_dir, modality)
+    def _query_modes(tid) -> list[str]:
+        """Modes in which tid has ≥ min_embeds, most embeds first."""
+        have = [(int(c.get(tid, 0)), m) for m, c in counts_by_mode.items()]
+        return [m for n, m in sorted(have, reverse=True) if n >= cr.min_embeds]
+
+    queryable_tids = [tid for tid in unresolved_tids if _query_modes(tid)]
+    log(f"Unresolved temp_ids: {len(unresolved_tids)}  "
+        f"Queryable (≥{cr.min_embeds} embeds in at least one camera mode): "
+        f"{len(queryable_tids)}")
+
+    # Load pose galleries — both modes
+    pose_galleries = {m: PoseGallery.load(gallery_dir, m) for m in MODALITIES}
+    temp_galleries = {m: TempPoseGallery.load(gallery_dir, m) for m in MODALITIES}
+    cosine_mode: dict = {}          # {temp_id -> mode whose galleries produced the match}
 
     cosine_assignment = {}
     # {temp_id -> score}, parallel to cosine_assignment — needed by Boundary Rendezvous
@@ -897,9 +1001,12 @@ def cosine_resolver(
     def _aid_blocked_for(tid: int, aid) -> bool:
         return _aid_block_reason(tid, aid)[0]
 
-    for tid in queryable_tids:
-        tid_embeds = embed_df[embed_df["temp_id"] == tid]
-        query_vec  = compute_mean_embed(tid_embeds)
+    def _resolve_real_id(tid, mode: str, query_vec: np.ndarray, near_miss: list) -> bool:
+        """Steps 1-2 (confirmed real_id galleries) for one temp_id against one
+        camera mode's galleries. Records the assignment and returns True on a
+        match; appends to near_miss and returns False otherwise."""
+        gallery      = galleries[mode]
+        pose_gallery = pose_galleries[mode]
 
         # ── Step 1: flat real_id gallery ─────────────────────────────────────
         best_aid, best_sim = None, -1.0
@@ -914,13 +1021,13 @@ def cosine_resolver(
             cosine_assignment[tid] = best_aid
             cosine_scores[tid] = float(best_sim)
             aid_claims.setdefault(best_aid, []).append((tid, tid_frames.get(tid, np.array([]))))
-            log(f"  t{tid} → real_id {best_aid}  (flat cosine={best_sim:.3f})")
-            continue
+            log(f"  t{tid} → real_id {best_aid}  ({mode} flat cosine={best_sim:.3f})")
+            return True
 
-        # Best score seen so far across steps, for near-miss reporting if
-        # this tid ends up unresolved (Step 1's best_sim is always a real
-        # number regardless of whether it cleared the threshold).
-        near_miss = [("flat", best_aid, best_sim)]
+        # Best score seen so far across steps (and modes), for near-miss
+        # reporting if this tid ends up unresolved (Step 1's best_sim is
+        # always a real number regardless of whether it cleared the threshold).
+        near_miss.append(("flat", best_aid, best_sim))
 
         # ── Step 2: pose-conditioned real_id gallery ─────────────────────────
         p_id, p_cos, _ = pose_gallery.query(
@@ -932,8 +1039,14 @@ def cosine_resolver(
             cosine_assignment[tid] = p_id
             cosine_scores[tid] = float(p_cos)
             aid_claims.setdefault(p_id, []).append((tid, tid_frames.get(tid, np.array([]))))
-            log(f"  t{tid} → real_id {p_id}  (pose-slot cosine={p_cos:.3f})")
-            continue
+            log(f"  t{tid} → real_id {p_id}  ({mode} pose-slot cosine={p_cos:.3f})")
+            return True
+        return False
+
+    def _resolve_temp(tid, mode: str, query_vec: np.ndarray, near_miss: list) -> bool:
+        """Step 3 (TempPoseGallery — inherit or mint a synthetic id) for one
+        temp_id against one camera mode's temp gallery."""
+        temp_gallery = temp_galleries[mode]
 
         # ── Step 3: TempPoseGallery — cross-session, any camera ───────────────
         # Cows move between the cameras monitoring the enclosure, so we no
@@ -984,7 +1097,8 @@ def cosine_resolver(
                 cosine_scores[tid] = float(t_cos)
                 aid_claims.setdefault(matched_sid, []).append((tid, tid_frames.get(tid, np.array([]))))
                 log(f"  t{tid} → id {matched_sid}  "
-                    f"(temp cosine={t_cos:.3f}, matched {match_key})")
+                    f"({mode} temp cosine={t_cos:.3f}, matched {match_key})")
+                return True
             else:
                 # Mint a new synthetic id for this pair. Only THIS session's
                 # temp_id goes into cosine_assignment; the other session's
@@ -1006,65 +1120,99 @@ def cosine_resolver(
                         ]),
                     })
                 log(f"  t{tid} + {match_key} → NEW synthetic_id {new_synth}  "
-                    f"(temp cosine={t_cos:.3f})")
-        else:
-            source, candidate, score = max(near_miss, key=lambda x: x[2])
-            if candidate is None:
-                log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
-                    f"(closest: {source} @ {score:.3f}, no candidate id)")
-            elif score >= cr.threshold and source in ("flat", "pose-slot"):
-                # Cleared the cosine threshold but still ended up unresolved
-                # -> it was blocked by the overlap check, not by similarity.
-                # Report exactly what blocked it so a real conflict can be
-                # told apart from an overlap-check false positive (see the
-                # NOTE in _aid_block_reason).
-                blocked, block_tid, block_dist, block_iou = _aid_block_reason(tid, candidate)
-                if blocked:
-                    log(f"  t{tid}: scored {score:.3f} ({source}) on real_id {candidate} "
-                        f"— BLOCKED: {block_dist:.0f} frames + IoU={block_iou:.2f} vs "
-                        f"already-claimed t{block_tid} (tolerance={cooccur_tol}, "
-                        f"same-animal IoU≥{IOU_SAME_ANIMAL}). Low IoU here means a different "
-                        f"part of the pen -> likely a genuinely different animal.")
-                else:
-                    # Shouldn't normally happen (if not blocked it should have
-                    # been accepted above) — log plainly rather than guess why.
-                    log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
-                        f"(closest: {source} candidate {candidate} @ {score:.3f})")
+                    f"({mode} temp cosine={t_cos:.3f})")
+                return True
+        return False
+
+    for tid in queryable_tids:
+        # One query vector per camera mode the temp_id has enough embeds in,
+        # most embeds first. Real-id galleries (steps 1-2) are tried in every
+        # mode before any temp-gallery match (step 3), so a confirmed identity
+        # in one mode always beats inheriting/minting a synthetic id in another
+        # — the same real-before-temp priority as a single-mode session.
+        query_vecs = {}
+        for mode in _query_modes(tid):
+            mode_embeds = embeds_by_mode[mode]
+            query_vecs[mode] = compute_mean_embed(mode_embeds[mode_embeds["temp_id"] == tid])
+
+        near_miss: list = []
+        resolved_mode = None
+        for step_fn in (_resolve_real_id, _resolve_temp):
+            for mode, query_vec in query_vecs.items():
+                if step_fn(tid, mode, query_vec, near_miss):
+                    resolved_mode = mode
+                    break
+            if resolved_mode is not None:
+                break
+        if resolved_mode is not None:
+            cosine_mode[tid] = resolved_mode
+            continue
+
+        source, candidate, score = max(near_miss, key=lambda x: x[2])
+        if candidate is None:
+            log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
+                f"(closest: {source} @ {score:.3f}, no candidate id)")
+        elif score >= cr.threshold and source in ("flat", "pose-slot"):
+            # Cleared the cosine threshold but still ended up unresolved
+            # -> it was blocked by the overlap check, not by similarity.
+            # Report exactly what blocked it so a real conflict can be
+            # told apart from an overlap-check false positive (see the
+            # NOTE in _aid_block_reason).
+            blocked, block_tid, block_dist, block_iou = _aid_block_reason(tid, candidate)
+            if blocked:
+                log(f"  t{tid}: scored {score:.3f} ({source}) on real_id {candidate} "
+                    f"— BLOCKED: {block_dist:.0f} frames + IoU={block_iou:.2f} vs "
+                    f"already-claimed t{block_tid} (tolerance={cooccur_tol}, "
+                    f"same-animal IoU≥{IOU_SAME_ANIMAL}). Low IoU here means a different "
+                    f"part of the pen -> likely a genuinely different animal.")
             else:
+                # Shouldn't normally happen (if not blocked it should have
+                # been accepted above) — log plainly rather than guess why.
                 log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
                     f"(closest: {source} candidate {candidate} @ {score:.3f})")
+        else:
+            log(f"  t{tid}: no match above {cr.threshold} — unresolved  "
+                f"(closest: {source} candidate {candidate} @ {score:.3f})")
 
     if not cosine_assignment:
         log("  No cosine matches found.")
 
-    # ── Soft gallery update for real_id cosine matches (α/2) ─────────────────
+    # ── Soft gallery update for real_id cosine matches (α/2), per camera mode ─
+    # Every mode in which the temp_id has ≥ gallery.min_embeds gets updated
+    # with only its own frames — not just the mode that produced the match.
     if not dry_run:
         alpha_half = gp.ema_alpha / 2
+        touched = set()
         for tid, aid in cosine_assignment.items():
             if is_synthetic(aid):
                 continue   # don't update real_id gallery with unconfirmed embeddings
-            tid_embeds = embed_df[embed_df["temp_id"] == tid]
-            if len(tid_embeds) < gp.min_embeds:
-                continue
-            session_mean = compute_mean_embed(tid_embeds)
-            if aid in gallery:
-                updated = gallery[aid] * (1 - alpha_half) + session_mean * alpha_half
-                norm = np.linalg.norm(updated)
-                gallery[aid] = updated / norm if norm > 1e-8 else updated
-            else:
-                gallery[aid] = session_mean
-            ts      = pd.Timestamp.now().isoformat()
-            col_emb = f"gallery_embed_{modality}"
-            col_n   = f"gallery_n_{modality}"
-            existing = get_reid_row(conn, aid)
-            old_n    = (existing or {}).get(col_n, 0) or 0
-            upsert_reid(conn, aid, {
-                col_emb: json.dumps(gallery[aid].tolist()),
-                col_n:   old_n + 1,
-                f"last_updated_{modality}_dt": ts,
-                "match_method": f"cosine_{modality}",
-            })
-        save_gallery(gallery_dir, modality, gallery)
+            for mode, mode_embeds in embeds_by_mode.items():
+                tid_embeds = mode_embeds[mode_embeds["temp_id"] == tid]
+                if len(tid_embeds) < gp.min_embeds:
+                    continue
+                gallery = galleries[mode]
+                session_mean = compute_mean_embed(tid_embeds)
+                if aid in gallery:
+                    updated = gallery[aid] * (1 - alpha_half) + session_mean * alpha_half
+                    norm = np.linalg.norm(updated)
+                    gallery[aid] = updated / norm if norm > 1e-8 else updated
+                else:
+                    gallery[aid] = session_mean
+                touched.add(mode)
+                ts      = pd.Timestamp.now().isoformat()
+                col_emb = f"gallery_embed_{mode}"
+                col_n   = f"gallery_n_{mode}"
+                existing = get_reid_row(conn, aid)
+                old_n    = (existing or {}).get(col_n, 0) or 0
+                upsert_reid(conn, aid, {
+                    col_emb: json.dumps(gallery[aid].tolist()),
+                    col_n:   old_n + 1,
+                    f"last_updated_{mode}_dt": ts,
+                    # the mode whose galleries made the match
+                    "match_method": f"cosine_{cosine_mode.get(tid, mode)}",
+                })
+        for mode in touched:
+            save_gallery(gallery_dir, mode, galleries[mode])
 
     # ── Backpropagate: if any confirmed real_id was previously synthetic ──────
     all_assignments = {**kinetic_assignment, **cosine_assignment}
@@ -1074,19 +1222,20 @@ def cosine_resolver(
         # This temp_id now has a confirmed real_id via kinetics or manual?
         confirmed = kinetic_assignment.get(tid)
         if confirmed and not is_synthetic(confirmed):
+            # Folds the synthetic id's slots in BOTH modes' pose galleries
+            # (and saves each) — a synthetic id can have been built up from
+            # day and night sightings alike.
             rows = backpropagate_resolution(
-                synthetic_id = aid,
-                real_id      = confirmed,
-                conn         = conn,
-                pose_gallery = pose_gallery,
-                gallery_dir  = gallery_dir,
-                modality     = modality,
-                dry_run      = dry_run,
+                synthetic_id   = aid,
+                real_id        = confirmed,
+                conn           = conn,
+                pose_galleries = pose_galleries,
+                gallery_dir    = gallery_dir,
+                dry_run        = dry_run,
             )
             log(f"  Backpropagated synthetic_id {aid} → real_id {confirmed} "
                 f"({rows} timeline rows updated)")
             all_assignments[tid] = confirmed
-            pose_gallery.save(gallery_dir, modality)
 
     # NOTE: duplicate real_id resolution (multiple temp_ids matched to the same
     # AnimalId — expected now that assigned_aids has been replaced with the
@@ -1603,7 +1752,8 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     # ── load tracks from SQLite ───────────────────────────────────────────────
     log("Loading tracks from SQLite...")
     tracks_df = pd.read_sql(
-        "SELECT frame_index, frame_datetime, temp_id, cx, cy, x1, y1, x2, y2 "
+        "SELECT frame_index, frame_datetime, temp_id, cx, cy, x1, y1, x2, y2, "
+        f"{raw_tracks_is_night_select(conn)} "
         "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
         conn, params=(args.session,), parse_dates=["frame_datetime"],
     )
@@ -1615,14 +1765,16 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         f"frames {tracks_df['frame_index'].min()}–{tracks_df['frame_index'].max()}")
 
 
-    # detect day/night
-    is_night = detect_is_night_from_tracks(tracks_df)
-    log(f"is_night={is_night} (heuristic from frame_datetime hour distribution)")
+    # camera mode (day colour / night IR) — per row, detected by track_and_dump.py
+    tracks_df, fallback_is_night = resolve_camera_mode(tracks_df)
+    night_frac = float(tracks_df["is_night"].mean())
+    log(f"Camera mode: {night_frac*100:.1f}% of track rows night/IR "
+        f"({'mixed — both galleries' if 0 < night_frac < 1 else modality_of(night_frac > 0.5) + ' only'})")
 
-    # update is_night on the session row and load camera_id
-    # (video_path is registered by track_and_dump.py; this is just a fallback
-    #  INSERT OR IGNORE for sessions reconcile.py is run against standalone)
-    upsert_session(conn, args.session, "", is_night)
+    # register the session if missing (video_path and is_night are written by
+    # track_and_dump.py; this is just a fallback INSERT OR IGNORE for sessions
+    # reconcile.py is run against standalone) and load camera_id
+    upsert_session(conn, args.session, "", night_frac > 0.5)
     session_row = get_session(conn, args.session)
     camera_id   = (session_row.get("camera_id") or "cam0") if session_row else "cam0"
     log(f"camera_id={camera_id}")
@@ -1689,11 +1841,10 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session)
 
     # ── Gallery Builder ───────────────────────────────────────────────────────
-    gallery = gallery_builder(
+    galleries = gallery_builder(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
-        is_night           = is_night,
         conn               = conn,
         gallery_dir        = gallery_dir,
         dry_run            = args.dry_run,
@@ -1705,8 +1856,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         tracks_df          = tracks_df,
         embed_df           = embed_df,
         kinetic_assignment = kinetic_assignment,
-        gallery            = gallery,
-        is_night           = is_night,
+        galleries          = galleries,
         conn               = conn,
         gallery_dir        = gallery_dir,
         session_id         = args.session,
@@ -1757,13 +1907,12 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         embed_df_remapped = embed_df.copy()
         embed_df_remapped["temp_id"] = embed_df_remapped["temp_id"].replace(merge_map)
         # rebuild gallery with remapped embeds for any merged pairs
-        gallery = gallery_builder(
+        galleries = gallery_builder(
             tracks_df          = tracks_df,
             embed_df           = embed_df_remapped,
             kinetic_assignment = full_assignment,
-            is_night           = is_night,
             conn               = conn,
-                gallery_dir        = gallery_dir,
+            gallery_dir        = gallery_dir,
             dry_run            = args.dry_run,
         )
 
@@ -1798,7 +1947,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
             timeline_df   = timeline_df,
             conn          = conn,
             assignment    = full_assignment,
-            is_night      = is_night,
+            fallback_is_night = fallback_is_night,   # only for NULL (legacy) rows
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
             # kps is written as multi-part files (kps_part000.parquet, ...) by
             # track_and_dump.py's KpsWriter, same as embeds — pass the session
@@ -1842,14 +1991,17 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         # Reproducibility: the exact params.yaml this run used
         config.save_params_snapshot(dm, args.session, "reconcile")
         log(f"params snapshot → outputs/{args.session}/params_reconcile.yaml")
-        # Gallery .npy files
-        modality = "night" if detect_is_night_from_tracks(tracks_df) else "day"
-        gallery_files = [
-            f"gallery_{modality}.npy",
-            f"gallery_pose_{modality}.npy",
-            f"temp_gallery_pose_{modality}.npy",
-            "synthetic_id_counter.npy",
-        ]
+        # Gallery .npy files — BOTH modalities. A session can span the
+        # camera's colour/IR switch and update both; backprop folds synthetic
+        # ids in both pose galleries; and the temp galleries are purged of
+        # this session's old entries in both. Uploading only the files this
+        # session's majority mode suggests would leave the rest local-only,
+        # and the next run's pull_gallery() would overwrite them. Files this
+        # run didn't touch are byte-identical to what was just pulled.
+        gallery_files = [f"{prefix}_{m}.npy"
+                         for m in MODALITIES
+                         for prefix in ("gallery", "gallery_pose", "temp_gallery_pose")]
+        gallery_files.append("synthetic_id_counter.npy")
         from drive_manager import LOCAL_GALLERY_DIR, DRIVE_GALLERY_PREFIX
         for fname in gallery_files:
             local_f = LOCAL_GALLERY_DIR / fname

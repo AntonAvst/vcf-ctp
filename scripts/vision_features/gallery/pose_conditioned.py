@@ -8,11 +8,15 @@ Two pose-conditioned ReID galleries:
                      Files: gallery_pose_{day|night}.npy
 
   TempPoseGallery  — keyed by (camera_id, session_id, temp_id)
-                     Unresolved identities. Cross-session within a camera.
+                     Unresolved identities. Cross-session, queried across cameras.
                      Files: temp_gallery_pose_{day|night}.npy
                      Entries are deleted when the temp_id gets resolved.
 
 Both use 8 slots = {standing, lying} × {left, right, toward, away}.
+
+Modality (day/night) is just the file suffix. One session can feed both
+files: each frame carries its own camera mode (raw_tracks.is_night), and the
+caller splits a session's frames by it before updating.
 
 Synthetic IDs
 ─────────────
@@ -356,6 +360,19 @@ class TempPoseGallery:
             del self.counts[k]
         return to_delete
 
+    def delete_session(self, session_id: str) -> list[TempKey]:
+        """
+        Remove every entry belonging to session_id. Called before a session
+        writes its entries so a re-run replaces them rather than piling on —
+        and so a re-run whose day/night labelling changed doesn't leave stale
+        entries behind in the other modality's file.
+        """
+        to_delete = [k for k in self.embeds if k.session_id == session_id]
+        for k in to_delete:
+            del self.embeds[k]
+            del self.counts[k]
+        return to_delete
+
     def query_for_camera(
         self,
         camera_id: str,
@@ -411,14 +428,17 @@ def backpropagate_resolution(
     synthetic_id: int,
     real_id: int,
     conn: sqlite3.Connection,
-    pose_gallery: PoseGallery,
+    pose_galleries: dict[str, PoseGallery],   # {"day": PoseGallery, "night": PoseGallery}
     gallery_dir: str,
-    modality: str,
     dry_run: bool = False,
 ) -> int:
     """
     Replace every occurrence of synthetic_id with real_id across the DB,
     fold the gallery vectors, and delete the synthetic entry.
+
+    A synthetic id can have slots in both the day and the night pose gallery
+    (sessions can span the camera's colour/IR switch), so the fold runs on
+    every gallery passed in and each is saved under its own modality.
 
     Tables updated:
         resolved_cow_timeline   (real_id column)
@@ -465,10 +485,12 @@ def backpropagate_resolution(
     )
     conn.commit()
 
-    # ── Fold gallery vectors ─────────────────────────────────────────────────
-    pose_gallery.merge_and_delete(synthetic_id, real_id,
-                                 alpha=config.params().gallery.synthetic_merge_alpha)
-    pose_gallery.save(gallery_dir, modality)
+    # ── Fold gallery vectors (every modality) ───────────────────────────────
+    alpha = config.params().gallery.synthetic_merge_alpha
+    for modality, pose_gallery in pose_galleries.items():
+        if synthetic_id in pose_gallery.embeds:
+            pose_gallery.merge_and_delete(synthetic_id, real_id, alpha=alpha)
+            pose_gallery.save(gallery_dir, modality)
 
     return rows_updated
 

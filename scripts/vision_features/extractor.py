@@ -34,7 +34,9 @@ Inputs (all per-frame, aligned):
 Outputs:
     Per-frame labels DataFrame  — stored in memory; used by gallery builder.
     Window scalar DataFrame     — merged into timeline_df.
-    Updated PoseGallery         — saved to gallery_pose_{modality}.npy.
+    Updated PoseGallery         — saved to gallery_pose_{modality}.npy, one
+                                  update per modality present in the session
+                                  (raw_tracks.is_night is per frame).
 """
 
 from __future__ import annotations
@@ -98,10 +100,28 @@ def migrate_timeline_schema(conn: sqlite3.Connection) -> None:
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_night_select(conn: sqlite3.Connection) -> str:
+    """SELECT expression for raw_tracks.is_night — NULL AS is_night on a DB
+    whose raw_tracks predates per-frame camera-mode detection."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(raw_tracks)").fetchall()}
+    return "is_night" if "is_night" in cols else "NULL AS is_night"
+
+
+def _fill_is_night(df: pd.DataFrame, fallback_is_night: bool) -> pd.DataFrame:
+    """raw_tracks.is_night → bool column; NULL (legacy rows) → session fallback."""
+    n_null = int(df["is_night"].isna().sum())
+    if n_null:
+        log(f"  {n_null} rows have no per-frame camera mode (tracked before "
+            f"detection existed) — using session fallback is_night={fallback_is_night}")
+    df["is_night"] = df["is_night"].fillna(int(fallback_is_night)).astype(bool)
+    return df
+
+
 def load_kps_for_session(
     session_id: str,
     kps_parquet: str | None,
     conn: sqlite3.Connection,
+    fallback_is_night: bool = False,
 ) -> pd.DataFrame:
     """
     Load per-frame kps + bbox for a session.
@@ -116,20 +136,23 @@ def load_kps_for_session(
         x1, y1, x2, y2,
         kps_flat  (np.ndarray shape (57,)  — flat [x,y,conf] × 19),
         kps_kconf (np.ndarray shape (19,)),
+        is_night  (bool — camera mode at that frame; NULLs → fallback_is_night)
     One row per detection.
     """
+    is_night_sel = _is_night_select(conn)
     # ── Always load scalar columns from SQLite (bbox, datetime, det_conf) ────
     log("Loading scalar columns from SQLite (bbox, datetime, det_conf)...")
     scalar_df = pd.read_sql(
-        """
+        f"""
         SELECT frame_index, frame_datetime, temp_id, det_conf,
-               x1, y1, x2, y2
+               x1, y1, x2, y2, {is_night_sel}
         FROM   raw_tracks
         WHERE  session_id = ?
         ORDER  BY frame_index, temp_id
         """,
         conn, params=(session_id,), parse_dates=["frame_datetime"],
     )
+    scalar_df = _fill_is_night(scalar_df, fallback_is_night)
     log(f"  {len(scalar_df)} scalar rows from SQLite")
 
     # ── Parquet path — load kps arrays and merge with scalar_df ──────────────
@@ -161,7 +184,8 @@ def load_kps_for_session(
             log(f"  {n_before - n_after} rows dropped (no kps in parquet for those detections)")
         log(f"  {n_after} rows after merge")
         return merged[["frame_index", "frame_datetime", "temp_id", "det_conf",
-                        "x1", "y1", "x2", "y2", "kps_flat", "kps_kconf"]].copy()
+                        "x1", "y1", "x2", "y2", "kps_flat", "kps_kconf",
+                        "is_night"]].copy()
 
     # ── SQLite fallback ────────────────────────────────────────────────────────
     # NOTE: track_and_dump.py's raw_tracks only ever stores kps_conf (scalar)
@@ -187,9 +211,9 @@ def load_kps_for_session(
         return pd.DataFrame()
 
     rdf = pd.read_sql(
-        """
+        f"""
         SELECT frame_index, frame_datetime, temp_id, det_conf,
-               x1, y1, x2, y2, kps, kps_kconf
+               x1, y1, x2, y2, kps, kps_kconf, {is_night_sel}
         FROM   raw_tracks
         WHERE  session_id = ?
         ORDER  BY frame_index, temp_id
@@ -214,9 +238,10 @@ def load_kps_for_session(
 
     # Drop rows where kps failed to parse (pose model not run)
     rdf = rdf.dropna(subset=["kps_flat"]).copy()
+    rdf = _fill_is_night(rdf, fallback_is_night)
     log(f"  {len(rdf)} rows with valid kps loaded from SQLite")
     return rdf[["frame_index", "frame_datetime", "temp_id", "det_conf",
-                "x1", "y1", "x2", "y2", "kps_flat", "kps_kconf"]].copy()
+                "x1", "y1", "x2", "y2", "kps_flat", "kps_kconf", "is_night"]].copy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,7 +346,7 @@ def run_vision_features(
     timeline_df:       pd.DataFrame,          # output of sensor_sequencer
     conn:              sqlite3.Connection,
     assignment:        dict,                   # {temp_id -> real_id}
-    is_night:          bool,
+    fallback_is_night: bool       = False,     # only for legacy rows with NULL is_night
     camera_id:         str        = "cam0",
     kps_parquet:       str | None = None,
     embed_parquet:     str | None = None,
@@ -338,7 +363,9 @@ def run_vision_features(
     timeline_df     : sensor-only timeline from sensor_sequencer.
     conn            : SQLite connection.
     assignment      : {temp_id -> real_id} from kinetic + cosine resolution.
-    is_night        : True if this is a night/IR session.
+    fallback_is_night : camera mode to assume for raw_tracks rows whose
+                      is_night is NULL (sessions tracked before per-frame
+                      detection existed). Rows that have it use their own.
     kps_parquet     : path to kps.parquet for this session (optional).
     embed_parquet   : path to embeds.parquet (for gallery slot update).
     gallery_dir     : directory containing gallery_pose_*.npy files.
@@ -355,7 +382,7 @@ def run_vision_features(
     timeline_df with new vision feature columns filled in.
     """
     section("Vision Feature Extraction")
-    log(f"session_id: {session_id}  |  is_night: {is_night}  |  dry_run: {dry_run}")
+    log(f"session_id: {session_id}  |  dry_run: {dry_run}")
     P = config.params()
     ema_alpha     = P.gallery.ema_alpha
     min_slot_conf = P.vision.min_slot_conf
@@ -370,7 +397,11 @@ def run_vision_features(
         migrate_timeline_schema(conn)
 
     # ── Load kps data ─────────────────────────────────────────────────────────
-    kps_df = load_kps_for_session(session_id, kps_parquet, conn)
+    kps_df = load_kps_for_session(session_id, kps_parquet, conn,
+                                  fallback_is_night=fallback_is_night)
+    n_night = int(kps_df["is_night"].sum()) if not kps_df.empty else 0
+    if not kps_df.empty:
+        log(f"  Camera mode: {len(kps_df) - n_night} day rows, {n_night} night rows")
     if kps_df.empty:
         log("No kps data available — vision columns will remain NULL.")
         return timeline_df
@@ -477,7 +508,6 @@ def run_vision_features(
             kps_df       = kps_df,       # ALL temp_ids — temp gallery needs unresolved too
             embed_parquet= embed_parquet,
             assignment   = assignment,
-            is_night     = is_night,
             gallery_dir  = gallery_dir,
             ema_alpha    = ema_alpha,
             min_slot_conf= min_slot_conf,
@@ -500,7 +530,6 @@ def _update_pose_gallery(
     kps_df:        pd.DataFrame,    # ALL temp_ids, with posture/facing columns
     embed_parquet: str,
     assignment:    dict,            # {temp_id -> real_id} — resolved only
-    is_night:      bool,
     gallery_dir:   str,
     ema_alpha:     float,
     min_slot_conf: float,
@@ -514,9 +543,15 @@ def _update_pose_gallery(
       2. Resolved temp_ids  → update PoseGallery (real_id keyed, full alpha)
       3. All temp_ids       → update TempPoseGallery (TempKey keyed, full alpha)
       4. Resolved temp_ids  → delete from TempPoseGallery (they have graduated)
+
+    Each frame carries its own camera mode (kps_df.is_night), so the session's
+    frames are split by it and steps 1-3 run once per modality present, each
+    against that modality's files. A temp_id seen on both sides of the
+    camera's colour↔IR switch feeds both galleries — which is how the night
+    gallery learns identities confirmed in daylight. Modalities never mix:
+    a day frame only ever updates a day slot.
     """
     log("Updating pose-conditioned galleries...")
-    modality = "night" if is_night else "day"
 
     # ── Load embeddings (multi-part or single file) ───────────────────────────
     _ep = Path(embed_parquet)
@@ -549,7 +584,7 @@ def _update_pose_gallery(
     # ── Merge embeds with per-frame labels ────────────────────────────────────
     merged = edf.merge(
         kps_df[["frame_index", "temp_id", "posture", "posture_conf",
-                "facing", "facing_conf"]],
+                "facing", "facing_conf", "is_night"]],
         on=["frame_index", "temp_id"], how="inner",
     )
     if merged.empty:
@@ -559,72 +594,93 @@ def _update_pose_gallery(
     log(f"  {len(merged)} frames available for slot assignment "
         f"({merged['temp_id'].nunique()} temp_ids)")
 
-    # ── Build slot embeddings for ALL temp_ids ────────────────────────────────
-    slot_embeds_by_tid = build_slot_embeds(
-        embed_df         = merged[["temp_id", "embed"]].reset_index(drop=True),
-        per_frame_labels = {
-            "posture": merged["posture"].values.astype(np.int8),
-            "facing":  merged["facing"].values.astype(np.int8),
-        },
-        frame_temp_ids   = merged["temp_id"].values,
-        min_conf_posture = merged["posture_conf"].values.astype(np.float32),
-        min_conf_facing  = merged["facing_conf"].values.astype(np.float32),
-        min_conf         = min_slot_conf,
-    )
-
-    if not slot_embeds_by_tid:
-        log("  No confident slot frames found — gallery update skipped.")
-        return
-
-    log(f"  Slot embeddings built for {len(slot_embeds_by_tid)} temp_ids")
-
-    # ── Update PoseGallery (resolved temp_ids only, full alpha) ───────────────
-    pose_gallery  = PoseGallery.load(gallery_dir, modality)
-    pose_updates  = 0
-    for tid, slot_embeds in slot_embeds_by_tid.items():
-        real_id = assignment.get(int(tid))
-        if real_id is None:
-            continue
-        cosines = pose_gallery.update(int(real_id), slot_embeds, alpha=ema_alpha)
-        for slot_idx, cos in cosines.items():
-            cos_str = f"{cos:.3f}" if not (isinstance(cos, float) and np.isnan(cos)) else "new"
-            log(f"  real_id {real_id}  slot [{slot_name(slot_idx)}]  cos={cos_str}")
-        pose_updates += len(slot_embeds)
-    log(f"  PoseGallery: {pose_updates} slot updates ({len(pose_gallery.embeds)} total entries)")
-
-    # ── Update TempPoseGallery (ALL temp_ids, full alpha) ─────────────────────
-    temp_gallery  = TempPoseGallery.load(gallery_dir, modality)
-    temp_updates  = 0
-    for tid, slot_embeds in slot_embeds_by_tid.items():
-        key     = TempKey(camera_id=camera_id, session_id=session_id, temp_id=int(tid))
-        cosines = temp_gallery.update(key, slot_embeds, alpha=ema_alpha)
-        temp_updates += len(slot_embeds)
-    log(f"  TempPoseGallery: {temp_updates} slot updates")
-
-    # ── Delete resolved temp_ids from TempPoseGallery ─────────────────────────
-    # Include merge_map's losers (e.g. t313, t263...), not just the winner
-    # (t1) that remains as assignment's key — they graduated into the same
-    # real_id and their raw-keyed TempPoseGallery entries are now stale.
+    # Resolved temp_ids graduate out of the temp gallery. Include merge_map's
+    # losers (e.g. t313, t263...), not just the winner (t1) that remains as
+    # assignment's key — they graduated into the same real_id and their
+    # raw-keyed TempPoseGallery entries are now stale.
     resolved_tids = set(int(t) for t in assignment.keys())
     if merge_map:
         resolved_tids |= set(int(t) for t in merge_map.keys())
-    deleted = temp_gallery.delete_resolved(session_id, resolved_tids)
-    if deleted:
-        log(f"  TempPoseGallery: deleted {len(deleted)} resolved entries: "
-            f"{[f't{k.temp_id}' for k in deleted]}")
 
-    # ── Save both galleries ───────────────────────────────────────────────────
+    # Both modalities' temp galleries are always loaded: this session's old
+    # entries are purged from BOTH first, so a re-run replaces them — including
+    # entries left in the other modality's file by an earlier run whose
+    # day/night labelling differed (e.g. the old clock-based rule).
+    pose_galleries = {}
+    temp_galleries = {m: TempPoseGallery.load(gallery_dir, m) for m in ("day", "night")}
+    for m, tg in temp_galleries.items():
+        purged = tg.delete_session(session_id)
+        if purged:
+            log(f"  TempPoseGallery[{m}]: purged {len(purged)} entries from an "
+                f"earlier run of this session")
+
+    for is_night_val, mdf in merged.groupby("is_night"):
+        modality = "night" if bool(is_night_val) else "day"
+        mdf = mdf.reset_index(drop=True)
+
+        # ── Build slot embeddings for ALL temp_ids (this modality) ────────────
+        slot_embeds_by_tid = build_slot_embeds(
+            embed_df         = mdf[["temp_id", "embed"]],
+            per_frame_labels = {
+                "posture": mdf["posture"].values.astype(np.int8),
+                "facing":  mdf["facing"].values.astype(np.int8),
+            },
+            frame_temp_ids   = mdf["temp_id"].values,
+            min_conf_posture = mdf["posture_conf"].values.astype(np.float32),
+            min_conf_facing  = mdf["facing_conf"].values.astype(np.float32),
+            min_conf         = min_slot_conf,
+        )
+        if not slot_embeds_by_tid:
+            log(f"  [{modality}] {len(mdf)} frames, no confident slot frames — skipped")
+            continue
+        log(f"  [{modality}] {len(mdf)} frames → slot embeddings for "
+            f"{len(slot_embeds_by_tid)} temp_ids")
+
+        # ── Update PoseGallery (resolved temp_ids only, full alpha) ───────────
+        pose_gallery = PoseGallery.load(gallery_dir, modality)
+        pose_updates = 0
+        for tid, slot_embeds in slot_embeds_by_tid.items():
+            real_id = assignment.get(int(tid))
+            if real_id is None:
+                continue
+            cosines = pose_gallery.update(int(real_id), slot_embeds, alpha=ema_alpha)
+            for slot_idx, cos in cosines.items():
+                cos_str = f"{cos:.3f}" if not (isinstance(cos, float) and np.isnan(cos)) else "new"
+                log(f"  [{modality}] real_id {real_id}  slot [{slot_name(slot_idx)}]  cos={cos_str}")
+            pose_updates += len(slot_embeds)
+        pose_galleries[modality] = pose_gallery
+        log(f"  [{modality}] PoseGallery: {pose_updates} slot updates "
+            f"({len(pose_gallery.embeds)} total entries)")
+
+        # ── Update TempPoseGallery (ALL temp_ids, full alpha) ─────────────────
+        temp_gallery = temp_galleries[modality]
+        temp_updates = 0
+        for tid, slot_embeds in slot_embeds_by_tid.items():
+            key = TempKey(camera_id=camera_id, session_id=session_id, temp_id=int(tid))
+            temp_gallery.update(key, slot_embeds, alpha=ema_alpha)
+            temp_updates += len(slot_embeds)
+        log(f"  [{modality}] TempPoseGallery: {temp_updates} slot updates")
+
+    # ── Delete resolved temp_ids from BOTH TempPoseGalleries ──────────────────
+    for m, tg in temp_galleries.items():
+        deleted = tg.delete_resolved(session_id, resolved_tids)
+        if deleted:
+            log(f"  TempPoseGallery[{m}]: deleted {len(deleted)} resolved entries: "
+                f"{[f't{k.temp_id}' for k in deleted]}")
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    # Pose galleries only for modalities that were updated; temp galleries
+    # always (both), since the purge above may have changed either.
     if not dry_run:
-        pose_gallery.save(gallery_dir, modality)
-        temp_gallery.save(gallery_dir, modality)
-        log(f"  Saved gallery_pose_{modality}.npy  ({len(pose_gallery.embeds)} entries)")
-        log(f"  Saved temp_gallery_pose_{modality}.npy  "
-            f"({len(temp_gallery.embeds)} entries, "
-            f"camera {camera_id})")
-        if pose_gallery.embeds:
-            log(pose_gallery.summary())
-        cam_count = len(temp_gallery.entries_for_camera(camera_id))
-        if cam_count:
-            log(temp_gallery.summary(camera_id))
+        for m, pg in pose_galleries.items():
+            pg.save(gallery_dir, m)
+            log(f"  Saved gallery_pose_{m}.npy  ({len(pg.embeds)} entries)")
+            if pg.embeds:
+                log(pg.summary())
+        for m, tg in temp_galleries.items():
+            tg.save(gallery_dir, m)
+            log(f"  Saved temp_gallery_pose_{m}.npy  ({len(tg.embeds)} entries)")
+            if tg.entries_for_camera(camera_id):
+                log(tg.summary(camera_id))
     else:
         log("  [dry_run] galleries not saved")
