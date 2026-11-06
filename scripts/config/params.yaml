@@ -41,7 +41,7 @@ embedder:
   crop_margin: 0.10         # bbox padding (fraction of w/h) for embed + pose crops
 
 sampling:
-  save_every: 10            # keep latest detection per temp_id per N frames
+  save_every: 1            # keep latest detection per temp_id per N frames
   flush_every: 5            # flush to SQLite + Parquet every M windows (N×M frames)
   parquet_rows_per_part: 50000
 

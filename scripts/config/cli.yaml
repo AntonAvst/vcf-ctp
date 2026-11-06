@@ -17,26 +17,26 @@
 # ═════════════════════════════════════════════════════════════════════════════
 
 track_and_dump:
-  save_crops: false
-  crops_local: false        # keep crops local only (no Drive upload); needs save_crops
+  save_crops: true
+  crops_local: true        # keep crops local only (no Drive upload); needs save_crops
   crop_tags: false          # append _<posture>_<facing> to crop names; needs a pose model
-  crop_every: 1             # save every N-th sample per temp_id (counts samples, not frames)
-  min_crop_wh: [0, 0]       # [W, H] minimum crop size to save
-  save_masks: false         # QA mask polygons → outputs/<sid>/qa_masks/, never uploaded
+  crop_every: 100             # save every N-th sample per temp_id (counts samples, not frames)
+  min_crop_wh: [100, 100]       # [W, H] minimum crop size to save
+  save_masks: true         # QA mask polygons → outputs/<sid>/qa_masks/, never uploaded
 
 display_tracks:
   port: 5000
   start: 0                  # first frame
   limit: 0                  # stop after N frames (0 = whole video)
-  draw_pose: false
-  draw_masks: false         # needs track_and_dump save_masks: true first
+  draw_pose: true
+  draw_masks: true         # needs track_and_dump save_masks: true first
   kp_radius: 3
   sk_thickness: 2
   kp_thresh: 0.0            # hide keypoints with visibility <= this
   hide_occluded: false
   kp_conf_thresh: 0.30      # display filter only — independent of params pose.kp_conf_thresh
   show_lowconf: false
-  kp_index: false           # draw keypoint index numbers
+  kp_index: true           # draw keypoint index numbers
   kp_index_scale: 0.45
   kp_index_thickness: 1
   kp_index_offset: 6

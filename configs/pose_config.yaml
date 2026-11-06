@@ -1,2 +1,0 @@
-min_px_size: 160 # if (bbox_h < min_px_size) or (bbox_w < min_px_size): continue  # skip too small
-   

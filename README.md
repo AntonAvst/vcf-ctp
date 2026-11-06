@@ -780,19 +780,14 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
   When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
 - [x] resolve session id logic (video name, time, etc...) — see Key Design Decision 23 / `make_session_id`
-- [ ] regenerate tracks with higher frame rate (< 0.5[sec])
-- [ ] filter out temp ids with less then epsilon instances
 - [ ] what to do about bbox overpopulation?
-- [ ] OCR?
 - [ ] change day-night logic to grayscale vs rgb
 - [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `identity.source_priority` in `params.yaml`
 - [x] drop camera_id restriction in TempPoseGallery
 - [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
 - [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
   - [x] Implement tier-3 motion-magnitude correlation — `make_motion_corr_fn` / `motion_magnitude_corr` in `cross_camera.py`. On synthetic tracks (same cow seen at different scales and opposite directions, 1 px jitter): same cow r≈0.998, different cows ≤0.48; still matches with up to ~1.5 s clock offset, fails at 10 s. `motion_corr_threshold` not yet checked against real crossings.
-  - [ ] Check `frame_datetime` against the video's real clock. It is computed as start + frame_index / fps, so any dropped frame shifts every later timestamp. Camera 38's 2-hour file (`…E110000`) has 143,540 frames = 7,177 s at 20 fps, i.e. ends 23 s short: either the recording is shorter, or frames were lost and late timestamps run up to ~23 s behind. Cross-camera matching (dwell-window overlap, tier 3) assumes cameras agree within ~2 s. Possible fix: use the decoder's per-frame timestamp (`CAP_PROP_POS_MSEC`) instead of frame_index / fps.
   - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
-  - [ ] Tune `boundary_dwell_seconds` / `boundary_dwell_min_frames` against real crossing durations once more footage is annotated
 - [x] Reset the tracker between videos in batch mode.
 - [ ] Collapse match_identity.py and reconcile's inline correlation logic into one implementation.
 - [x] Move vision-feature constants into the config file, including CLI plumbing — `config/params.yaml` + `config/cli.yaml`, see Configuration
