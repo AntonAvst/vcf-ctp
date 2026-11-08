@@ -142,16 +142,33 @@ class KineticMatch:
 
 
 @dataclass(frozen=True)
+class SourceWeights:
+    manual: float
+    kinetic: float
+    boundary_rendezvous: float
+    cosine: float
+
+
+@dataclass(frozen=True)
 class Gallery:
     ema_alpha: float
-    min_embeds: int
+    min_embeds: float
     synthetic_merge_alpha: float
+    source_weights: SourceWeights
+
+
+@dataclass(frozen=True)
+class AppearanceQuality:
+    min_px: float
+    full_px: float
+    edge_margin_px: float
+    edge_weight: float
 
 
 @dataclass(frozen=True)
 class CosineResolver:
     threshold: float
-    min_embeds: int
+    min_embeds: float
 
 
 @dataclass(frozen=True)
@@ -192,6 +209,7 @@ class Vision:
     facing: FacingParams
     aggregate_min_conf: float
     min_slot_conf: float
+    min_slot_frames: float
 
 
 @dataclass(frozen=True)
@@ -240,6 +258,7 @@ class Params:
     session: Session
     stitching: Stitching
     noise_filter: NoiseFilter
+    appearance_quality: AppearanceQuality
     kinetic_match: KineticMatch
     gallery: Gallery
     cosine_resolver: CosineResolver
@@ -428,6 +447,26 @@ def _validate_params(p: Params) -> None:
                      (p.session.night_end_hour, "session.night_end_hour")]:
         if not 0 <= h <= 23:
             raise ConfigError(f"{where}: must be 0..23, got {h}")
+
+    sw = p.gallery.source_weights
+    for name in ("manual", "kinetic", "boundary_rendezvous", "cosine"):
+        _unit(getattr(sw, name), f"gallery.source_weights.{name}")
+    if set(p.identity.source_priority) != {"manual", "kinetic", "boundary_rendezvous", "cosine"}:
+        raise ConfigError("gallery.source_weights has a weight for exactly manual, kinetic, "
+                          "boundary_rendezvous and cosine; identity.source_priority must "
+                          f"list the same sources, got {p.identity.source_priority}")
+
+    aq = p.appearance_quality
+    if aq.min_px < 0 or aq.full_px <= aq.min_px:
+        raise ConfigError(f"appearance_quality: need 0 <= min_px < full_px, "
+                          f"got min_px={aq.min_px}, full_px={aq.full_px}")
+    if aq.edge_margin_px < 0:
+        raise ConfigError(f"appearance_quality.edge_margin_px: must be >= 0, got {aq.edge_margin_px}")
+    _unit(aq.edge_weight, "appearance_quality.edge_weight")
+    if p.vision.min_slot_frames < 0:
+        raise ConfigError(f"vision.min_slot_frames: must be >= 0, got {p.vision.min_slot_frames}")
+    if p.gallery.min_embeds < 0 or p.cosine_resolver.min_embeds < 0:
+        raise ConfigError("gallery.min_embeds / cosine_resolver.min_embeds must be >= 0")
 
     st = p.stitching
     for name in ("max_gap_s", "max_dist", "dist_per_s", "end_window_s",

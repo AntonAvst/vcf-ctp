@@ -506,20 +506,30 @@ def build_slot_embeds(
     min_conf_posture,
     min_conf_facing,
     min_conf: float,              # params vision.min_slot_conf
+    frame_weights=None,           # appearance_quality weight per row (None → all 1)
+    min_slot_frames: float = 0.0, # params vision.min_slot_frames (effective frames)
 ) -> dict[int, dict[int, np.ndarray]]:
     """
-    Group embed rows by slot, mean-pool each slot per temp_id.
+    Group embed rows by slot, quality-weighted mean per slot per temp_id.
+
+    A slot needs at least min_slot_frames EFFECTIVE frames (sum of
+    frame_weights over its confident frames); frames with weight 0 never
+    count. Without frame_weights every frame weighs 1, so min_slot_frames is
+    a plain frame count.
 
     Returns dict { temp_id -> { slot_idx -> mean_embed (128,) } }
     """
     posture_arr = per_frame_labels["posture"]
     facing_arr  = per_frame_labels["facing"]
+    weights = (np.ones(len(posture_arr), dtype=np.float32) if frame_weights is None
+               else np.asarray(frame_weights, dtype=np.float32))
 
     confident = (
         (min_conf_posture >= min_conf)
         & (min_conf_facing >= min_conf)
         & (posture_arr != int(Posture.UNCERTAIN))
         & (facing_arr  != int(Facing.UNCERTAIN))
+        & (weights > 0)
     )
 
     result: dict[int, dict[int, list]] = {}
@@ -534,14 +544,16 @@ def build_slot_embeds(
         if s is None:
             continue
         tid = int(frame_temp_ids[i])
-        result.setdefault(tid, {}).setdefault(s, []).append(embeds_array[i])
+        result.setdefault(tid, {}).setdefault(s, []).append(i)
 
     pooled: dict[int, dict[int, np.ndarray]] = {}
     for tid, slots in result.items():
-        pooled[tid] = {}
-        for slot_idx, vecs in slots.items():
-            mean = np.stack(vecs).mean(axis=0)
-            pooled[tid][slot_idx] = _l2_norm(mean)
+        for slot_idx, idx in slots.items():
+            w = weights[idx]
+            if w.sum() < min_slot_frames:
+                continue
+            mean = (embeds_array[idx] * w[:, None]).sum(axis=0) / w.sum()
+            pooled.setdefault(tid, {})[slot_idx] = _l2_norm(mean)
 
     return pooled
 

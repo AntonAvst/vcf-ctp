@@ -325,7 +325,9 @@ CREATE TABLE IF NOT EXISTS video_sessions (
     end_dt          TEXT,
     collar_csv_path TEXT,
     is_night        INTEGER DEFAULT 0,  -- majority camera mode (summary only)
-    night_frame_fraction REAL           -- fraction of frames in grayscale/IR mode
+    night_frame_fraction REAL,          -- fraction of frames in grayscale/IR mode
+    frame_w         INTEGER,            -- video frame size in px (reconcile's
+    frame_h         INTEGER             -- appearance-quality edge check)
 );
 
 CREATE TABLE IF NOT EXISTS raw_tracks (
@@ -355,7 +357,9 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA_SQL)
     # DBs created before per-frame camera-mode detection existed
     for sql in ("ALTER TABLE raw_tracks ADD COLUMN is_night INTEGER",
-                "ALTER TABLE video_sessions ADD COLUMN night_frame_fraction REAL"):
+                "ALTER TABLE video_sessions ADD COLUMN night_frame_fraction REAL",
+                "ALTER TABLE video_sessions ADD COLUMN frame_w INTEGER",
+                "ALTER TABLE video_sessions ADD COLUMN frame_h INTEGER"):
         try:
             conn.execute(sql)
         except sqlite3.OperationalError:
@@ -1078,6 +1082,8 @@ def process_video(video_path: "Path", args, dm, db_path: "Path",
     # Session-level camera-mode summary. Per-row raw_tracks.is_night is what
     # reconcile uses; video_sessions.is_night is a majority-vote convenience.
     night_frac = night_frames / frame_idx if frame_idx else 0.0
+    conn.execute("UPDATE video_sessions SET frame_w=?, frame_h=? WHERE session_id=?",
+                 (W, H, session_id))
     conn.execute("UPDATE video_sessions SET is_night=?, night_frame_fraction=? "
                  "WHERE session_id=?",
                  (int(night_frac > 0.5), round(night_frac, 4), session_id))

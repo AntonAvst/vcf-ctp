@@ -64,6 +64,7 @@ import pandas as pd
 # Imported as _config: several functions here take a parameter named
 # `config` (a CrossCameraConfig), which would shadow the module.
 import config as _config
+import appearance_quality as _aq
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,7 +259,12 @@ CREATE TABLE IF NOT EXISTS boundary_observations (
     resolved_animal_id  INTEGER,
     resolved_confidence REAL,
     status              TEXT NOT NULL DEFAULT 'pending',  -- pending|matched|no_match_found
-    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- outcome of the pairing, on BOTH rows once matched, so a re-run of either
+    -- session can re-apply it (the partner row is no longer pending to re-pair)
+    match_kind          TEXT,      -- corroboration|resolved_by_confidence|needs_review|linked_unresolved
+    match_animal_id     INTEGER,   -- id the pairing settled on (NULL if none)
+    partner_obs_id      INTEGER    -- boundary_observations.id of the other side
 );
 """
 
@@ -286,6 +292,13 @@ def migrate_cross_camera_schema(conn: sqlite3.Connection) -> None:
     vision_features.migrate_timeline_schema."""
     conn.executescript(BOUNDARY_OBSERVATIONS_DDL)
     conn.executescript(CROSS_CAMERA_CONFLICTS_DDL)
+    for sql in ("ALTER TABLE boundary_observations ADD COLUMN match_kind TEXT",
+                "ALTER TABLE boundary_observations ADD COLUMN match_animal_id INTEGER",
+                "ALTER TABLE boundary_observations ADD COLUMN partner_obs_id INTEGER"):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass   # column already present
     conn.commit()
 
 
@@ -696,9 +709,22 @@ def resolve_cross_camera_pair(
                 conn.commit()
 
     if not dry_run:
-        _mark_status(conn, a.id, "matched")
-        _mark_status(conn, b.id, "matched")
+        _mark_matched(conn, a.id, b.id, outcome["kind"], outcome.get("animal_id"))
     return outcome
+
+
+def _mark_matched(conn: sqlite3.Connection, obs_a: int, obs_b: int,
+                  kind: str, animal_id: Optional[int]) -> None:
+    """Mark both sides matched and record the outcome on each, pointing at
+    the other — a later re-run of either session re-applies it from here."""
+    for this, other in ((obs_a, obs_b), (obs_b, obs_a)):
+        if this < 0:          # dry_run sentinel
+            continue
+        conn.execute(
+            "UPDATE boundary_observations SET status='matched', match_kind=?, "
+            "match_animal_id=?, partner_obs_id=? WHERE id=?",
+            (kind, animal_id, other if other >= 0 else None, this))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,11 +803,63 @@ def run_boundary_rendezvous(
     session_start = tracks_df["frame_datetime"].min()
     session_end = tracks_df["frame_datetime"].max()
 
+    # ── Re-run: replace what this session staged, keep what others consumed ──
+    # Pending rows of this session were never used by anyone: delete them and
+    # stage afresh. Rows already matched (or ruled out by a partner session's
+    # coverage) are kept — the partner side is no longer pending, so they
+    # can't be re-paired — and their recorded outcome is re-applied below.
+    consumed: dict = {}    # (temp_id, zone_pair_id) -> row
+    if not dry_run:
+        n_pending = conn.execute(
+            "DELETE FROM boundary_observations WHERE session_id = ? AND status = 'pending'",
+            (session_id,)).rowcount
+        conn.commit()
+        if n_pending:
+            log.append(f"  [boundary_rendezvous] Re-run: replaced {n_pending} pending "
+                       f"observation(s) from an earlier run of this session")
+    for row in conn.execute(
+            "SELECT id, temp_id, zone_pair_id, status, match_kind, match_animal_id "
+            "FROM boundary_observations WHERE session_id = ? AND status != 'pending'",
+            (session_id,)).fetchall():
+        consumed[(int(row[1]), row[2])] = {"id": row[0], "status": row[3],
+                                           "kind": row[4], "animal_id": row[5]}
+
+    def apply_outcome(this_tid: int, new, kind: str) -> None:
+        """Set this session's temp_id to the id a pairing settled on, unless a
+        manual/kinetic id outranks it."""
+        old = assignment.get(this_tid)
+        if new is None or old == new:
+            return
+        if protected_tids and this_tid in protected_tids:
+            log.append(f"  [boundary_rendezvous] KEPT t{this_tid}={old}: partner "
+                       f"camera suggests {new}, but a manual/kinetic id "
+                       f"outranks a boundary match ({kind})")
+            return
+        log.append(f"  [boundary_rendezvous] OVERRIDE t{this_tid}: {old} -> {new} "
+                   f"(reason={kind})")
+        assignment[this_tid] = new
+
     # ── Stage this session's qualifying boundary tracks ──────────────────────
-    staged_ids: dict[int, int] = {}   # temp_id -> boundary_observations.id
-    for temp_id in tracks_df["temp_id"].unique():
+    staged: dict[int, tuple] = {}   # temp_id -> (obs_id, dwell, flat_embedding)
+    tids_present = set(int(t) for t in tracks_df["temp_id"].unique())
+    for temp_id in sorted(tids_present):
         dwell = compute_dwell_in_known_zones(tracks_df, int(temp_id), camera_id, config)
         if dwell is None:
+            continue
+
+        prior = consumed.get((temp_id, dwell.zone_pair_id))
+        if prior is not None:
+            if prior["status"] == "matched" and prior["kind"] in ("corroboration",
+                                                                  "resolved_by_confidence"):
+                log.append(f"  [boundary_rendezvous] t{temp_id}: already matched in an "
+                           f"earlier run ({prior['kind']}) — re-applying its outcome")
+                apply_outcome(temp_id, prior["animal_id"], prior["kind"])
+            elif prior["status"] == "matched" and prior["kind"] is None:
+                log.append(f"  [boundary_rendezvous] t{temp_id}: matched before outcomes "
+                           f"were recorded — its result can't be re-applied")
+            else:
+                log.append(f"  [boundary_rendezvous] t{temp_id}: already "
+                           f"{prior['kind'] or prior['status']} in an earlier run — kept")
             continue
 
         tid_embeds = embed_df[embed_df["temp_id"] == temp_id]
@@ -789,10 +867,8 @@ def run_boundary_rendezvous(
             log.append(f"  [boundary_rendezvous] t{temp_id}: qualifies for zone {dwell.zone_pair_id} "
                        f"but has no embedding — skipped")
             continue
-        flat_embed = np.stack(tid_embeds["embed"].values).mean(axis=0)
-        norm = np.linalg.norm(flat_embed)
-        if norm > 1e-8:
-            flat_embed = flat_embed / norm
+        # quality-weighted mean (appearance_quality.py), L2-normalised
+        flat_embed = _aq.weighted_mean_embed(tid_embeds)
 
         obs_id = write_boundary_observation(
             conn, camera_id=camera_id, zone_pair_id=dwell.zone_pair_id,
@@ -802,23 +878,20 @@ def run_boundary_rendezvous(
             resolved_confidence=confidence.get(int(temp_id)),
             dry_run=dry_run,
         )
-        staged_ids[int(temp_id)] = obs_id
+        staged[int(temp_id)] = (obs_id, dwell, flat_embed)
         log.append(f"  [boundary_rendezvous] t{temp_id}: staged in zone {dwell.zone_pair_id} "
                    f"({dwell.frames} frames, {dwell.seconds:.1f}s)")
 
-    if not staged_ids:
-        log.append("  [boundary_rendezvous] No boundary candidates this session.")
+    if not staged:
+        log.append("  [boundary_rendezvous] No new boundary candidates this session.")
 
     # ── For each zone this camera participates in, look for a partner match ──
     by_zone: dict[str, list[PendingObservation]] = {}
-    for temp_id, obs_id in staged_ids.items():
-        dwell = compute_dwell_in_known_zones(tracks_df, temp_id, camera_id, config)
+    for temp_id, (obs_id, dwell, flat_embed) in staged.items():
         by_zone.setdefault(dwell.zone_pair_id, []).append(PendingObservation(
             id=obs_id, camera_id=camera_id, session_id=session_id, temp_id=temp_id,
             enter_time=dwell.enter_time, exit_time=dwell.exit_time,
-            flat_embedding=np.stack(
-                embed_df[embed_df["temp_id"] == temp_id]["embed"].values
-            ).mean(axis=0),
+            flat_embedding=flat_embed,
             resolved_animal_id=assignment.get(temp_id),
             resolved_confidence=confidence.get(temp_id),
         ))
@@ -840,21 +913,9 @@ def run_boundary_rendezvous(
             log.append(f"  [boundary_rendezvous] t{a.temp_id}({a.camera_id}) <-> "
                        f"t{b.temp_id}({b.camera_id})  tier={tier} score={score:.3f}  "
                        f"-> {outcome['kind']}")
-
             if outcome["kind"] in ("corroboration", "resolved_by_confidence"):
                 this_tid = a.temp_id if a.camera_id == camera_id else b.temp_id
-                old = assignment.get(this_tid)
-                new = outcome["animal_id"]
-                if old == new:
-                    continue
-                if protected_tids and this_tid in protected_tids:
-                    log.append(f"  [boundary_rendezvous] KEPT t{this_tid}={old}: partner "
-                               f"camera suggests {new}, but a manual/kinetic id "
-                               f"outranks a boundary match ({outcome['kind']})")
-                    continue
-                log.append(f"  [boundary_rendezvous] OVERRIDE t{this_tid}: {old} -> {new} "
-                           f"(reason={outcome['kind']})")
-                assignment[this_tid] = new
+                apply_outcome(this_tid, outcome["animal_id"], outcome["kind"])
 
     # ── Coverage-based finalization ───────────────────────────────────────────
     finalized = finalize_no_match_observations(conn, camera_id, session_start, session_end,

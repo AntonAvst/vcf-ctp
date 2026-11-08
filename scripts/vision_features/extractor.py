@@ -49,6 +49,7 @@ import numpy as np
 import pandas as pd
 
 import config
+import appearance_quality
 from .schema import (
     BACK_KPS, N_KP,
     TIMELINE_VISION_COLS, TIMELINE_ALTER_SQLS,
@@ -348,6 +349,7 @@ def run_vision_features(
     assignment:        dict,                   # {temp_id -> real_id}
     fallback_is_night: bool       = False,     # only for legacy rows with NULL is_night
     exclude_tids:      set | None = None,      # temp_ids reconcile's noise filter dropped
+    frame_size:        tuple | None = None,    # (frame_w, frame_h) px for the edge check
     camera_id:         str        = "cam0",
     kps_parquet:       str | None = None,
     embed_parquet:     str | None = None,
@@ -369,6 +371,8 @@ def run_vision_features(
                       aggregates nor the pose galleries (TempPoseGallery
                       takes every temp_id, so noise would otherwise become
                       match targets for later sessions).
+    frame_size      : video frame (width, height) in px, used by the appearance-
+                      quality weight's frame-edge check (None → check skipped).
     fallback_is_night : camera mode to assume for raw_tracks rows whose
                       is_night is NULL (sessions tracked before per-frame
                       detection existed). Rows that have it use their own.
@@ -437,6 +441,11 @@ def run_vision_features(
             _save_temp_galleries(_purged_temp_galleries(session_id, gallery_dir),
                                  gallery_dir, dry_run)
             return timeline_df
+
+    # Appearance-quality weight per frame (appearance_quality.py) — pose slots
+    # are weighted means and need min_slot_frames EFFECTIVE frames.
+    kps_df[appearance_quality.QUALITY_COL] = appearance_quality.frame_weights(
+        kps_df, *(frame_size or (None, None)))
 
     # ── Per-frame extraction (all temp_ids — no identity filter yet) ─────────
     log(f"Running per-frame extractors on all {len(kps_df)} rows "
@@ -624,7 +633,7 @@ def _update_pose_gallery(
     # ── Merge embeds with per-frame labels ────────────────────────────────────
     merged = edf.merge(
         kps_df[["frame_index", "temp_id", "posture", "posture_conf",
-                "facing", "facing_conf", "is_night"]],
+                "facing", "facing_conf", "is_night", appearance_quality.QUALITY_COL]],
         on=["frame_index", "temp_id"], how="inner",
     )
     if merged.empty:
@@ -664,6 +673,8 @@ def _update_pose_gallery(
             min_conf_posture = mdf["posture_conf"].values.astype(np.float32),
             min_conf_facing  = mdf["facing_conf"].values.astype(np.float32),
             min_conf         = min_slot_conf,
+            frame_weights    = mdf[appearance_quality.QUALITY_COL].values,
+            min_slot_frames  = config.params().vision.min_slot_frames,
         )
         if not slot_embeds_by_tid:
             log(f"  [{modality}] {len(mdf)} frames, no confident slot frames — skipped")

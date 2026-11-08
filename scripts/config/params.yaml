@@ -102,14 +102,36 @@ kinetic_match:
   activity_pct: 0.25        # a bin is "active" if delta >= this percentile
 
 gallery:
-  ema_alpha: 0.15           # kinetic-confirmed update; cosine-only uses alpha/2
-  min_embeds: 10            # min embed rows per temp_id to contribute to a gallery
+  # Galleries are updated ONCE per run, after every identity step, with each
+  # temp_id's final id. Update rate = ema_alpha × source_weights[source of the id].
+  ema_alpha: 0.15
+  min_embeds: 10            # min EFFECTIVE frames (sum of appearance_quality weights)
+                            # per temp_id and camera mode to contribute to a gallery
   synthetic_merge_alpha: 0.5  # blend weight when a synthetic id resolves to a real one
+  source_weights:           # 0 = never updates the gallery
+    manual: 1.0
+    kinetic: 1.0
+    boundary_rendezvous: 0.5  # inferred from appearance + motion across cameras, not confirmed
+    cosine: 0.5             # appearance self-match (was the hard-coded alpha/2)
+
+appearance_quality:
+  # Per-frame weight for every step that reads APPEARANCE (gallery means, cosine
+  # queries, pose slots, boundary embeddings) — never for positions or kinetics.
+  # Size = sqrt(w·h) of the box in px: weight 0 below min_px, rising linearly to
+  # 1 at full_px. PROVISIONAL: June 16 boxes are small (median ~40 px); 24/96
+  # zeroes 0-8% of detections and gives full weight to 8-24%. Calibrate once
+  # embeddings are available (agreement of each frame with its track's mean vs size).
+  min_px: 24
+  full_px: 96
+  edge_margin_px: 4         # box within this of the frame border = cut off by the edge
+  edge_weight: 0.3          # weight multiplier for such frames (partial cow in the crop);
+                            # skipped for sessions without video_sessions.frame_w/frame_h
 
 cosine_resolver:
   threshold: 0.75           # single cosine threshold — Cosine Resolver AND
                             # Boundary Rendezvous tier 2 both read this
-  min_embeds: 5             # min embed rows for a temp_id to be queried
+  min_embeds: 5             # min EFFECTIVE frames (appearance_quality) for a temp_id
+                            # to be queried in a camera mode
 
 cooccurrence:
   # Shared by Cosine Resolver and Duplicate Resolver: are two temp_ids that
@@ -142,6 +164,7 @@ vision:
     lying_conf_penalty: 0.70
   aggregate_min_conf: 0.30  # per-frame conf needed to count in window aggregates
   min_slot_conf: 0.30       # posture AND facing conf needed to feed a gallery slot
+  min_slot_frames: 3        # min EFFECTIVE frames (appearance_quality) for a slot vector
 
 # ── Boundary Rendezvous (cross_camera.py) ────────────────────────────────────
 cross_camera:
