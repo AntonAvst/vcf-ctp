@@ -117,10 +117,15 @@ class Session:
 
 
 @dataclass(frozen=True)
+class NoiseFilter:
+    min_duration_s: float
+    min_detections: int
+
+
+@dataclass(frozen=True)
 class KineticMatch:
     corr_threshold: float
     min_active_bins: int
-    live_min_active_bins: int
     min_temp_id_frames: float
     activity_pct: float
 
@@ -222,6 +227,7 @@ class Params:
     camera_mode: CameraMode
     timeline: Timeline
     session: Session
+    noise_filter: NoiseFilter
     kinetic_match: KineticMatch
     gallery: Gallery
     cosine_resolver: CosineResolver
@@ -410,6 +416,12 @@ def _validate_params(p: Params) -> None:
                      (p.session.night_end_hour, "session.night_end_hour")]:
         if not 0 <= h <= 23:
             raise ConfigError(f"{where}: must be 0..23, got {h}")
+
+    nf = p.noise_filter
+    if nf.min_duration_s < 0:
+        raise ConfigError(f"noise_filter.min_duration_s: must be >= 0, got {nf.min_duration_s}")
+    if nf.min_detections < 1:
+        raise ConfigError(f"noise_filter.min_detections: must be >= 1, got {nf.min_detections}")
 
     cm = p.camera_mode
     if not 0 <= cm.chroma_tol <= 255:

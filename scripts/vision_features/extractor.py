@@ -347,6 +347,7 @@ def run_vision_features(
     conn:              sqlite3.Connection,
     assignment:        dict,                   # {temp_id -> real_id}
     fallback_is_night: bool       = False,     # only for legacy rows with NULL is_night
+    exclude_tids:      set | None = None,      # temp_ids reconcile's noise filter dropped
     camera_id:         str        = "cam0",
     kps_parquet:       str | None = None,
     embed_parquet:     str | None = None,
@@ -363,6 +364,11 @@ def run_vision_features(
     timeline_df     : sensor-only timeline from sensor_sequencer.
     conn            : SQLite connection.
     assignment      : {temp_id -> real_id} from kinetic + cosine resolution.
+    exclude_tids    : temp_ids reconcile.py's noise filter dropped. Removed
+                      right after loading so they reach neither the window
+                      aggregates nor the pose galleries (TempPoseGallery
+                      takes every temp_id, so noise would otherwise become
+                      match targets for later sessions).
     fallback_is_night : camera mode to assume for raw_tracks rows whose
                       is_night is NULL (sessions tracked before per-frame
                       detection existed). Rows that have it use their own.
@@ -399,6 +405,11 @@ def run_vision_features(
     # ── Load kps data ─────────────────────────────────────────────────────────
     kps_df = load_kps_for_session(session_id, kps_parquet, conn,
                                   fallback_is_night=fallback_is_night)
+    if exclude_tids and not kps_df.empty:
+        before = len(kps_df)
+        kps_df = kps_df[~kps_df["temp_id"].isin(exclude_tids)].reset_index(drop=True)
+        log(f"  Noise filter: removed {before - len(kps_df)} rows of "
+            f"{len(exclude_tids)} dropped temp_ids")
     n_night = int(kps_df["is_night"].sum()) if not kps_df.empty else 0
     if not kps_df.empty:
         log(f"  Camera mode: {len(kps_df) - n_night} day rows, {n_night} night rows")

@@ -783,8 +783,6 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 
 ## ToDo
 
-- [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
-  When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
 - [x] resolve session id logic (video name, time, etc...) — see Key Design Decision 23 / `make_session_id`
 - [x] change day-night logic to grayscale vs rgb — per-frame camera-mode detection in `track_and_dump.py`, stored in `raw_tracks.is_night`, routed per row everywhere downstream; see Key Design Decision 25
 - [ ] Gallery Builder runs twice when the Duplicate Resolver merges anything (second call after the remap): kinetic temp_ids get the EMA applied twice per session and cosine-resolved ones get a full α on top of α/2. Re-running a session likewise re-applies the PoseGallery EMA. Pre-existing — not caused by the day/night change.
@@ -818,3 +816,5 @@ raw_data/videos/                            # LOCAL ONLY — never synced
   - [ ] Tracker mask-IoU — still box-IoU only (ByteTrack/BoT-SORT default); only worth escalating if ID-switch rate is still bad after the segmentation swap, per original plan
   - [ ] Coat-pattern fingerprinting
   - [ ] fp16/explicit-device optimization?
+  - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
+  - [ ] When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.

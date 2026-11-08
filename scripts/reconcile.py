@@ -39,8 +39,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
-from itertools import product
 
 from vision_features import run_vision_features, migrate_timeline_schema
 from vision_features.gallery import (
@@ -50,6 +48,7 @@ from vision_features.gallery import (
 from vision_features.schema import EMBED_DIM
 
 import config
+import kinetic_match
 
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
@@ -354,160 +353,107 @@ def split_by_modality(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {modality_of(v): g for v, g in df.groupby("is_night")}
 
 
+def raw_tracks_optional_select(conn: sqlite3.Connection, col: str) -> str:
+    """SELECT expression for a raw_tracks column that older DBs may lack."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(raw_tracks)").fetchall()}
+    return col if col in cols else f"NULL AS {col}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Kinetic Matcher (wraps match_identity.py logic inline)
+# Noise filter — drop noise-level temp_ids before any identity step
+#
+# On the June 16 sessions roughly half of all temp_ids lasted under 5 s while
+# carrying only 1-3% of the detections. Kept, each of them is queried by the
+# Cosine Resolver (5 embeds is 0.2 s at 25 fps) and gets its own TempPoseGallery
+# entry that later sessions can match — the seed of a junk synthetic id.
+# A good share are fragments of real cows' broken tracks rather than false
+# detections; short-gap tracklet stitching, when it exists, runs BEFORE this
+# filter so fragments get the chance to be joined first.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _camera_displacement_per_bin(tracks: pd.DataFrame,
-                                  bins: pd.DatetimeIndex) -> pd.DataFrame:
-    df = tracks.sort_values(["temp_id", "frame_datetime"])
-    df["bin"] = pd.cut(df["frame_datetime"], bins=bins, right=False, labels=bins[:-1])
-    df = df.dropna(subset=["bin"])
-    # cast Categorical bin labels → Timestamp so merge with kin_delta works
-    df["bin"] = df["bin"].astype("datetime64[ns]")
-    rows = []
-    for (tid, b), grp in df.groupby(["temp_id", "bin"], observed=True):
-        grp = grp.sort_values("frame_datetime")
-        dx = grp["cx"].diff().abs()
-        dy = grp["cy"].diff().abs()
-        disp = np.sqrt(dx**2 + dy**2).sum()
-        rows.append({"bin": b, "temp_id": tid, "displacement": disp})
-    return pd.DataFrame(rows)
+def noise_filter(tracks_df: pd.DataFrame,
+                 exempt_tids: set) -> tuple[pd.DataFrame, set]:
+    """
+    Drop temp_ids lasting < noise_filter.min_duration_s (first → last detection)
+    or with < noise_filter.min_detections rows. temp_ids in exempt_tids
+    (manual assignments — operator decisions always stand) are kept regardless.
+
+    Duration uses frame_time_sec when present, else frame_datetime.
+    Returns (filtered tracks_df, set of dropped temp_ids).
+    """
+    nf = config.params().noise_filter
+    if "frame_time_sec" in tracks_df.columns and tracks_df["frame_time_sec"].notna().all():
+        t = tracks_df["frame_time_sec"].astype(float)
+    else:
+        t = (tracks_df["frame_datetime"] - tracks_df["frame_datetime"].min()).dt.total_seconds()
+    per_tid = (pd.DataFrame({"temp_id": tracks_df["temp_id"], "t": t})
+               .groupby("temp_id")["t"].agg(["min", "max", "size"]))
+    duration = per_tid["max"] - per_tid["min"]
+    noisy = (duration < nf.min_duration_s) | (per_tid["size"] < nf.min_detections)
+    dropped = set(per_tid.index[noisy]) - set(exempt_tids)
+
+    kept_exempt = set(per_tid.index[noisy]) & set(exempt_tids)
+    n_rows = int(tracks_df["temp_id"].isin(dropped).sum())
+    n_tids = tracks_df["temp_id"].nunique()
+    log(f"Noise filter (< {nf.min_duration_s:g} s or < {nf.min_detections} detections): "
+        f"dropped {len(dropped)}/{n_tids} temp_ids "
+        f"({len(dropped) / max(n_tids, 1) * 100:.1f}%), "
+        f"{n_rows}/{len(tracks_df)} rows ({n_rows / max(len(tracks_df), 1) * 100:.2f}%)")
+    if kept_exempt:
+        log(f"  kept {len(kept_exempt)} noise-level temp_id(s) because they are manually "
+            f"assigned: {sorted(kept_exempt)}")
+    return tracks_df[~tracks_df["temp_id"].isin(dropped)].copy(), dropped
 
 
-def _kinetics_delta_per_bin(kinetics: pd.DataFrame,
-                             bins: pd.DatetimeIndex) -> pd.DataFrame:
-    rows = []
-    for aid, grp in kinetics.groupby("AnimalId"):
-        grp = grp.sort_values("datetime")
-        for i in range(len(bins) - 1):
-            t0, t1 = bins[i], bins[i + 1]
-            before = grp[grp["datetime"] < t0]["KineticsCountR"]
-            after  = grp[grp["datetime"] < t1]["KineticsCountR"]
-            if before.empty or after.empty:
-                continue
-            delta = after.iloc[-1] - before.iloc[-1]
-            if delta < 0:
-                delta = 0
-            rows.append({"bin": t0, "AnimalId": aid, "delta": delta})
-    return pd.DataFrame(rows)
 
 
-def _compute_scores(cam_disp: pd.DataFrame, kin_delta: pd.DataFrame,
-                    activity_pct: float, min_active_bins: int) -> pd.DataFrame:
-    results = []
-    for tid, aid in product(cam_disp["temp_id"].unique(), kin_delta["AnimalId"].unique()):
-        cam = cam_disp[cam_disp["temp_id"] == tid][["bin", "displacement"]]
-        kin = kin_delta[kin_delta["AnimalId"] == aid][["bin", "delta"]]
-        merged = cam.merge(kin, on="bin", how="inner")
-        if merged.empty:
-            continue
-        thresh = merged["delta"].quantile(activity_pct)
-        active = merged[merged["delta"] >= thresh]
-        n = len(active)
-        if n < max(min_active_bins, 2):
-            results.append({"temp_id": tid, "AnimalId": aid,
-                             "correlation": np.nan, "n_bins": n,
-                             "p_value": np.nan, "note": f"only {n} active bins"})
-            continue
-        if active["displacement"].std() == 0 or active["delta"].std() == 0:
-            results.append({"temp_id": tid, "AnimalId": aid,
-                             "correlation": np.nan, "n_bins": n,
-                             "p_value": np.nan, "note": "zero variance"})
-            continue
-        r, p = pearsonr(active["displacement"], active["delta"])
-        results.append({"temp_id": tid, "AnimalId": aid,
-                         "correlation": round(r, 4), "n_bins": n,
-                         "p_value": round(p, 4), "note": "ok"})
-    return pd.DataFrame(results)
-
-
-def _greedy_assign(scores: pd.DataFrame, corr_threshold: float) -> dict:
-    assignment = {}
-    used_animals, used_tids = set(), set()
-    valid = scores[scores["correlation"] >= corr_threshold].sort_values(
-        "correlation", ascending=False)
-    for _, row in valid.iterrows():
-        tid, aid = row["temp_id"], row["AnimalId"]
-        if tid in used_tids or aid in used_animals:
-            continue
-        assignment[tid] = aid
-        used_tids.add(tid)
-        used_animals.add(aid)
-    return assignment
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Kinetic Matcher — the implementation lives in kinetic_match.py (shared with
+# the match_identity.py CLI); this wrapper only logs.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def kinetic_matcher(tracks_df: pd.DataFrame,
-                          kinetics_df: pd.DataFrame) -> tuple[dict, dict]:
+                    kinetics_df: pd.DataFrame) -> tuple[dict, dict]:
     """
     Returns (assignment, kinetic_corr):
         assignment   : {temp_id (int) -> AnimalId (int)}
         kinetic_corr : {temp_id (int) -> Pearson r}, the correlation that
-                       produced each assignment. Added for Boundary Rendezvous
-                       (cross_camera.py), which needs per-temp_id confidence
-                       for its tier-1 / confidence-gap logic — previously
-                       this was computed into `scores` but never returned.
+                       produced each assignment (used by Boundary Rendezvous,
+                       cross_camera.py, for its tier-1 / confidence-gap logic).
     """
     section("Kinetic Matcher")
-    km  = config.params().kinetic_match
+    km = config.params().kinetic_match
     bin_minutes = config.params().timeline.bin_minutes
 
-    total_frames = tracks_df["frame_index"].nunique()
-    tid_counts = tracks_df.groupby("temp_id")["frame_index"].nunique()
-    stable_tids = tid_counts[
-        tid_counts / total_frames >= km.min_temp_id_frames
-    ].index.tolist()
-    log(f"Stable temp_ids (≥{km.min_temp_id_frames*100:.0f}% frames): {sorted(stable_tids)}")
+    res = kinetic_match.match(tracks_df, kinetics_df)
 
-    tracks_filt = tracks_df[tracks_df["temp_id"].isin(stable_tids)].copy()
+    log(f"Stable temp_ids (≥{km.min_temp_id_frames*100:.0f}% frames): {sorted(res.stable_tids)}")
+    if res.bins is not None:
+        log(f"Time bins: {len(res.bins)-1} × {bin_minutes}-min "
+            f"from {res.bins[0]} to {res.bins[-1]}")
+    for w in res.warnings:
+        log(f"WARNING: {w}.")
 
-    t_start = tracks_filt["frame_datetime"].min().floor(f"{bin_minutes}min")
-    t_end   = tracks_filt["frame_datetime"].max().ceil(f"{bin_minutes}min")
-    bins    = pd.date_range(start=t_start, end=t_end, freq=f"{bin_minutes}min")
-    log(f"Time bins: {len(bins)-1} × {bin_minutes}-min from {t_start} to {t_end}")
-
-    if len(bins) < 3:
-        log("WARNING: fewer than 2 complete bins — correlation will be unreliable.")
-
-    cam_disp  = _camera_displacement_per_bin(tracks_filt, bins)
-    kin_delta = _kinetics_delta_per_bin(kinetics_df, bins)
-
-    if cam_disp.empty or kin_delta.empty:
-        log("WARNING: empty displacement or kinetics signal — no matches possible.")
-        return {}, {}
-
-    scores = _compute_scores(cam_disp, kin_delta, km.activity_pct, km.min_active_bins)
-
-    # print correlation matrix
-    if not scores.empty:
-        pivot = scores.pivot_table(index="temp_id", columns="AnimalId",
-                                   values="correlation", aggfunc="first")
+    matrix = res.matrix()
+    if not matrix.empty:
         print("\nCorrelation matrix (temp_id × AnimalId):")
-        print(pivot.to_string())
+        print(matrix.to_string())
         print()
 
-    assignment = _greedy_assign(scores, km.corr_threshold)
-
-    kinetic_corr = {}
-    for tid, aid in assignment.items():
-        row = scores[(scores["temp_id"] == tid) & (scores["AnimalId"] == aid)]
-        if not row.empty:
-            kinetic_corr[tid] = float(row.iloc[0]["correlation"])
-
-    if assignment:
-        for tid, aid in sorted(assignment.items()):
-            row = scores[(scores["temp_id"] == tid) & (scores["AnimalId"] == aid)].iloc[0]
+    if res.assignment:
+        for tid, aid in sorted(res.assignment.items()):
+            row = res.scores[(res.scores["temp_id"] == tid)
+                             & (res.scores["AnimalId"] == aid)].iloc[0]
             log(f"  temp_id {tid:>3}  →  AnimalId {aid}  "
                 f"(r={row['correlation']:.3f}, n_bins={int(row['n_bins'])})")
-    else:
+    elif res.stable_tids:
         log("  No confident kinetic matches. "
             "Try lowering kinetic_match.corr_threshold in params.yaml or using a longer video.")
 
-    unmatched = set(stable_tids) - set(assignment.keys())
-    if unmatched:
-        log(f"  Unmatched temp_ids after kinetics: {sorted(unmatched)}")
+    if res.unmatched:
+        log(f"  Unmatched temp_ids after kinetics: {res.unmatched}")
 
-    return assignment, kinetic_corr
+    return res.assignment, res.corr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -528,8 +474,11 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
     """
     mode = tracks_df[["frame_index", "temp_id", "is_night"]].drop_duplicates(
         ["frame_index", "temp_id"])
+    kept_tids = set(tracks_df["temp_id"].unique())
 
     def _attach_mode(df: pd.DataFrame) -> pd.DataFrame:
+        # temp_ids removed upstream (noise filter) leave the embeds too
+        df = df[df["temp_id"].isin(kept_tids)]
         df = df.merge(mode, on=["frame_index", "temp_id"], how="left")
         n_missing = int(df["is_night"].isna().sum())
         if n_missing:
@@ -1753,6 +1702,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     log("Loading tracks from SQLite...")
     tracks_df = pd.read_sql(
         "SELECT frame_index, frame_datetime, temp_id, cx, cy, x1, y1, x2, y2, "
+        f"{raw_tracks_optional_select(conn, 'frame_time_sec')}, "
         f"{raw_tracks_is_night_select(conn)} "
         "FROM raw_tracks WHERE session_id = ? ORDER BY frame_index",
         conn, params=(args.session,), parse_dates=["frame_datetime"],
@@ -1770,6 +1720,14 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     night_frac = float(tracks_df["is_night"].mean())
     log(f"Camera mode: {night_frac*100:.1f}% of track rows night/IR "
         f"({'mixed — both galleries' if 0 < night_frac < 1 else modality_of(night_frac > 0.5) + ' only'})")
+
+    # ── Noise filter — before every identity step ─────────────────────────────
+    manual_assignment = load_manual_assignments(conn, args.session)
+    tracks_df, noise_tids = noise_filter(tracks_df, exempt_tids=set(manual_assignment))
+    if tracks_df.empty:
+        log("Every temp_id was filtered as noise — nothing to reconcile.")
+        conn.close()
+        return
 
     # register the session if missing (video_path and is_night are written by
     # track_and_dump.py; this is just a fallback INSERT OR IGNORE for sessions
@@ -1824,7 +1782,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     provenance = {tid: "kinetic" for tid in kinetic_assignment}
 
     # ── Manual Merge ──────────────────────────────────────────────────────────
-    manual_assignment = load_manual_assignments(conn, args.session)
+    # (manual_assignment was loaded before the noise filter, which exempts it)
     if manual_assignment:
         conflicts = set(kinetic_assignment) & set(manual_assignment)
         if conflicts:
@@ -1948,6 +1906,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
             conn          = conn,
             assignment    = full_assignment,
             fallback_is_night = fallback_is_night,   # only for NULL (legacy) rows
+            exclude_tids  = noise_tids,
             camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
             # kps is written as multi-part files (kps_part000.parquet, ...) by
             # track_and_dump.py's KpsWriter, same as embeds — pass the session
