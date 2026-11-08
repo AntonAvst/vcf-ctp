@@ -69,6 +69,22 @@ session:
   night_fraction: 0.5
 
 # ── Stage 2: identity (reconcile.py) ─────────────────────────────────────────
+stitching:
+  # Short-gap tracklet stitching (tracklet_stitch.py) — joins a cow's track
+  # fragments across tracker dropouts, by position / size / timing only.
+  # Runs before the noise filter and every identity step. Calibrated on the
+  # June 16 sessions by cutting gaps into real long tracks: 90% of ≤3 s and
+  # 83% of 5–8 s dropouts rejoined, 1.4–3.4% wrong links.
+  enabled: true
+  max_gap_s: 8.5            # longest dropout bridged (last frame of A → first of B).
+                            # Shorter loses most 5–8 s dropouts; longer costs
+                            # short-gap recall to rival candidates
+  max_dist: 0.5             # max end→start distance, in box sizes (sqrt(w·h))
+  dist_per_s: 0.05          # + this many box sizes per second of gap
+  end_window_s: 1.0         # end/start position = median over this much of the track
+  max_size_ratio: 1.5       # larger/smaller box size at the two ends
+  ambiguity_margin: 0.15    # skip a link if a rival for the same end/start costs within this
+
 noise_filter:
   # Noise-level temp_ids are dropped right after reconcile loads raw_tracks,
   # before every identity step (kinetic, cosine, galleries, boundary, timeline).

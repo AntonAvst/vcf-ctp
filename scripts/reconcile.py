@@ -49,6 +49,7 @@ from vision_features.schema import EMBED_DIM
 
 import config
 import kinetic_match
+import tracklet_stitch
 
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
@@ -206,6 +207,19 @@ CREATE TABLE IF NOT EXISTS manual_assignments (
     UNIQUE(session_id, temp_id)
 );
 
+CREATE TABLE IF NOT EXISTS tracklet_stitches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL,
+    loser_tid   INTEGER NOT NULL,   -- raw temp_id renamed by stitching
+    root_tid    INTEGER NOT NULL,   -- temp_id it now carries (first fragment of the chain)
+    prev_tid    INTEGER NOT NULL,   -- the fragment it was linked to directly
+    gap_s       REAL,               -- prev's last frame → loser's first frame
+    dist        REAL,               -- end→start distance in box sizes
+    size_ratio  REAL,
+    created_dt  TEXT,
+    UNIQUE(session_id, loser_tid)
+);
+
 CREATE TABLE IF NOT EXISTS temp_id_merges (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id    TEXT    NOT NULL,
@@ -360,6 +374,61 @@ def raw_tracks_optional_select(conn: sqlite3.Connection, col: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tracklet stitching — join a cow's fragments across short tracker dropouts
+# (implementation in tracklet_stitch.py; this wrapper renames and records)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stitch_tracklets(tracks_df: pd.DataFrame, manual: dict, conn: sqlite3.Connection,
+                     session_id: str, dry_run: bool = False) -> tuple[pd.DataFrame, dict]:
+    """
+    Rename every stitched fragment to its chain's first temp_id.
+    Returns (tracks_df with renamed temp_ids, stitch_map {raw loser -> root}).
+
+    Records each link in tracklet_stitches, replacing this session's rows from
+    any earlier run. Every step that reads raw temp_ids straight from storage
+    must apply stitch_map itself: embeds (load_embeds_for_session), the
+    extractor (merge_map) and cross_camera.py's motion tier (via this table).
+    """
+    section("Tracklet Stitching")
+    res = tracklet_stitch.stitch(tracks_df, manual=manual)
+    n_before = tracks_df["temp_id"].nunique()
+    if res.tid_map:
+        tracks_df = tracks_df.copy()
+        tracks_df["temp_id"] = tracks_df["temp_id"].replace(res.tid_map)
+    log(f"{len(res.links)} links → {n_before} temp_ids become "
+        f"{tracks_df['temp_id'].nunique()} ({res.n_chains} multi-fragment chains); "
+        f"{res.n_candidates} candidate links, {res.n_ambiguous} skipped as ambiguous"
+        + (f", {res.n_manual_veto} vetoed by conflicting manual assignments"
+           if res.n_manual_veto else ""))
+    if res.links:
+        gaps = np.array([l.gap_s for l in res.links])
+        log(f"  gaps bridged: median {np.median(gaps):.2f} s, max {gaps.max():.2f} s")
+
+    if not dry_run:
+        conn.execute("DELETE FROM tracklet_stitches WHERE session_id = ?", (session_id,))
+        ts = pd.Timestamp.now().isoformat()
+        conn.executemany(
+            "INSERT INTO tracklet_stitches (session_id, loser_tid, root_tid, prev_tid, "
+            "gap_s, dist, size_ratio, created_dt) VALUES (?,?,?,?,?,?,?,?)",
+            [(session_id, int(l.next_tid), int(res.tid_map[l.next_tid]), int(l.prev_tid),
+              l.gap_s, l.dist, l.size_ratio, ts) for l in res.links])
+        conn.commit()
+    return tracks_df, {int(k): int(v) for k, v in res.tid_map.items()}
+
+
+def compose_tid_maps(first: dict, then: dict) -> dict:
+    """raw temp_id → final temp_id through two renames (stitching, then the
+    Duplicate Resolver's merges, which are keyed by post-stitch ids)."""
+    out = {}
+    for raw in set(first) | set(then):
+        mid = first.get(raw, raw)
+        final = then.get(mid, mid)
+        if final != raw:
+            out[raw] = final
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Noise filter — drop noise-level temp_ids before any identity step
 #
 # On the June 16 sessions roughly half of all temp_ids lasted under 5 s while
@@ -462,7 +531,8 @@ def kinetic_matcher(tracks_df: pd.DataFrame,
 
 def load_embeds_for_session(tracks_df: pd.DataFrame,
                              embed_parquet: str,
-                             session_id: str) -> pd.DataFrame:
+                             session_id: str,
+                             tid_map: dict | None = None) -> pd.DataFrame:
     """
     Returns DataFrame with columns [frame_index, temp_id, embed (np.ndarray
     shape 128), is_night (bool)]. Tries parquet first, falls back to an
@@ -477,6 +547,10 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
     kept_tids = set(tracks_df["temp_id"].unique())
 
     def _attach_mode(df: pd.DataFrame) -> pd.DataFrame:
+        # stored embeds carry raw temp_ids: rename stitched fragments first
+        if tid_map:
+            df = df.copy()
+            df["temp_id"] = df["temp_id"].replace(tid_map)
         # temp_ids removed upstream (noise filter) leave the embeds too
         df = df[df["temp_id"].isin(kept_tids)]
         df = df.merge(mode, on=["frame_index", "temp_id"], how="left")
@@ -1721,8 +1795,13 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     log(f"Camera mode: {night_frac*100:.1f}% of track rows night/IR "
         f"({'mixed — both galleries' if 0 < night_frac < 1 else modality_of(night_frac > 0.5) + ' only'})")
 
-    # ── Noise filter — before every identity step ─────────────────────────────
+    # ── Tracklet stitching, then noise filter — before every identity step ────
+    # Manual assignments are keyed by raw temp_ids (what display_tracks.py
+    # shows the operator); they veto conflicting stitches, then follow the rename.
     manual_assignment = load_manual_assignments(conn, args.session)
+    tracks_df, stitch_map = stitch_tracklets(tracks_df, manual_assignment, conn,
+                                             args.session, args.dry_run)
+    manual_assignment = {stitch_map.get(t, t): aid for t, aid in manual_assignment.items()}
     tracks_df, noise_tids = noise_filter(tracks_df, exempt_tids=set(manual_assignment))
     if tracks_df.empty:
         log("Every temp_id was filtered as noise — nothing to reconcile.")
@@ -1796,7 +1875,8 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     # by track_and_dump.py's EmbedWriter, so we pass the session directory —
     # load_embeds_for_session() globs *_part*.parquet within it.
     embed_parquet_path = str(dm.get_session_dir(args.session))
-    embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session)
+    embed_df = load_embeds_for_session(tracks_df, embed_parquet_path, args.session,
+                                       tid_map=stitch_map)
 
     # ── Gallery Builder ───────────────────────────────────────────────────────
     galleries = gallery_builder(
@@ -1875,7 +1955,16 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         )
 
     # ── update known_temp_ids ─────────────────────────────────────────────────
-    update_known_temp_ids(conn, full_assignment, args.session, args.dry_run)
+    # raw temp_id → final temp_id (stitching, then Duplicate Resolver merges).
+    # Everything that reads raw temp_ids from storage needs it.
+    raw_to_final = compose_tid_maps(stitch_map, merge_map)
+    # display_tracks.py shows raw temp_ids, so every raw fragment of an
+    # identified track is recorded under that identity, not just the survivor.
+    known_assignment = dict(full_assignment)
+    for raw, final in raw_to_final.items():
+        if final in full_assignment:
+            known_assignment[raw] = full_assignment[final]
+    update_known_temp_ids(conn, known_assignment, args.session, args.dry_run)
 
     # Duplicate Resolver deletes loser temp_ids from full_assignment (keeps only
     # {winner_tid: real_id}) — tracks_df still carries the losers' rows under
@@ -1918,7 +2007,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
             embed_parquet = embed_parquet_path,
             gallery_dir   = gallery_dir,
             dry_run       = args.dry_run,
-            merge_map     = merge_map,
+            merge_map     = raw_to_final,   # stitching + Duplicate Resolver, raw → final
         )
 
     # ── Timeline Writer — write to DB ─────────────────────────────────────────

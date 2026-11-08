@@ -117,6 +117,17 @@ class Session:
 
 
 @dataclass(frozen=True)
+class Stitching:
+    enabled: bool
+    max_gap_s: float
+    max_dist: float
+    dist_per_s: float
+    end_window_s: float
+    max_size_ratio: float
+    ambiguity_margin: float
+
+
+@dataclass(frozen=True)
 class NoiseFilter:
     min_duration_s: float
     min_detections: int
@@ -227,6 +238,7 @@ class Params:
     camera_mode: CameraMode
     timeline: Timeline
     session: Session
+    stitching: Stitching
     noise_filter: NoiseFilter
     kinetic_match: KineticMatch
     gallery: Gallery
@@ -416,6 +428,14 @@ def _validate_params(p: Params) -> None:
                      (p.session.night_end_hour, "session.night_end_hour")]:
         if not 0 <= h <= 23:
             raise ConfigError(f"{where}: must be 0..23, got {h}")
+
+    st = p.stitching
+    for name in ("max_gap_s", "max_dist", "dist_per_s", "end_window_s",
+                 "ambiguity_margin"):
+        if getattr(st, name) < 0:
+            raise ConfigError(f"stitching.{name}: must be >= 0, got {getattr(st, name)}")
+    if st.max_size_ratio < 1:
+        raise ConfigError(f"stitching.max_size_ratio: must be >= 1, got {st.max_size_ratio}")
 
     nf = p.noise_filter
     if nf.min_duration_s < 0:

@@ -178,6 +178,7 @@ Reconcile thresholds are no longer passed by `track_and_dump.py` — reconcile r
 
 | Step | Keys | Defaults |
 |---|---|---|
+| Tracklet Stitching | `stitching.enabled` / `max_gap_s` / `max_dist` / `dist_per_s` / `end_window_s` / `max_size_ratio` / `ambiguity_margin` | true / 8.5 / 0.5 / 0.05 / 1.0 / 1.5 / 0.15 |
 | Noise Filter | `noise_filter.min_duration_s` / `min_detections` | 2.0 / 25 |
 | Kinetic Matcher | `kinetic_match.corr_threshold` / `min_active_bins` / `min_temp_id_frames` / `activity_pct` | 0.7 / 3 / 0.10 / 0.25 |
 | Shared time grid | `timeline.bin_minutes` (matcher, Sensor Sequencer, vision windows) | 15 |
@@ -419,7 +420,8 @@ def parse(self, df_raw: pd.DataFrame, source_file: str) -> pd.DataFrame:
 | Name | Description | Legacy ID |
 |---|---|---|
 | **Collar Candidate Selector** | Given `session.start_dt` / `session.end_dt`, filter to AnimalIds with ΔKineticsCountR above threshold. Cows not in the pen are automatically excluded — no manual roster needed. | *(was Step 0)* |
-| **Noise Filter** | Drop noise-level temp_ids before any identity step: lasting < `noise_filter.min_duration_s` or with < `min_detections` rows. Manually assigned temp_ids are exempt. Dropped temp_ids leave tracks, embeds, and the extractor's pose galleries (TempPoseGallery would otherwise turn each into a match target for later sessions); rows stay in `raw_tracks`. On the June 16 sessions this removed 14–68% of temp_ids but 0.4–6% of detections — about 35–45% of short tracks are fragments of real cows' broken tracks, which short-gap stitching (when built) will join before this filter runs. | — |
+| **Tracklet Stitching** | Join a cow's track fragments across short tracker dropouts (`tracklet_stitch.py`), by position, box size and timing only — no appearance, so detector-independent. A link A → B needs B to start after A's last frame (never on screen together) within `max_gap_s`, A's end and B's start (median box centre over `end_window_s`) within `max_dist + dist_per_s × gap` box sizes, and similar box sizes. Greedy one-to-one by distance → chains; ambiguous links (a rival within `ambiguity_margin`) and links joining two different manual assignments are skipped. Each chain is renamed to its first temp_id; links are recorded in `tracklet_stitches`. Raw temp_ids read back from storage are renamed the same way (embeds, the extractor via `merge_map`, cross_camera's motion tier via the table, and `known_temp_ids` lists every raw fragment so display_tracks shows the id). Calibrated by cutting gaps into ~700 real long tracks with all other tracks left in place: 90% of ≤3 s and 83% of 5–8 s dropouts rejoined, 1.4–3.4% wrong links. Velocity extrapolation was tested and gave no gain. On June 16 it joined 716 fragments on cam26 (3,032 → 2,316 temp_ids) and 101 on cam33_6. | — |
+| **Noise Filter** | Drop noise-level temp_ids before any identity step (after stitching, so fragments get joined first): lasting < `noise_filter.min_duration_s` or with < `min_detections` rows. Manually assigned temp_ids are exempt. Dropped temp_ids leave tracks, embeds, and the extractor's pose galleries (TempPoseGallery would otherwise turn each into a match target for later sessions); rows stay in `raw_tracks`. On the June 16 sessions this removed 14–68% of temp_ids but 0.4–6% of detections. | — |
 | **Kinetic Matcher** | bbox centroid displacement ↔ ΔR · Pearson r · greedy one-to-one → temp_id ↔ AnimalId (`kinetic_match.py`, shared with `match_identity.py`) | *(was Step A)* |
 | **Manual Merge** | Load `manual_assignments` from DB; manual overrides kinetic on conflict | *(was Step A.5)* |
 | **Gallery Builder** | Group embeds by confirmed AnimalId → EMA mean → separate day/night galleries. Routes **per frame** on `raw_tracks.is_night` (the camera can switch mid-video): a temp_id seen on both sides of a switch updates both galleries, each with only its own frames and each gated by `min_embeds` separately. Never mixes modalities. | *(was Step B)* |
@@ -560,6 +562,11 @@ gallery_embed_new = α × mean(session_embeds_in_slot) + (1 − α) × gallery_e
 - Written by `cross_camera.py` only when two sessions on different cameras independently claim the same real_id for a pairing that isn't zone-consistent (a genuine conflict, not ordinary corroboration)
 - `needs_review` rows need a human — the confidence gap was too close to call automatically
 
+### `tracklet_stitches` — tracklet stitching log
+- One row per stitched fragment: session_id, loser_tid (raw temp_id that was renamed), root_tid (the chain's first temp_id, which it now carries), prev_tid (fragment it was linked to directly), gap_s, dist (box sizes), size_ratio, created_dt
+- UNIQUE(session_id, loser_tid); reconcile replaces a session's rows on every run
+- Read by cross_camera.py's motion tier to load every fragment of a track
+
 ### `temp_id_merges` — duplicate-claim log
 - session_id, winner_tid, loser_tid, real_id, winner_reason, loser_reason, merged_dt, action
 - Written by reconcile.py's Duplicate Resolver step when two temp_ids are assigned the same AnimalId
@@ -695,6 +702,7 @@ python3 drive_manager.py retry-buffer
     drive_manager.py                        # Drive I/O layer — import in all scripts
     reconcile.py
     kinetic_match.py                        # Kinetic Matcher — shared by reconcile.py and match_identity.py
+    tracklet_stitch.py                      # Tracklet Stitching — called by reconcile.py
     cross_camera.py                         # Boundary Rendezvous — called by reconcile.py, not standalone
     track_and_dump.py
     display_tracks.py
@@ -803,7 +811,8 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [x] Collapse match_identity.py and reconcile's inline correlation logic into one implementation — `kinetic_match.py`; `score_up_to()` and `kinetic_match.live_min_active_bins` removed (no callers). Old and new verified identical on cam26's real tracks (assignments, r, all 325 scored pairs).
 - [x] Move vision-feature constants into the config file, including CLI plumbing — `config/params.yaml` + `config/cli.yaml`, see Configuration
 - [ ] Move from strict hierarchical override to a fused confidence score once ≥3–4 matching signals exist, keeping manual as a hard override.
-- [ ] Short-gap tracklet stitching before Cosine Resolver — position-extrapolation-based merge of brief tracker dropouts, independent of detector type.
+- [x] Short-gap tracklet stitching — `tracklet_stitch.py`, runs before the noise filter and the Kinetic Matcher. Purely geometric; velocity extrapolation was tested and dropped (no gain).
+- [ ] **Kinetic Matcher is starved on this data.** Even after stitching, no track in the June 16 sessions spans 30 minutes (cam26: 8 tracks ≥ 15 min, 0 ≥ 30 min; cam33: 0–1 ≥ 15 min), while correlating against 15-minute collar bins with `min_active_bins: 3` needs a cow followed under one temp_id for ~45 minutes. Stitching joins only nearby-in-time fragments and can't close that. Needs a decision on how kinetics gets longer evidence per cow — e.g. chaining fragments within a session by appearance before kinetics, or scoring kinetics per bin and accumulating evidence across fragments instead of per-track correlation.
 - [x] Minimum-occurrence-count filter — reconcile's Noise Filter step (`noise_filter:` in params.yaml). Box size was tested as an extra criterion and dropped: short tracks aren't smaller than long ones on the June 16 data, so size belongs in a per-frame appearance weight instead.
 - [x] Config file for constants/thresholds — done in one pass, not incrementally (all scripts)
 - [ ] Configurable ID-matching hierarchy (e.g. manual > kinetic = cosine > ocr) with tie-break rules.
@@ -823,4 +832,5 @@ raw_data/videos/                            # LOCAL ONLY — never synced
   - [ ] Tracker mask-IoU — still box-IoU only (ByteTrack/BoT-SORT default); only worth escalating if ID-switch rate is still bad after the segmentation swap, per original plan
   - [ ] Coat-pattern fingerprinting
   - [ ] fp16/explicit-device optimization?
-  - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`): When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.
+  - [ ] **Collar data — handle overlapping files on upload** (`drive_manager.py` → `_cmd_upload_collar`):
+  - [ ] When two CSV files cover the same animals and overlapping time windows (e.g. an export was re-run with a wider date range), the current upload creates separate files on Drive with different names but partially duplicate data. Need to detect overlap on upload and decide a strategy — options include: merge rows and re-export as a single file with the combined time range, skip files whose entire window is already covered by an existing Drive file, or flag for manual review and skip. Overlapping files are identified by matching animal ID sets and intersecting `[s_timestamp, e_timestamp]` ranges parsed from the canonical filename.

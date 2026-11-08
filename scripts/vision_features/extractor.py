@@ -353,7 +353,7 @@ def run_vision_features(
     embed_parquet:     str | None = None,
     gallery_dir:       str        = "./reid_gallery",
     dry_run:           bool       = False,
-    merge_map:         dict | None = None,   # {loser_tid -> winner_tid} from Duplicate Resolver
+    merge_map:         dict | None = None,   # {raw temp_id -> final}: stitching + Duplicate Resolver
 ) -> pd.DataFrame:
     """
     Stage 2-B: Vision Feature Extraction.
@@ -405,11 +405,6 @@ def run_vision_features(
     # ── Load kps data ─────────────────────────────────────────────────────────
     kps_df = load_kps_for_session(session_id, kps_parquet, conn,
                                   fallback_is_night=fallback_is_night)
-    if exclude_tids and not kps_df.empty:
-        before = len(kps_df)
-        kps_df = kps_df[~kps_df["temp_id"].isin(exclude_tids)].reset_index(drop=True)
-        log(f"  Noise filter: removed {before - len(kps_df)} rows of "
-            f"{len(exclude_tids)} dropped temp_ids")
     n_night = int(kps_df["is_night"].sum()) if not kps_df.empty else 0
     if not kps_df.empty:
         log(f"  Camera mode: {len(kps_df) - n_night} day rows, {n_night} night rows")
@@ -417,19 +412,31 @@ def run_vision_features(
         log("No kps data available — vision columns will remain NULL.")
         return timeline_df
 
-    # Duplicate Resolver (resolve_duplicate_assignments) deletes loser temp_ids from
-    # `assignment` — it only keeps {winner_tid: real_id}. kps_df still has
-    # the losers' rows under their original temp_id, so without this remap
-    # `kps_df["temp_id"].map(assignment)` below would silently classify every
-    # merged-but-losing fragment as unresolved (NaN real_id), dropping it from
-    # the timeline/gallery even though Duplicate Resolver already decided it belongs to
-    # the same animal. Mirrors the equivalent embed_df remap in reconcile.py.
-    if merge_map:
+    # merge_map renames raw temp_ids to the ids reconcile ended up using:
+    # tracklet stitching (fragment → its chain's first temp_id), then the
+    # Duplicate Resolver (merged loser → winner). kps_df is read from storage
+    # under raw temp_ids, so without this `kps_df["temp_id"].map(assignment)`
+    # below would treat every renamed fragment as unresolved, dropping it from
+    # the timeline/gallery. Mirrors the embed_df rename in reconcile.py.
+    if merge_map and not kps_df.empty:
         n_remapped = int(kps_df["temp_id"].isin(merge_map.keys()).sum())
         if n_remapped:
-            log(f"  Remapping {n_remapped} rows from {len(merge_map)} "
-                f"merged (loser→winner) temp_id(s) before identity lookup")
+            log(f"  Renaming {n_remapped} rows from {len(merge_map)} stitched/merged "
+                f"temp_id(s) before identity lookup")
             kps_df["temp_id"] = kps_df["temp_id"].replace(merge_map)
+
+    # Noise filter AFTER the rename: exclude_tids are post-stitch ids.
+    if exclude_tids and not kps_df.empty:
+        before = len(kps_df)
+        kps_df = kps_df[~kps_df["temp_id"].isin(exclude_tids)].reset_index(drop=True)
+        log(f"  Noise filter: removed {before - len(kps_df)} rows of "
+            f"{len(exclude_tids)} dropped temp_ids")
+        if kps_df.empty:
+            log("No kps rows left after the noise filter — vision columns will remain NULL.")
+            # still replace this session's temp-gallery entries from earlier runs
+            _save_temp_galleries(_purged_temp_galleries(session_id, gallery_dir),
+                                 gallery_dir, dry_run)
+            return timeline_df
 
     # ── Per-frame extraction (all temp_ids — no identity filter yet) ─────────
     log(f"Running per-frame extractors on all {len(kps_df)} rows "
@@ -535,6 +542,28 @@ def run_vision_features(
 # Pose gallery update (internal)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _purged_temp_galleries(session_id: str, gallery_dir: str) -> dict:
+    """Both modalities' TempPoseGalleries with this session's entries removed.
+    A run replaces its own entries rather than adding to them — including
+    entries left in the other modality's file by an earlier run whose
+    day/night labelling differed, and entries of temp_ids that this run
+    renamed (stitching) or dropped (noise filter)."""
+    temp_galleries = {m: TempPoseGallery.load(gallery_dir, m) for m in ("day", "night")}
+    for m, tg in temp_galleries.items():
+        purged = tg.delete_session(session_id)
+        if purged:
+            log(f"  TempPoseGallery[{m}]: purged {len(purged)} entries from an "
+                f"earlier run of this session")
+    return temp_galleries
+
+
+def _save_temp_galleries(temp_galleries: dict, gallery_dir: str, dry_run: bool) -> None:
+    if dry_run:
+        return
+    for m, tg in temp_galleries.items():
+        tg.save(gallery_dir, m)
+
+
 def _update_pose_gallery(
     session_id:    str,
     camera_id:     str,
@@ -545,7 +574,7 @@ def _update_pose_gallery(
     ema_alpha:     float,
     min_slot_conf: float,
     dry_run:       bool,
-    merge_map:     dict | None = None,   # {loser_tid -> winner_tid} from Duplicate Resolver
+    merge_map:     dict | None = None,   # {raw temp_id -> final}: stitching + Duplicate Resolver
 ) -> None:
     """
     Update both pose galleries after feature extraction:
@@ -600,6 +629,8 @@ def _update_pose_gallery(
     )
     if merged.empty:
         log("  No rows after merging embeds with kps labels — gallery update skipped.")
+        _save_temp_galleries(_purged_temp_galleries(session_id, gallery_dir),
+                             gallery_dir, dry_run)
         return
 
     log(f"  {len(merged)} frames available for slot assignment "
@@ -613,17 +644,10 @@ def _update_pose_gallery(
     if merge_map:
         resolved_tids |= set(int(t) for t in merge_map.keys())
 
-    # Both modalities' temp galleries are always loaded: this session's old
-    # entries are purged from BOTH first, so a re-run replaces them — including
-    # entries left in the other modality's file by an earlier run whose
-    # day/night labelling differed (e.g. the old clock-based rule).
+    # Both modalities' temp galleries are always loaded, with this session's
+    # old entries purged from both first (see _purged_temp_galleries).
     pose_galleries = {}
-    temp_galleries = {m: TempPoseGallery.load(gallery_dir, m) for m in ("day", "night")}
-    for m, tg in temp_galleries.items():
-        purged = tg.delete_session(session_id)
-        if purged:
-            log(f"  TempPoseGallery[{m}]: purged {len(purged)} entries from an "
-                f"earlier run of this session")
+    temp_galleries = _purged_temp_galleries(session_id, gallery_dir)
 
     for is_night_val, mdf in merged.groupby("is_night"):
         modality = "night" if bool(is_night_val) else "day"

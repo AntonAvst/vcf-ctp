@@ -438,13 +438,27 @@ def match_tier(
 # Tier 3 — motion-magnitude correlation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _track_fragments(conn: sqlite3.Connection, session_id: str, temp_id: int) -> list[int]:
+    """Raw temp_ids that make up temp_id: itself plus every fragment
+    reconcile.py's tracklet stitching renamed to it (tracklet_stitches)."""
+    try:
+        rows = conn.execute(
+            "SELECT loser_tid FROM tracklet_stitches WHERE session_id = ? AND root_tid = ?",
+            (session_id, int(temp_id)),
+        ).fetchall()
+    except sqlite3.OperationalError:      # DB from before stitching existed
+        rows = []
+    return [int(temp_id)] + [int(r[0]) for r in rows]
+
+
 def _load_track(conn: sqlite3.Connection, session_id: str, temp_id: int) -> pd.DataFrame:
-    """All raw_tracks rows for one track, with frame_datetime parsed.
-    Columns: t (Timestamp), cx, cy, h."""
+    """All raw_tracks rows for one track — including its stitched fragments —
+    with frame_datetime parsed. Columns: t (Timestamp), cx, cy, h."""
+    tids = _track_fragments(conn, session_id, temp_id)
     rows = conn.execute(
         "SELECT frame_datetime, x1, y1, x2, y2 FROM raw_tracks "
-        "WHERE session_id = ? AND temp_id = ?",
-        (session_id, int(temp_id)),
+        f"WHERE session_id = ? AND temp_id IN ({','.join('?' * len(tids))})",
+        (session_id, *tids),
     ).fetchall()
     if not rows:
         return pd.DataFrame(columns=["t", "cx", "cy", "h"])
