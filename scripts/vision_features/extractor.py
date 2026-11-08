@@ -389,6 +389,8 @@ def _run_vision_features(
     provenance:        dict | None = None,     # {temp_id -> source}: gallery contribution
                                                 # ledger weighting (gallery_ledger.py);
                                                 # missing/unknown temp_ids default to "cosine"
+    cosine_ok:         set | None = None,      # (temp_id, modality) cosine ids allowed to update
+                                                # the gallery (reconcile's margin gate); None = all
     fallback_is_night: bool       = False,     # only for legacy rows with NULL is_night
     exclude_tids:      set | None = None,      # temp_ids reconcile's noise filter dropped
     frame_size:        tuple | None = None,    # (frame_w, frame_h) px for the edge check
@@ -584,6 +586,7 @@ def _run_vision_features(
             embed_parquet= embed_parquet,
             assignment   = assignment,
             provenance   = provenance or {},
+            cosine_ok    = cosine_ok,
             pose_ledger  = pose_ledger,
             gallery_dir  = gallery_dir,
             ema_alpha    = ema_alpha,
@@ -630,6 +633,7 @@ def _update_pose_gallery(
     embed_parquet: str,
     assignment:    dict,            # {temp_id -> real_id} — resolved only
     provenance:    dict,            # {temp_id -> source} — gallery contribution ledger weighting
+    cosine_ok:     set | None,      # (temp_id, modality) cosine ids that passed the margin gate
     pose_ledger,                    # gallery_ledger.SessionCommit for 'pose' (see run_vision_features)
     gallery_dir:   str,
     ema_alpha:     float,
@@ -758,6 +762,9 @@ def _update_pose_gallery(
             weight = getattr(sw, source)
             if weight <= 0:
                 continue
+            if (source == "cosine" and cosine_ok is not None
+                    and (int(tid), modality) not in cosine_ok):
+                continue   # kept out of the flat gallery by the margin gate → pose too
             for slot_idx, slot_embed in slot_embeds.items():
                 res = pose_ledger.record(
                     real_id=real_id, modality=modality, slot_idx=slot_idx, source=source,

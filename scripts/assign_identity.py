@@ -46,6 +46,7 @@ from pathlib import Path
 # Drive I/O layer
 from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableError
 import config
+import identity_record
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,24 +174,13 @@ def get_cow_registry_ids(conn: sqlite3.Connection) -> set:
     return {int(r[0]) for r in rows}
 
 
-def get_kinetic_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
-    """Return temp_ids already kinetically confirmed in reid_registry for this session."""
-    rows = conn.execute(
-        "SELECT known_temp_ids FROM reid_registry WHERE match_method = 'kinetic'"
-    ).fetchall()
-    result = {}
-    import json
-    for row in rows:
-        if not row["known_temp_ids"]:
-            continue
-        try:
-            entries = json.loads(row["known_temp_ids"])
-            for e in entries:
-                if e.get("session_id") == session_id:
-                    result[int(e["temp_id"])] = row["real_id"] if "real_id" in row.keys() else None
-        except Exception:
-            pass
-    return result
+def get_reconciled_assignments(conn: sqlite3.Connection, session_id: str) -> dict:
+    """{temp_id -> (real_id, source)} from this session's last reconcile run
+    (session_assignments, own rows only), excluding manual ids — the ids a
+    new manual assignment would override."""
+    identity_record.ensure(conn, log=log)
+    return {tid: v for tid, v in identity_record.session_map(
+                conn, session_id, own_only=True).items() if v[1] != "manual"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,7 +281,7 @@ def remove_assignments(conn: sqlite3.Connection,
 def validate_pairs(pairs: dict,
                    session_temp_ids: set,
                    registry_ids: set,
-                   kinetic_assignment: dict) -> None:
+                   reconciled: dict) -> None:
     """Warn (not error) on suspicious assignments."""
     for tid, aid in pairs.items():
         if tid not in session_temp_ids:
@@ -300,9 +290,11 @@ def validate_pairs(pairs: dict,
         if registry_ids and aid not in registry_ids:
             log(f"  WARNING: real_id {aid} not in cow_registry "
                 f"— animal may not be registered yet (will still be written)")
-        if tid in kinetic_assignment:
-            log(f"  WARNING: temp_id {tid} already has a kinetic assignment "
-                f"(→ {kinetic_assignment[tid]}) — manual will override it")
+        if tid in reconciled:
+            rid, source = reconciled[tid]
+            if rid != aid:
+                log(f"  WARNING: temp_id {tid} has a {source} id (→ {rid}) from the last "
+                    f"reconcile run — manual will override it")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,8 +380,8 @@ def main() -> None:
     # validate (warns only, never blocks)
     session_temp_ids  = get_session_temp_ids(conn, args.session)
     registry_ids      = get_cow_registry_ids(conn)
-    kinetic_assignment = get_kinetic_assignments(conn, args.session)
-    validate_pairs(pairs, session_temp_ids, registry_ids, kinetic_assignment)
+    reconciled = get_reconciled_assignments(conn, args.session)
+    validate_pairs(pairs, session_temp_ids, registry_ids, reconciled)
 
     # write
     section("Writing assignments")

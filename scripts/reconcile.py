@@ -56,6 +56,7 @@ import kinetic_match
 import tracklet_stitch
 import appearance_quality
 import gallery_ledger
+import identity_record
 from appearance_quality import effective_frames
 
 # Drive I/O layer
@@ -172,9 +173,13 @@ CREATE TABLE IF NOT EXISTS reid_registry (
     gallery_conf_night    REAL    DEFAULT 0.0,
     last_updated_day_dt   TEXT,
     last_updated_night_dt TEXT,
-    known_temp_ids        TEXT,   -- JSON list of {session_id, temp_id} objects
+    known_temp_ids        TEXT,   -- DEPRECATED, no longer written: see session_assignments
+                                  -- (identity_record.py); kept so old DBs still open
     first_seen_dt         TEXT,
-    match_method          TEXT    -- 'kinetic' | 'cosine_day' | 'cosine_night'
+    match_method          TEXT    -- best source that ever identified the cow (upgrade-only):
+                                  -- manual | kinetic | boundary_rendezvous | cosine;
+                                  -- 'synthetic' for synthetic ids; older rows may hold
+                                  -- 'cosine_day' / 'cosine_night' (= cosine)
 );
 
 CREATE TABLE IF NOT EXISTS resolved_cow_timeline (
@@ -728,7 +733,7 @@ def preview_galleries(embed_df: pd.DataFrame, confirmed: dict,
 
 def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                      conn: sqlite3.Connection, gallery_dir: str, session_id: str,
-                     dry_run: bool = False) -> dict:
+                     dry_run: bool = False) -> tuple[dict, set | None]:
     """
     The run's single flat-gallery update, after the Cosine Resolver,
     Boundary Rendezvous and Duplicate Resolver have settled every temp_id's id
@@ -748,6 +753,17 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     Item 10: each contributing track is also checked for a two-group split
     (appearance_quality.mean_embed_report) and flagged in id_switch_flags —
     for review only, nothing is changed automatically.
+
+    Item 9 (gallery.cosine_gate): a cosine id contributes only if the track's
+    mean is at least cosine_resolver.threshold + threshold_margin from the
+    cow's vector AND beats every other cow by second_best_margin. Vectors are
+    as they stand for this run (gallery_ledger.SessionCommit.reference): other
+    sessions plus this run's manual / kinetic / boundary ids, which are
+    committed first, never this session's earlier runs.
+
+    Returns (galleries, cosine_ok): cosine_ok is the set of (temp_id,
+    modality) cosine ids allowed to update the galleries — the pose update
+    in the Vision Feature Extractor follows it — or None when the gate is off.
     """
     section("Gallery commit")
     P = config.params()
@@ -755,12 +771,19 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     galleries = {m: load_gallery(gallery_dir, m) for m in MODALITIES}
     ledger = gallery_ledger.SessionCommit(conn, session_id, "flat", dry_run=dry_run)
     gallery_ledger.clear_id_switch_flags(conn, session_id, dry_run=dry_run)
+    gate = gp.cosine_gate
+    cosine_ok: set | None = set() if gate.enabled else None
     counts: dict = {}
     held: dict = {}
+    gated: dict = {}
     touched: set = set()
+    # manual / kinetic / boundary first, so cosine ids are gated against
+    # galleries that already include this run's confirmed ids
+    order = sorted(assignment.items(), key=lambda kv: provenance.get(kv[0], "cosine") == "cosine")
     for modality, mdf in split_by_modality(embed_df).items():
         gallery = galleries[modality]
-        for tid, aid in assignment.items():
+        refs = None   # {real_id -> reference vector}, built at the first cosine id
+        for tid, aid in order:
             if is_synthetic(aid):
                 continue
             source = provenance.get(tid, "cosine")
@@ -786,6 +809,37 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                     f"frames) — flagged for review, nothing changed")
                 gallery_ledger.flag_id_switch(conn, session_id, tid, aid, modality,
                                               report, dry_run=dry_run)
+
+            if source == "cosine" and gate.enabled:
+                if refs is None:
+                    cand = ledger.known_ids(modality) | {r for r in gallery if r > 0}
+                    refs = {r: v for r in cand
+                            if (v := ledger.reference(r, modality, fallback=gallery.get(r)))
+                            is not None}
+                own = refs.get(aid)
+                score = float(report.vector @ own) if own is not None else None
+                rival_id, rival = None, None
+                for r, v in refs.items():
+                    if r != aid:
+                        c = float(report.vector @ v)
+                        if rival is None or c > rival:
+                            rival_id, rival = r, c
+                need = P.cosine_resolver.threshold + gate.threshold_margin
+                if score is None:
+                    why = "cow has no gallery vector to check against"
+                elif score < need:
+                    why = f"cosine {score:.3f} < {need:.3f}"
+                elif rival is not None and score - rival < gate.second_best_margin:
+                    why = (f"cosine {score:.3f} only {score - rival:.3f} above AnimalId "
+                           f"{rival_id} ({rival:.3f}); need {gate.second_best_margin}")
+                else:
+                    why = None
+                if why:
+                    log(f"  [{modality}] AnimalId {aid} (t{tid}, cosine): not used for the "
+                        f"gallery — {why}")
+                    gated[modality] = gated.get(modality, 0) + 1
+                    continue
+                cosine_ok.add((int(tid), modality))
 
             existing = get_reid_row(conn, aid) or {}
             res = ledger.record(
@@ -817,13 +871,12 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                 + (" [approved earlier]" if res.carried_decision else ""))
             counts[(modality, source)] = counts.get((modality, source), 0) + 1
             if not dry_run:
-                method = ("kinetic" if source in ("manual", "kinetic")
-                          else f"cosine_{modality}" if source == "cosine" else source)
+                # match_method is set once per run from session_assignments'
+                # sources (identity_record.upgrade_match_methods), not here
                 upsert_reid(conn, aid, {
                     f"gallery_embed_{modality}": json.dumps(res.vector_after.tolist()),
                     f"gallery_n_{modality}":     res.n_contributions,
                     f"last_updated_{modality}_dt": pd.Timestamp.now().isoformat(),
-                    "match_method": method,
                 })
 
     # Cows this session contributed to on an earlier run but not on this one
@@ -851,10 +904,13 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     if held:
         log("Not applied (held/rejected): "
             + ", ".join(f"{m}/{src}={n}" for (m, src), n in sorted(held.items())))
+    if gated:
+        log("Cosine ids kept out of the gallery by the margin gate: "
+            + ", ".join(f"{m}={n}" for m, n in sorted(gated.items())))
     if not dry_run:
         for m in {m for (_, m) in touched}:
             save_gallery(gallery_dir, m, galleries[m])
-    return galleries
+    return galleries, cosine_ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -976,6 +1032,7 @@ def cosine_resolver(
     session_id: str,
     camera_id: str = "cam0",
     dry_run: bool = False,
+    foreign_links: list | None = None,   # out: [(other_session_id, other_temp_id, id)]
 ) -> tuple[dict, dict]:
     """
     Resolve unconfirmed temp_ids via cosine similarity.
@@ -983,6 +1040,9 @@ def cosine_resolver(
     Returns (merged_assignment, cosine_scores): cosine_scores is
     {temp_id -> score}, parallel to the cosine-resolved subset of
     merged_assignment — added for Boundary Rendezvous (cross_camera.py).
+    When a synthetic id is minted for a pair, the OTHER session's temp_id is
+    appended to foreign_links; reconcile records it in session_assignments
+    (identity_record.py) together with this session's own rows.
 
     Query order per unresolved temp_id:
       1. Flat real_id gallery        — confirmed identities across all sessions
@@ -1225,7 +1285,7 @@ def cosine_resolver(
             # session_id above). Its temp_id number means nothing in this
             # session's dicts, and it is not a real_id, so look up any id it
             # already has by (session_id, temp_id) — in this run first, then
-            # in reid_registry.known_temp_ids.
+            # in session_assignments.
             foreign = (match_key.session_id, int(match_key.temp_id))
             matched_sid = foreign_ids.get(foreign)
             if matched_sid is None:
@@ -1242,22 +1302,19 @@ def cosine_resolver(
             else:
                 # Mint a new synthetic id for this pair. Only THIS session's
                 # temp_id goes into cosine_assignment; the other session's
-                # temp_id is linked through reid_registry.known_temp_ids below.
+                # temp_id is recorded as a link row in session_assignments.
                 new_synth = mint_synthetic_id(gallery_dir)
                 cosine_assignment[tid] = new_synth
                 cosine_scores[tid]     = float(t_cos)
                 foreign_ids[foreign]   = new_synth
                 aid_claims.setdefault(new_synth, []).append((tid, tid_frames.get(tid, np.array([]))))
+                if foreign_links is not None:
+                    foreign_links.append((match_key.session_id, int(match_key.temp_id), new_synth))
                 # Register synthetic id in reid_registry
                 if not dry_run:
-                    ts = pd.Timestamp.now().isoformat()
                     upsert_reid(conn, new_synth, {
                         "match_method":  "synthetic",
-                        "first_seen_dt": ts,
-                        "known_temp_ids": json.dumps([
-                            {"session_id": session_id,       "temp_id": int(tid)},
-                            {"session_id": match_key.session_id, "temp_id": match_key.temp_id},
-                        ]),
+                        "first_seen_dt": pd.Timestamp.now().isoformat(),
                     })
                 log(f"  t{tid} + {match_key} → NEW synthetic_id {new_synth}  "
                     f"({mode} temp cosine={t_cos:.3f})")
@@ -1565,10 +1622,6 @@ def write_timeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Update known_temp_ids in reid_registry
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Assignment provenance
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1614,47 +1667,13 @@ def _pair_conflict(frames_a: np.ndarray, boxes_a, frames_b: np.ndarray, boxes_b,
 
 def find_real_id_for_temp(conn: sqlite3.Connection, session_id: str,
                           temp_id: int):
-    """The id (real or synthetic) already recorded for a temp_id of a given
-    session, looked up through reid_registry.known_temp_ids. None if none.
+    """The id (real or synthetic) on record for a temp_id of a given session
+    (session_assignments — identity_record.lookup). None if none.
 
     temp_ids are per-session counters, so a temp_id is only meaningful
     together with its session_id, and it is never a real_id itself.
     """
-    rows = conn.execute(
-        "SELECT real_id, known_temp_ids FROM reid_registry "
-        "WHERE known_temp_ids IS NOT NULL"
-    ).fetchall()
-    target = {"session_id": session_id, "temp_id": int(temp_id)}
-    for row in rows:
-        try:
-            known = json.loads(row[1] or "[]")
-        except Exception:
-            continue
-        if target in known:
-            return row[0]
-    return None
-
-
-def update_known_temp_ids(conn: sqlite3.Connection,
-                           assignment: dict,
-                           session_id: str,
-                           dry_run: bool = False) -> None:
-    """Append {session_id, temp_id} entries to reid_registry.known_temp_ids."""
-    if dry_run:
-        return
-    for tid, aid in assignment.items():
-        existing = get_reid_row(conn, aid)
-        if existing is None:
-            continue
-        raw = existing.get("known_temp_ids") or "[]"
-        try:
-            known = json.loads(raw)
-        except Exception:
-            known = []
-        entry = {"session_id": session_id, "temp_id": int(tid)}
-        if entry not in known:
-            known.append(entry)
-        upsert_reid(conn, aid, {"known_temp_ids": json.dumps(known)})
+    return identity_record.lookup(conn, session_id, temp_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1872,6 +1891,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     conn = init_db(str(db_local))
     migrate_timeline_schema(conn)
     gallery_ledger.migrate_schema(conn)
+    identity_record.ensure(conn, log=log)
 
 
     # ── load tracks from SQLite ───────────────────────────────────────────────
@@ -1995,6 +2015,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
 
     # ── Cosine Resolver ───────────────────────────────────────────────────────
     merge_map = {}   # populated by Duplicate Resolver below
+    foreign_links: list = []   # other sessions' temp_ids tied to a synthetic id this run
     full_assignment, cosine_scores = cosine_resolver(
         tracks_df          = tracks_df,
         embed_df           = embed_df,
@@ -2005,6 +2026,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         session_id         = args.session,
         camera_id          = camera_id,
         dry_run            = args.dry_run,
+        foreign_links      = foreign_links,
     )
 
     # ── Boundary Rendezvous — triggered cross-camera reconcile ───────────────
@@ -2052,20 +2074,30 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     if merge_map and not embed_df.empty:
         embed_df_final = embed_df.copy()
         embed_df_final["temp_id"] = embed_df_final["temp_id"].replace(merge_map)
-    commit_galleries(embed_df_final, full_assignment, provenance, conn,
-                     gallery_dir, session_id=args.session, dry_run=args.dry_run)
+    _, cosine_ok = commit_galleries(embed_df_final, full_assignment, provenance, conn,
+                                    gallery_dir, session_id=args.session, dry_run=args.dry_run)
 
-    # ── update known_temp_ids ─────────────────────────────────────────────────
+    # ── Identity record — session_assignments (identity_record.py) ───────────
     # raw temp_id → final temp_id (stitching, then Duplicate Resolver merges).
     # Everything that reads raw temp_ids from storage needs it.
     raw_to_final = compose_tid_maps(stitch_map, merge_map)
-    # display_tracks.py shows raw temp_ids, so every raw fragment of an
-    # identified track is recorded under that identity, not just the survivor.
-    known_assignment = dict(full_assignment)
-    for raw, final in raw_to_final.items():
-        if final in full_assignment:
-            known_assignment[raw] = full_assignment[final]
-    update_known_temp_ids(conn, known_assignment, args.session, args.dry_run)
+    # Replaces every row this session wrote before. display_tracks.py shows
+    # raw temp_ids, so every raw fragment of an identified track gets a row.
+    n_rows = identity_record.write_session(
+        conn, args.session, full_assignment, provenance, raw_to_final,
+        links=foreign_links, dry_run=args.dry_run)
+    log(f"session_assignments: {n_rows} row(s) for this session"
+        + (f" ({len(foreign_links)} link(s) to other sessions)" if foreign_links else "")
+        + (" [dry_run]" if args.dry_run else ""))
+    # match_method = best source that has ever identified the cow (upgrade-only)
+    best_source: dict = {}
+    for tid, aid in full_assignment.items():
+        src = provenance.get(tid, "cosine")
+        if aid not in best_source or (identity_record.method_rank(src)
+                                      < identity_record.method_rank(best_source[aid])):
+            best_source[aid] = src
+    for rid, old, new in identity_record.upgrade_match_methods(conn, best_source, args.dry_run):
+        log(f"  match_method AnimalId {rid}: {old or '(new)'} → {new}")
 
     # Duplicate Resolver deletes loser temp_ids from full_assignment (keeps only
     # {winner_tid: real_id}) — tracks_df still carries the losers' rows under
@@ -2098,6 +2130,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         conn          = conn,
         assignment    = full_assignment,
         provenance    = provenance,   # {temp_id -> source} — gallery contribution ledger weighting
+        cosine_ok     = cosine_ok,    # cosine ids that passed the gallery margin gate (None = gate off)
         fallback_is_night = fallback_is_night,   # only for NULL (legacy) rows
         exclude_tids  = noise_tids,
         frame_size    = frame_size,

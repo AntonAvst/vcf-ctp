@@ -142,6 +142,18 @@ gallery:
                                 # commit, the stored vector is seeded as one 'legacy' row
                                 # with this many effective frames (source weight 1.0),
                                 # so it isn't replaced by a single session
+  cosine_gate:
+    # A cosine id (appearance self-match) only updates the galleries when it is
+    # clearly this cow (ToDo item 9). Checked at the Gallery commit per track and
+    # camera mode, on the track's robust session mean against each cow's flat
+    # vector as it stands without this session's earlier runs; the pose slots
+    # follow the flat decision. The id is assigned either way. Passing ids still
+    # update at source_weights.cosine. To cut cosine off from the galleries
+    # entirely, set source_weights.cosine: 0 instead.
+    enabled: true
+    threshold_margin: 0.05     # cosine to the cow ≥ cosine_resolver.threshold + this
+    second_best_margin: 0.10   # ... and ≥ best other cow's cosine + this
+                               # PROVISIONAL: calibrate on kinetically confirmed tracks
 
 appearance_quality:
   # Per-frame weight for every step that reads APPEARANCE (gallery means, cosine

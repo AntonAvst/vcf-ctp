@@ -482,6 +482,7 @@ def backpropagate_resolution(
         reid_registry           (real_id PK — delete synthetic, upsert real)
         temp_id_merges          (real_id column)
         manual_assignments      (real_id column)
+        session_assignments     (real_id column — identity_record.py)
 
     Returns number of timeline rows updated.
     """
@@ -512,6 +513,10 @@ def backpropagate_resolution(
     )
     conn.execute(
         "UPDATE manual_assignments SET real_id = ? WHERE real_id = ?",
+        (real_id, synthetic_id)
+    )
+    conn.execute(
+        "UPDATE session_assignments SET real_id = ? WHERE real_id = ?",
         (real_id, synthetic_id)
     )
 

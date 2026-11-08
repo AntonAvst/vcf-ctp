@@ -35,6 +35,7 @@ from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableErr
 # session_id derivation — single source of truth, shared with track_and_dump.py
 from track_and_dump import parse_filename, make_session_id
 import config
+import identity_record
 
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
@@ -982,15 +983,12 @@ def main():
                 "SELECT temp_id,real_id FROM manual_assignments WHERE session_id=?",
                 (args.session_id,)).fetchall():
             assignment[int(tid)]=int(aid)
-        for real_id,kj in conn.execute(
-                "SELECT real_id,known_temp_ids FROM reid_registry WHERE known_temp_ids IS NOT NULL"
-                ).fetchall():
-            try:
-                for e in json.loads(kj):
-                    if e.get("session_id")==args.session_id:
-                        tid=int(e["temp_id"])
-                        if tid not in assignment: assignment[tid]=int(real_id)
-            except: pass
+        # ids from the last reconcile run (session_assignments, one per raw
+        # temp_id); manual assignments above win. Local copy only: ensure()
+        # just creates/backfills the table if reconcile hasn't run since it existed.
+        identity_record.ensure(conn, log=log)
+        for tid,(aid,_src) in identity_record.session_map(conn,args.session_id).items():
+            if tid not in assignment: assignment[tid]=int(aid)
         conn.close()
         if assignment:
             log("Assignments: "+", ".join(f"t{t}->{a}" for t,a in sorted(assignment.items())))

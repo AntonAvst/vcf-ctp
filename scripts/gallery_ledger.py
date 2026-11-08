@@ -270,6 +270,9 @@ class SessionCommit:
         self.now = now or pd.Timestamp.now()
         self.recorded: set = set()
         self.finished = False
+        # per key, this run's not-excluded contributions as rebuild extras:
+        # its own active row, plus (dry run) a legacy seed it didn't store
+        self._run_extras: dict = {}
 
         rows = conn.execute(
             "SELECT real_id, modality, slot_idx, status, reviewed_dt "
@@ -354,15 +357,43 @@ class SessionCommit:
             conn.commit()
         self.recorded.add(key)
 
+        run_extras = list(extras)
         if status != "active":
             vec_after, n_after = prior, prior_n
         else:
+            run_extras.append((vector, float(source_weight), float(n_effective_frames), 0.0))
             vec_after, n_after, _ = rebuild_vector(
                 conn, *key[:2], g, key[2], as_of=self.now, exclude_session=sid,
-                extras=extras + [(vector, float(source_weight), float(n_effective_frames), 0.0)])
+                extras=run_extras)
+        self._run_extras[key] = run_extras
         return ContributionResult(status=status, drift=drift, vector_after=vec_after,
                                   n_contributions=n_after, seeded_legacy=seeded,
                                   carried_decision=carried[0] if carried else None, note=note)
+
+    def reference(self, real_id: int, modality: str, slot_idx: int = FLAT_SLOT,
+                  fallback: np.ndarray | None = None) -> np.ndarray | None:
+        """The cow's vector as it stands for THIS run: every other session's
+        active rows plus whatever this run has recorded so far, never this
+        session's rows from earlier runs (a re-run must not be judged against
+        a vector built from itself). `fallback` — the vector the gallery file
+        holds — is used only for a pre-ledger key with no rows at all."""
+        key = (int(real_id), modality, int(slot_idx))
+        vec, _, _ = rebuild_vector(self.conn, *key[:2], self.gallery, key[2], as_of=self.now,
+                                   exclude_session=self.session_id,
+                                   extras=self._run_extras.get(key))
+        if vec is None and fallback is not None and key not in self.old_keys \
+                and key not in self._run_extras \
+                and not _has_any_rows(self.conn, *key[:2], self.gallery, key[2], self.session_id):
+            return _l2(np.asarray(fallback, dtype=np.float32))
+        return vec
+
+    def known_ids(self, modality: str) -> set:
+        """Real ids with any row for this gallery + modality (other sessions)
+        or recorded in this run."""
+        ids = {r[0] for r in self.conn.execute(
+            "SELECT DISTINCT real_id FROM gallery_contributions WHERE gallery = ? "
+            "AND modality = ? AND session_id != ?", (self.gallery, modality, self.session_id))}
+        return ids | {k[0] for k in self._run_extras if k[1] == modality}
 
     def finish(self) -> dict:
         """{(real_id, modality, slot_idx) -> (vector or None, n_contributions)}

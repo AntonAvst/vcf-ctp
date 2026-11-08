@@ -167,6 +167,16 @@ class Contribution:
 
 
 @dataclass(frozen=True)
+class CosineGate:
+    """Which cosine-resolved ids may update a gallery (ToDo item 9). The id
+    itself is assigned either way; this only decides gallery updates."""
+    enabled: bool                 # false → every cosine id updates (old behaviour)
+    threshold_margin: float       # cosine to the cow's vector must reach
+                                  # cosine_resolver.threshold + this
+    second_best_margin: float     # ... and beat the best OTHER cow by at least this
+
+
+@dataclass(frozen=True)
 class Gallery:
     ema_alpha: float              # still used by TempPoseGallery (unresolved/ephemeral) and
                                    # the synthetic-id merge fold; real_id-keyed flat + pose
@@ -175,6 +185,7 @@ class Gallery:
     synthetic_merge_alpha: float
     source_weights: SourceWeights
     contribution: Contribution
+    cosine_gate: CosineGate
 
 
 @dataclass(frozen=True)
@@ -519,6 +530,15 @@ def _validate_params(p: Params) -> None:
     if ct.legacy_seed_frames <= 0:
         raise ConfigError(f"gallery.contribution.legacy_seed_frames: must be > 0, "
                           f"got {ct.legacy_seed_frames}")
+
+    cg = p.gallery.cosine_gate
+    for name in ("threshold_margin", "second_best_margin"):
+        v = getattr(cg, name)
+        if not 0.0 <= v <= 1.0:
+            raise ConfigError(f"gallery.cosine_gate.{name}: must be in [0, 1], got {v}")
+    if p.cosine_resolver.threshold + cg.threshold_margin > 1.0:
+        raise ConfigError("gallery.cosine_gate.threshold_margin: cosine_resolver.threshold + "
+                          "threshold_margin is above 1 — no cosine id could ever pass")
 
     aq = p.appearance_quality
     if aq.min_px < 0 or aq.full_px <= aq.min_px:
