@@ -65,6 +65,15 @@ class TempKey(NamedTuple):
     temp_id:    int
 
 
+class SlotEmbed(NamedTuple):
+    """One temp_id's pooled embedding for one slot, plus how many effective
+    (appearance-quality-weighted) frames backed it — the latter feeds the
+    gallery contribution ledger's "stronger evidence counts more" weighting
+    (gallery_ledger.py); it used to be computed and discarded."""
+    vector:      np.ndarray
+    n_effective: float
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Synthetic ID counter  (global .npy file)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +234,34 @@ class PoseGallery:
             self.counts[real_id][slot_idx] += 1
 
         return cosines
+
+    def get_slot_vector(self, real_id: int, slot_idx: int) -> np.ndarray | None:
+        """Current vector for one (real_id, slot), or None if unpopulated."""
+        if real_id not in self.embeds:
+            return None
+        v = self.embeds[real_id][slot_idx]
+        return None if np.all(np.isnan(v)) else v
+
+    def set_slot_vector(self, real_id: int, slot_idx: int,
+                        vector: np.ndarray | None, count: int) -> None:
+        """Directly ASSIGN (not EMA-blend) a slot vector — used by the
+        gallery contribution ledger (gallery_ledger.py), which recomputes
+        the vector itself as a weighted mean over stored per-session
+        contributions and just needs the result written in. `count` is the
+        number of active contributions now backing this slot, replacing the
+        old increment-forever `counts` meaning. vector=None clears the slot
+        back to unpopulated (e.g. its last contribution was just removed)."""
+        if real_id not in self.embeds:
+            if vector is None:
+                return
+            self.embeds[real_id] = np.full((N_SLOTS, EMBED_DIM), np.nan, dtype=np.float32)
+            self.counts[real_id] = np.zeros(N_SLOTS, dtype=np.int32)
+        if vector is None:
+            self.embeds[real_id][slot_idx] = np.nan
+            self.counts[real_id][slot_idx] = 0
+        else:
+            self.embeds[real_id][slot_idx] = _l2_norm(vector)
+            self.counts[real_id][slot_idx] = count
 
     def merge_and_delete(self, src_id: int, dst_id: int, alpha: float) -> None:
         """
@@ -508,7 +545,7 @@ def build_slot_embeds(
     min_conf: float,              # params vision.min_slot_conf
     frame_weights=None,           # appearance_quality weight per row (None → all 1)
     min_slot_frames: float = 0.0, # params vision.min_slot_frames (effective frames)
-) -> dict[int, dict[int, np.ndarray]]:
+) -> dict[int, dict[int, SlotEmbed]]:
     """
     Group embed rows by slot, quality-weighted mean per slot per temp_id.
 
@@ -517,7 +554,7 @@ def build_slot_embeds(
     count. Without frame_weights every frame weighs 1, so min_slot_frames is
     a plain frame count.
 
-    Returns dict { temp_id -> { slot_idx -> mean_embed (128,) } }
+    Returns dict { temp_id -> { slot_idx -> SlotEmbed(vector (128,), n_effective) } }
     """
     posture_arr = per_frame_labels["posture"]
     facing_arr  = per_frame_labels["facing"]
@@ -546,14 +583,14 @@ def build_slot_embeds(
         tid = int(frame_temp_ids[i])
         result.setdefault(tid, {}).setdefault(s, []).append(i)
 
-    pooled: dict[int, dict[int, np.ndarray]] = {}
+    pooled: dict[int, dict[int, SlotEmbed]] = {}
     for tid, slots in result.items():
         for slot_idx, idx in slots.items():
             w = weights[idx]
             if w.sum() < min_slot_frames:
                 continue
             mean = (embeds_array[idx] * w[:, None]).sum(axis=0) / w.sum()
-            pooled.setdefault(tid, {})[slot_idx] = _l2_norm(mean)
+            pooled.setdefault(tid, {})[slot_idx] = SlotEmbed(_l2_norm(mean), float(w.sum()))
 
     return pooled
 

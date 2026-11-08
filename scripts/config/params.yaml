@@ -104,7 +104,7 @@ kinetic_match:
 gallery:
   # Galleries are updated ONCE per run, after every identity step, with each
   # temp_id's final id. Update rate = ema_alpha × source_weights[source of the id].
-  ema_alpha: 0.15
+  ema_alpha: 0.15           # synthetic ids + TempPoseGallery only (real ids: contribution)
   min_embeds: 10            # min EFFECTIVE frames (sum of appearance_quality weights)
                             # per temp_id and camera mode to contribute to a gallery
   synthetic_merge_alpha: 0.5  # blend weight when a synthetic id resolves to a real one
@@ -113,6 +113,35 @@ gallery:
     kinetic: 1.0
     boundary_rendezvous: 0.5  # inferred from appearance + motion across cameras, not confirmed
     cosine: 0.5             # appearance self-match (was the hard-coded alpha/2)
+  contribution:
+    # Gallery contribution ledger (gallery_ledger.py): every session's flat-
+    # and pose-gallery contribution is stored as its own row (vector, source,
+    # effective frames, timestamp); a cow's gallery vector is the weighted
+    # mean of its active rows, recomputed on every change. Re-running a
+    # session replaces ALL of its own rows, so nothing is applied twice and a
+    # contribution the re-run no longer makes disappears. A wrong one can be
+    # rejected and the gallery rebuilt without it, exactly. Real ids only —
+    # synthetic ids and TempPoseGallery still use ema_alpha.
+    half_life_days: 180        # a contribution's weight halves every this many days —
+                                # "old contributions fade"
+    drift_gate_cosine: 0.5     # cosine(cow's current vector, this session's vector)
+                                # below this holds the contribution for review instead
+                                # of folding it in (nothing to compare against → it goes
+                                # straight in). Kept below cosine_resolver.threshold, so
+                                # it guards kinetic/manual/boundary ids — a cosine id has
+                                # already matched this gallery. PROVISIONAL: calibrate on
+                                # the stored drift of kinetic contributions.
+    frames_weight_power: 0.5   # weight *= n_effective_frames ** this, on top of
+                                # source_weight and the day-based decay — "stronger
+                                # evidence counts more" (sqrt: a 500-frame session
+                                # outweighs a 10-frame one, but not 50x as much)
+    min_weight: 0.02           # a contribution whose decayed weight falls below this
+                                # is excluded from the rebuild sum (faded to irrelevance,
+                                # row still kept for audit)
+    legacy_seed_frames: 200    # galleries built before the ledger: on a cow's first
+                                # commit, the stored vector is seeded as one 'legacy' row
+                                # with this many effective frames (source weight 1.0),
+                                # so it isn't replaced by a single session
 
 appearance_quality:
   # Per-frame weight for every step that reads APPEARANCE (gallery means, cosine
@@ -126,6 +155,28 @@ appearance_quality:
   edge_margin_px: 4         # box within this of the frame border = cut off by the edge
   edge_weight: 0.3          # weight multiplier for such frames (partial cow in the crop);
                             # skipped for sessions without video_sessions.frame_w/frame_h
+  robust_mean:
+    # Outlier-trimmed session mean (appearance_quality.weighted_mean_embed):
+    # drop frames whose embedding looks nothing like the rest of the track
+    # before averaging — a handful of misdetected/occluded/handoff-artifact
+    # frames no longer skew the whole session's contribution.
+    enabled: true
+    min_frames_for_trim: 20   # below this many effective frames, skip trimming — not
+                               # enough points to trust an outlier statistic
+    trim_mad_k: 3.0           # drop frames more than k robust SDs (1.4826 x MAD) below
+                               # the median cosine-to-preliminary-mean
+    max_trim_frac: 0.3        # never trim more than this fraction of effective frames
+  id_switch:
+    # Two-cluster split check on the same per-track frame set: flags a likely
+    # tracker ID switch (one temp_id secretly covering two animals) for human
+    # review (gallery_ledger.id_switch_flags). Never auto-merges or auto-splits.
+    enabled: true
+    min_frames: 20            # below this many effective frames, skip the check
+    min_cluster_frac: 0.25    # each of the 2 clusters must hold at least this fraction
+                               # of effective frames (else it's a few outliers, which
+                               # robust_mean above already handles separately)
+    min_gap: 0.15             # (mean within-cluster cosine) - (between-cluster cosine)
+                               # must exceed this to flag
 
 cosine_resolver:
   threshold: 0.75           # single cosine threshold — Cosine Resolver AND

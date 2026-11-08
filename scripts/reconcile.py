@@ -55,6 +55,7 @@ import config
 import kinetic_match
 import tracklet_stitch
 import appearance_quality
+import gallery_ledger
 from appearance_quality import effective_frames
 
 # Drive I/O layer
@@ -640,9 +641,17 @@ def load_embeds_for_session(tracks_df: pd.DataFrame,
 
 
 def compute_mean_embed(embed_rows: pd.DataFrame) -> np.ndarray:
-    """Appearance-quality-weighted mean of the embed arrays, L2-normalised
-    (plain mean when no weights are attached) — see appearance_quality.py."""
+    """Appearance-quality-weighted, outlier-trimmed mean of the embed arrays,
+    L2-normalised (plain mean when no weights are attached) — see
+    appearance_quality.py."""
     return appearance_quality.weighted_mean_embed(embed_rows)
+
+
+def compute_mean_embed_report(embed_rows: pd.DataFrame):
+    """Same as compute_mean_embed() but also returns the outlier-trim and
+    ID-switch-split diagnostics (appearance_quality.MeanEmbedReport) — use
+    this wherever a possible tracker ID switch should be surfaced."""
+    return appearance_quality.mean_embed_report(embed_rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -718,29 +727,37 @@ def preview_galleries(embed_df: pd.DataFrame, confirmed: dict,
 
 
 def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
-                     conn: sqlite3.Connection, gallery_dir: str,
+                     conn: sqlite3.Connection, gallery_dir: str, session_id: str,
                      dry_run: bool = False) -> dict:
     """
-    The single flat-gallery update of a run, after the Cosine Resolver,
+    The run's single flat-gallery update, after the Cosine Resolver,
     Boundary Rendezvous and Duplicate Resolver have settled every temp_id's id
     (embed_df already has the Duplicate Resolver's merged fragments pooled
     under their winner).
 
-    Per temp_id and camera mode: weighted mean of its frames in that mode →
-    EMA into that mode's gallery with α = gallery.ema_alpha ×
-    gallery.source_weights[source of its id]. Skipped for synthetic ids, a
-    source weight of 0, or fewer than gallery.min_embeds effective frames.
-    Galleries are loaded fresh from disk, so nothing earlier in the run has
-    been applied to them yet — each temp_id is applied exactly once.
+    Per temp_id and camera mode, this session's outlier-trimmed, quality-
+    weighted mean is recorded in the gallery contribution ledger
+    (gallery_ledger.py) and the cow's vector becomes the ledger's rebuild —
+    no running EMA. The session's rows from earlier runs are replaced as a
+    whole, so a re-run never applies anything twice and a cow this session no
+    longer contributes to is rebuilt without it. A contribution too far from
+    the cow's current vector is held for review (gallery.contribution.
+    drift_gate_cosine). Skipped: synthetic ids, a source weight of 0, fewer
+    than gallery.min_embeds effective frames.
 
-    Re-running the same session still applies its update again on top of the
-    previous run's (EMA can't be undone) — see the contribution-ledger ToDo.
+    Item 10: each contributing track is also checked for a two-group split
+    (appearance_quality.mean_embed_report) and flagged in id_switch_flags —
+    for review only, nothing is changed automatically.
     """
     section("Gallery commit")
     P = config.params()
     gp = P.gallery
     galleries = {m: load_gallery(gallery_dir, m) for m in MODALITIES}
+    ledger = gallery_ledger.SessionCommit(conn, session_id, "flat", dry_run=dry_run)
+    gallery_ledger.clear_id_switch_flags(conn, session_id, dry_run=dry_run)
     counts: dict = {}
+    held: dict = {}
+    touched: set = set()
     for modality, mdf in split_by_modality(embed_df).items():
         gallery = galleries[modality]
         for tid, aid in assignment.items():
@@ -756,31 +773,86 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                 log(f"  [{modality}] t{tid} ({source}): {eff:.1f} effective frames "
                     f"(< {gp.min_embeds}) — skip")
                 continue
-            alpha = gp.ema_alpha * weight
-            drift = _ema_update(gallery, aid, compute_mean_embed(tid_embeds), alpha)
-            log(f"  [{modality}] AnimalId {aid} (t{tid}, {source}): "
-                + (f"EMA α={alpha:.3f}  cosine(old,new)={drift:.3f}" if drift is not None
-                   else f"new entry from {eff:.1f} effective frames"))
-            counts[(modality, source)] = counts.get((modality, source), 0) + 1
 
+            report = compute_mean_embed_report(tid_embeds)
+            if report.n_trimmed > 0:
+                log(f"  [{modality}] t{tid}: trimmed {report.n_trimmed:.1f} of "
+                    f"{report.n_total:.1f} effective frames as outliers "
+                    f"({report.trim_frac:.0%})")
+            if report.split_suspected:
+                log(f"  [{modality}] t{tid}: possible ID SWITCH — frames split into two "
+                    f"groups (gap={report.split_gap:.3f}, smaller group="
+                    f"{report.split_cluster_frac:.0%} of {report.n_total:.0f} effective "
+                    f"frames) — flagged for review, nothing changed")
+                gallery_ledger.flag_id_switch(conn, session_id, tid, aid, modality,
+                                              report, dry_run=dry_run)
+
+            existing = get_reid_row(conn, aid) or {}
+            res = ledger.record(
+                real_id=aid, modality=modality, source=source, source_weight=weight,
+                n_effective_frames=report.n_total - report.n_trimmed,
+                vector=report.vector,
+                current_vector=gallery.get(aid),
+                current_dt=existing.get(f"last_updated_{modality}_dt"),
+            )
+            if res.seeded_legacy:
+                log(f"  [{modality}] AnimalId {aid}: pre-ledger gallery vector seeded as a "
+                    f"'legacy' contribution")
+            if res.note:
+                log(f"  [{modality}] AnimalId {aid}: WARNING {res.note}")
+            drift_s = f"{res.drift:.3f}" if res.drift is not None else "—"
+            if res.status != "active":
+                why = (f"kept {res.status} (decision from an earlier run)"
+                       if res.carried_decision else
+                       f"drift {drift_s} < {gp.contribution.drift_gate_cosine} — HELD FOR "
+                       f"REVIEW (python3 gallery_ledger.py list-pending)")
+                log(f"  [{modality}] AnimalId {aid} (t{tid}, {source}): {why}; not applied")
+                held[(modality, source)] = held.get((modality, source), 0) + 1
+                continue
+
+            gallery[aid] = res.vector_after
+            touched.add((aid, modality))
+            log(f"  [{modality}] AnimalId {aid} (t{tid}, {source}): drift={drift_s}, "
+                f"rebuilt from {res.n_contributions} contribution(s)"
+                + (" [approved earlier]" if res.carried_decision else ""))
+            counts[(modality, source)] = counts.get((modality, source), 0) + 1
             if not dry_run:
-                existing = get_reid_row(conn, aid)
-                old_n = (existing or {}).get(f"gallery_n_{modality}", 0) or 0
                 method = ("kinetic" if source in ("manual", "kinetic")
                           else f"cosine_{modality}" if source == "cosine" else source)
                 upsert_reid(conn, aid, {
-                    f"gallery_embed_{modality}": json.dumps(gallery[aid].tolist()),
-                    f"gallery_n_{modality}":     old_n + 1,
+                    f"gallery_embed_{modality}": json.dumps(res.vector_after.tolist()),
+                    f"gallery_n_{modality}":     res.n_contributions,
                     f"last_updated_{modality}_dt": pd.Timestamp.now().isoformat(),
                     "match_method": method,
                 })
+
+    # Cows this session contributed to on an earlier run but not on this one
+    # (re-assigned, dropped below min_embeds, ...): rebuild them without it.
+    for (aid, modality, _), (vec, n) in ledger.finish().items():
+        gallery = galleries[modality]
+        if vec is None:
+            gallery.pop(aid, None)
+        else:
+            gallery[aid] = vec
+        touched.add((aid, modality))
+        log(f"  [{modality}] AnimalId {aid}: earlier run's contribution withdrawn — "
+            + (f"rebuilt from {n} contribution(s)" if vec is not None else "no vector left"))
+        if not dry_run:
+            upsert_reid(conn, aid, {
+                f"gallery_embed_{modality}": json.dumps(vec.tolist()) if vec is not None else None,
+                f"gallery_n_{modality}": n,
+                f"last_updated_{modality}_dt": pd.Timestamp.now().isoformat(),
+            })
 
     if counts:
         log("Updated: " + ", ".join(f"{m}/{src}={n}" for (m, src), n in sorted(counts.items())))
     else:
         log("No gallery updates this session.")
+    if held:
+        log("Not applied (held/rejected): "
+            + ", ".join(f"{m}/{src}={n}" for (m, src), n in sorted(held.items())))
     if not dry_run:
-        for m in {m for (m, _) in counts}:
+        for m in {m for (_, m) in touched}:
             save_gallery(gallery_dir, m, galleries[m])
     return galleries
 
@@ -1799,6 +1871,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
     # ── database ──────────────────────────────────────────────────────────────
     conn = init_db(str(db_local))
     migrate_timeline_schema(conn)
+    gallery_ledger.migrate_schema(conn)
 
 
     # ── load tracks from SQLite ───────────────────────────────────────────────
@@ -1980,7 +2053,7 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         embed_df_final = embed_df.copy()
         embed_df_final["temp_id"] = embed_df_final["temp_id"].replace(merge_map)
     commit_galleries(embed_df_final, full_assignment, provenance, conn,
-                     gallery_dir, dry_run=args.dry_run)
+                     gallery_dir, session_id=args.session, dry_run=args.dry_run)
 
     # ── update known_temp_ids ─────────────────────────────────────────────────
     # raw temp_id → final temp_id (stitching, then Duplicate Resolver merges).
@@ -2016,28 +2089,31 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         timeline_df["session_id"] = args.session
 
     # ── Vision Feature Extraction ─────────────────────────────────────────────
-    if not timeline_df.empty:
-        timeline_df = run_vision_features(
-            session_id    = args.session,
-            timeline_df   = timeline_df,
-            conn          = conn,
-            assignment    = full_assignment,
-            fallback_is_night = fallback_is_night,   # only for NULL (legacy) rows
-            exclude_tids  = noise_tids,
-            frame_size    = frame_size,
-            camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
-            # kps is written as multi-part files (kps_part000.parquet, ...) by
-            # track_and_dump.py's KpsWriter, same as embeds — pass the session
-            # directory so extractor.py's glob-based loader can find them.
-            # (dm.get_parquet_path(session, "kps") returns a single hardcoded
-            # "kps.parquet" filename that never actually exists — see embeds
-            # a few lines up for the correct pattern.)
-            kps_parquet   = str(dm.get_session_dir(args.session)),
-            embed_parquet = embed_parquet_path,
-            gallery_dir   = gallery_dir,
-            dry_run       = args.dry_run,
-            merge_map     = raw_to_final,   # stitching + Duplicate Resolver, raw → final
-        )
+    # Called even with an empty timeline: it still has to replace this
+    # session's pose-gallery contributions and temp-gallery entries from
+    # earlier runs (it returns at once otherwise).
+    timeline_df = run_vision_features(
+        session_id    = args.session,
+        timeline_df   = timeline_df,
+        conn          = conn,
+        assignment    = full_assignment,
+        provenance    = provenance,   # {temp_id -> source} — gallery contribution ledger weighting
+        fallback_is_night = fallback_is_night,   # only for NULL (legacy) rows
+        exclude_tids  = noise_tids,
+        frame_size    = frame_size,
+        camera_id     = session_row.get("camera_id", "cam0") if session_row else "cam0",
+        # kps is written as multi-part files (kps_part000.parquet, ...) by
+        # track_and_dump.py's KpsWriter, same as embeds — pass the session
+        # directory so extractor.py's glob-based loader can find them.
+        # (dm.get_parquet_path(session, "kps") returns a single hardcoded
+        # "kps.parquet" filename that never actually exists — see embeds
+        # a few lines up for the correct pattern.)
+        kps_parquet   = str(dm.get_session_dir(args.session)),
+        embed_parquet = embed_parquet_path,
+        gallery_dir   = gallery_dir,
+        dry_run       = args.dry_run,
+        merge_map     = raw_to_final,   # stitching + Duplicate Resolver, raw → final
+    )
 
     # ── Timeline Writer — write to DB ─────────────────────────────────────────
     write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)

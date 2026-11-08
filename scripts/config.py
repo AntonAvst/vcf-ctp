@@ -150,11 +150,58 @@ class SourceWeights:
 
 
 @dataclass(frozen=True)
+class Contribution:
+    """Gallery contribution ledger (gallery_ledger.py): galleries are rebuilt
+    as a weighted mean over every session's stored contribution, rather than
+    an irreversible running EMA. See gallery_ledger.py module docstring."""
+    half_life_days: float        # a contribution's weight halves every this many days
+    drift_gate_cosine: float     # cosine(current gallery vector, new session vector) below
+                                  # this holds the contribution for review instead of
+                                  # folding it into the rebuilt gallery
+    frames_weight_power: float   # weight *= n_effective_frames ** this (0 = frame count
+                                  # doesn't matter beyond the existing min_embeds gate)
+    min_weight: float            # a contribution decayed below this is excluded from the
+                                  # rebuild sum (numerically faded away, row still kept)
+    legacy_seed_frames: float    # n_effective_frames given to a pre-ledger gallery vector
+                                  # when it is seeded as a 'legacy' row
+
+
+@dataclass(frozen=True)
 class Gallery:
-    ema_alpha: float
+    ema_alpha: float              # still used by TempPoseGallery (unresolved/ephemeral) and
+                                   # the synthetic-id merge fold; real_id-keyed flat + pose
+                                   # galleries are rebuilt from gallery_contributions instead
     min_embeds: float
     synthetic_merge_alpha: float
     source_weights: SourceWeights
+    contribution: Contribution
+
+
+@dataclass(frozen=True)
+class RobustMean:
+    """Outlier trimming for a track's session-mean embedding (gallery_commit,
+    cosine-resolver query vectors, boundary embeddings — anywhere
+    appearance_quality.weighted_mean_embed is used)."""
+    enabled: bool
+    min_frames_for_trim: float    # below this many effective frames, skip trimming entirely
+                                   # (not enough points to trust an outlier statistic)
+    trim_mad_k: float             # drop frames more than k robust SDs (1.4826 * MAD)
+                                   # below the median cosine-to-preliminary-mean
+    max_trim_frac: float          # never trim more than this fraction of effective frames
+
+
+@dataclass(frozen=True)
+class IdSwitchCheck:
+    """Two-cluster split check on a track's frames — flags a likely tracker
+    ID switch (one temp_id secretly covering two animals) for human review.
+    Never auto-acts; see gallery_ledger.id_switch_flags."""
+    enabled: bool
+    min_frames: float             # below this many effective frames, skip the check
+    min_cluster_frac: float       # each of the two clusters must hold at least this
+                                   # fraction of effective frames (else it's a few outliers,
+                                   # not a split — robust_mean trims those separately)
+    min_gap: float                # (mean within-cluster cosine) - (between-cluster cosine)
+                                   # must exceed this to flag
 
 
 @dataclass(frozen=True)
@@ -163,6 +210,8 @@ class AppearanceQuality:
     full_px: float
     edge_margin_px: float
     edge_weight: float
+    robust_mean: RobustMean
+    id_switch: IdSwitchCheck
 
 
 @dataclass(frozen=True)
@@ -456,6 +505,21 @@ def _validate_params(p: Params) -> None:
                           "boundary_rendezvous and cosine; identity.source_priority must "
                           f"list the same sources, got {p.identity.source_priority}")
 
+    ct = p.gallery.contribution
+    if ct.half_life_days <= 0:
+        raise ConfigError(f"gallery.contribution.half_life_days: must be > 0, got {ct.half_life_days}")
+    if not -1.0 <= ct.drift_gate_cosine <= 1.0:
+        raise ConfigError(f"gallery.contribution.drift_gate_cosine: must be in [-1, 1], "
+                          f"got {ct.drift_gate_cosine}")
+    if ct.frames_weight_power < 0:
+        raise ConfigError(f"gallery.contribution.frames_weight_power: must be >= 0, "
+                          f"got {ct.frames_weight_power}")
+    if ct.min_weight < 0:
+        raise ConfigError(f"gallery.contribution.min_weight: must be >= 0, got {ct.min_weight}")
+    if ct.legacy_seed_frames <= 0:
+        raise ConfigError(f"gallery.contribution.legacy_seed_frames: must be > 0, "
+                          f"got {ct.legacy_seed_frames}")
+
     aq = p.appearance_quality
     if aq.min_px < 0 or aq.full_px <= aq.min_px:
         raise ConfigError(f"appearance_quality: need 0 <= min_px < full_px, "
@@ -463,6 +527,28 @@ def _validate_params(p: Params) -> None:
     if aq.edge_margin_px < 0:
         raise ConfigError(f"appearance_quality.edge_margin_px: must be >= 0, got {aq.edge_margin_px}")
     _unit(aq.edge_weight, "appearance_quality.edge_weight")
+
+    rm = aq.robust_mean
+    if rm.min_frames_for_trim < 2:
+        raise ConfigError(f"appearance_quality.robust_mean.min_frames_for_trim: "
+                          f"must be >= 2, got {rm.min_frames_for_trim}")
+    if rm.trim_mad_k <= 0:
+        raise ConfigError(f"appearance_quality.robust_mean.trim_mad_k: must be > 0, "
+                          f"got {rm.trim_mad_k}")
+    if not 0.0 <= rm.max_trim_frac < 1.0:
+        raise ConfigError(f"appearance_quality.robust_mean.max_trim_frac: must be in "
+                          f"[0, 1), got {rm.max_trim_frac}")
+
+    isc = aq.id_switch
+    if isc.min_frames < 4:
+        raise ConfigError(f"appearance_quality.id_switch.min_frames: must be >= 4, "
+                          f"got {isc.min_frames}")
+    if not 0.0 < isc.min_cluster_frac <= 0.5:
+        raise ConfigError(f"appearance_quality.id_switch.min_cluster_frac: must be in "
+                          f"(0, 0.5], got {isc.min_cluster_frac}")
+    if isc.min_gap < 0:
+        raise ConfigError(f"appearance_quality.id_switch.min_gap: must be >= 0, "
+                          f"got {isc.min_gap}")
     if p.vision.min_slot_frames < 0:
         raise ConfigError(f"vision.min_slot_frames: must be >= 0, got {p.vision.min_slot_frames}")
     if p.gallery.min_embeds < 0 or p.cosine_resolver.min_embeds < 0:

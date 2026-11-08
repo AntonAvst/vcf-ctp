@@ -50,6 +50,7 @@ import pandas as pd
 
 import config
 import appearance_quality
+import gallery_ledger
 from .schema import (
     BACK_KPS, N_KP,
     TIMELINE_VISION_COLS, TIMELINE_ALTER_SQLS,
@@ -342,11 +343,52 @@ def aggregate_window(window_rows: pd.DataFrame) -> dict:
 # Main entry point (called by reconcile.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_vision_features(
+def run_vision_features(session_id: str, timeline_df: pd.DataFrame,
+                        conn: sqlite3.Connection, assignment: dict,
+                        gallery_dir: str = "./reid_gallery", dry_run: bool = False,
+                        **kwargs) -> pd.DataFrame:
+    """
+    Stage 2-B entry point (called by reconcile.py) — see _run_vision_features
+    for the parameters.
+
+    Wraps the work in one pose-gallery SessionCommit (gallery_ledger.py):
+    opening it replaces this session's pose contributions from earlier runs,
+    and finishing it — on every return path, including the early ones — puts
+    back the slots this run no longer contributes to.
+    """
+    pose_ledger = gallery_ledger.SessionCommit(conn, session_id, "pose", dry_run=dry_run)
+    out = _run_vision_features(pose_ledger, session_id, timeline_df, conn, assignment,
+                               gallery_dir=gallery_dir, dry_run=dry_run, **kwargs)
+    _finish_pose_ledger(pose_ledger, gallery_dir, dry_run)
+    return out
+
+
+def _finish_pose_ledger(pose_ledger, gallery_dir: str, dry_run: bool) -> None:
+    orphans = pose_ledger.finish()
+    if not orphans:
+        return
+    by_mode: dict = {}
+    for (rid, m, slot), vn in orphans.items():
+        by_mode.setdefault(m, {})[(rid, slot)] = vn
+    for m, items in by_mode.items():
+        pg = PoseGallery.load(gallery_dir, m)
+        for (rid, slot), (vec, n) in items.items():
+            pg.set_slot_vector(rid, slot, vec, n)
+            log(f"  [{m}] real_id {rid} slot [{slot_name(slot)}]: earlier run's contribution "
+                f"withdrawn — " + (f"rebuilt from {n}" if vec is not None else "slot cleared"))
+        if not dry_run:
+            pg.save(gallery_dir, m)
+
+
+def _run_vision_features(
+    pose_ledger,                               # gallery_ledger.SessionCommit (pose)
     session_id:        str,
     timeline_df:       pd.DataFrame,          # output of sensor_sequencer
     conn:              sqlite3.Connection,
     assignment:        dict,                   # {temp_id -> real_id}
+    provenance:        dict | None = None,     # {temp_id -> source}: gallery contribution
+                                                # ledger weighting (gallery_ledger.py);
+                                                # missing/unknown temp_ids default to "cosine"
     fallback_is_night: bool       = False,     # only for legacy rows with NULL is_night
     exclude_tids:      set | None = None,      # temp_ids reconcile's noise filter dropped
     frame_size:        tuple | None = None,    # (frame_w, frame_h) px for the edge check
@@ -383,7 +425,10 @@ def run_vision_features(
 
     Thresholds come from config/params.yaml, not arguments, so this step can
     never disagree with the rest of reconcile:
-        gallery.ema_alpha      EMA learning rate for the pose-gallery update
+        gallery.ema_alpha      EMA rate for TempPoseGallery (unresolved ids) only —
+                               resolved ids go through the gallery contribution
+                               ledger (gallery_ledger.py), weighted by
+                               gallery.source_weights / gallery.contribution instead
         vision.min_slot_conf   min posture AND facing conf to feed a slot
         timeline.bin_minutes   window size (same grid as Sensor Sequencer)
 
@@ -399,7 +444,10 @@ def run_vision_features(
     bin_minutes   = P.timeline.bin_minutes
 
     if timeline_df.empty:
-        log("timeline_df is empty — nothing to do.")
+        log("timeline_df is empty — no features to extract.")
+        # still replace this session's temp-gallery entries from earlier runs
+        _save_temp_galleries(_purged_temp_galleries(session_id, gallery_dir),
+                             gallery_dir, dry_run)
         return timeline_df
 
     # ── Schema migration ──────────────────────────────────────────────────────
@@ -535,6 +583,8 @@ def run_vision_features(
             kps_df       = kps_df,       # ALL temp_ids — temp gallery needs unresolved too
             embed_parquet= embed_parquet,
             assignment   = assignment,
+            provenance   = provenance or {},
+            pose_ledger  = pose_ledger,
             gallery_dir  = gallery_dir,
             ema_alpha    = ema_alpha,
             min_slot_conf= min_slot_conf,
@@ -579,6 +629,8 @@ def _update_pose_gallery(
     kps_df:        pd.DataFrame,    # ALL temp_ids, with posture/facing columns
     embed_parquet: str,
     assignment:    dict,            # {temp_id -> real_id} — resolved only
+    provenance:    dict,            # {temp_id -> source} — gallery contribution ledger weighting
+    pose_ledger,                    # gallery_ledger.SessionCommit for 'pose' (see run_vision_features)
     gallery_dir:   str,
     ema_alpha:     float,
     min_slot_conf: float,
@@ -589,8 +641,12 @@ def _update_pose_gallery(
     Update both pose galleries after feature extraction:
 
       1. Build slot embeddings for ALL temp_ids (resolved + unresolved)
-      2. Resolved temp_ids  → update PoseGallery (real_id keyed, full alpha)
-      3. All temp_ids       → update TempPoseGallery (TempKey keyed, full alpha)
+      2. Resolved temp_ids  → real ids: record each populated slot in the
+         gallery contribution ledger (gallery_ledger.py, same ledger and
+         drift gate as the flat gallery) and write the rebuilt vector into
+         PoseGallery; synthetic ids: plain EMA update, as before
+      3. All temp_ids       → update TempPoseGallery (TempKey keyed, full alpha —
+         unresolved/synthetic ids are ephemeral scratch space, not ledgered)
       4. Resolved temp_ids  → delete from TempPoseGallery (they have graduated)
 
     Each frame carries its own camera mode (kps_df.is_night), so the session's
@@ -682,28 +738,58 @@ def _update_pose_gallery(
         log(f"  [{modality}] {len(mdf)} frames → slot embeddings for "
             f"{len(slot_embeds_by_tid)} temp_ids")
 
-        # ── Update PoseGallery (resolved temp_ids only, full alpha) ───────────
+        # ── Update PoseGallery (resolved temp_ids only) ───────────────────────
+        # Real ids go through the gallery contribution ledger (gallery_ledger.py);
+        # synthetic ids keep the plain EMA update (the ledger covers real ids only).
+        sw = config.params().gallery.source_weights
         pose_gallery = PoseGallery.load(gallery_dir, modality)
-        pose_updates = 0
+        pose_updates, pose_held = 0, 0
         for tid, slot_embeds in slot_embeds_by_tid.items():
             real_id = assignment.get(int(tid))
             if real_id is None:
                 continue
-            cosines = pose_gallery.update(int(real_id), slot_embeds, alpha=ema_alpha)
-            for slot_idx, cos in cosines.items():
-                cos_str = f"{cos:.3f}" if not (isinstance(cos, float) and np.isnan(cos)) else "new"
-                log(f"  [{modality}] real_id {real_id}  slot [{slot_name(slot_idx)}]  cos={cos_str}")
-            pose_updates += len(slot_embeds)
+            real_id = int(real_id)
+            if is_synthetic(real_id):
+                pose_gallery.update(real_id, {s: se.vector for s, se in slot_embeds.items()},
+                                    alpha=ema_alpha)
+                pose_updates += len(slot_embeds)
+                continue
+            source = provenance.get(int(tid), "cosine")
+            weight = getattr(sw, source)
+            if weight <= 0:
+                continue
+            for slot_idx, slot_embed in slot_embeds.items():
+                res = pose_ledger.record(
+                    real_id=real_id, modality=modality, slot_idx=slot_idx, source=source,
+                    source_weight=weight, n_effective_frames=slot_embed.n_effective,
+                    vector=slot_embed.vector,
+                    current_vector=pose_gallery.get_slot_vector(real_id, slot_idx),
+                )
+                drift_s = f"{res.drift:.3f}" if res.drift is not None else "new"
+                if res.status != "active":
+                    log(f"  [{modality}] real_id {real_id}  slot [{slot_name(slot_idx)}]  "
+                        f"drift={drift_s} — {res.status}, not applied"
+                        + (" (decision from an earlier run)" if res.carried_decision else ""))
+                    pose_held += 1
+                    continue
+                pose_gallery.set_slot_vector(real_id, slot_idx, res.vector_after,
+                                             res.n_contributions)
+                log(f"  [{modality}] real_id {real_id}  slot [{slot_name(slot_idx)}]  "
+                    f"drift={drift_s}  ({res.n_contributions} contribution(s)"
+                    + (", legacy seeded" if res.seeded_legacy else "") + ")")
+                pose_updates += 1
         pose_galleries[modality] = pose_gallery
-        log(f"  [{modality}] PoseGallery: {pose_updates} slot updates "
+        log(f"  [{modality}] PoseGallery: {pose_updates} slot updates, {pose_held} not applied "
             f"({len(pose_gallery.embeds)} total entries)")
 
-        # ── Update TempPoseGallery (ALL temp_ids, full alpha) ─────────────────
+        # ── Update TempPoseGallery (ALL temp_ids, full alpha — ephemeral, ─────
+        # not ledgered: see module docstring)
         temp_gallery = temp_galleries[modality]
         temp_updates = 0
         for tid, slot_embeds in slot_embeds_by_tid.items():
             key = TempKey(camera_id=camera_id, session_id=session_id, temp_id=int(tid))
-            temp_gallery.update(key, slot_embeds, alpha=ema_alpha)
+            temp_gallery.update(key, {s: se.vector for s, se in slot_embeds.items()},
+                                alpha=ema_alpha)
             temp_updates += len(slot_embeds)
         log(f"  [{modality}] TempPoseGallery: {temp_updates} slot updates")
 
