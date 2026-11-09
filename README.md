@@ -295,6 +295,7 @@ vision_features/
 - Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
 - **`draw_masks` (cli.yaml; QA/visualization only):** overlays segmentation mask polygons as a translucent fill + outline, drawn beneath the bbox/label pills so text stays legible. Reads `outputs/<session_id>/qa_masks/masks_part*.parquet` — the file `track_and_dump.py` produces with `save_masks: true`. No-op with a log warning if that file doesn't exist for the session (re-run `track_and_dump.py` with `save_masks: true` first). Toggleable live in-browser ("🎭 Mask" button), same generic toggle mechanism as Bbox/Pose/Direction — flips `STATE.show_mask` via `POST /api/control {action: "toggle_mask"}`.
 - Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s; feature toggles: Bbox, ID, Keypoints, Pose, Direction, Mask
+- Shows the session_id as stored in the DB at the top of the right panel, with a Copy button (for `assign_identity.py --session`, `pipeline_check.py --session`, `reconcile.py --session`)
 - CLI: `--video`, `--session_id` (override), `--start N` (first frame, overrides `cli.yaml` for this run — the review queue's commands use it), `--bypass_upload_check`, `--params`. All overlay options (`draw_pose`, `draw_masks`, `kp_index`, `kp_conf_thresh`, `hide_occluded`, `port`, `start`, `limit`, …) are in `cli.yaml` → `display_tracks:`. Its `kp_conf_thresh` is a display filter only, independent of `params pose.kp_conf_thresh`.
 - Requires: `pip install flask`
 

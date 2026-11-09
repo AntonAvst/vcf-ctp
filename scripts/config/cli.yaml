@@ -5,10 +5,11 @@
 # Every key is required; unknown keys are errors. Validate: python3 config.py
 #
 # Still on the command line (per-invocation, never in a file):
-#   input/identity    track_and_dump --source, display_tracks --video --session_id,
+#   input/identity    track_and_dump --source, display_tracks --video --session_id [--start],
 #                     reconcile --session, assign_identity --session
 #   operations        assign_identity --assign/--remove/--list/--note/--run_reconcile,
-#                     drive_manager <command>, calving_ledger_ingest --file/--farm/
+#                     drive_manager <command>, gallery_ledger <command>, pipeline_check <command>,
+#                     calving_ledger_ingest --file/--farm/
 #                     --overwrite, match_identity --tracks/--kinetics/--output/--scores_json
 #   safety one-shots  --dry_run, --bypass_upload_check
 #   config override   --params my_params.yaml

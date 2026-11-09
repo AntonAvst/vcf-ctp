@@ -467,6 +467,7 @@ def load_sensor_data(kin_df, beh_df):
 
 SENSOR_DATA   = {}   # aid → DataFrame
 SENSOR_AIDS   = []   # sorted list of animal ids
+SESSION_ID    = ""   # shown in the page, copyable (set in main)
 _SENSOR_LOCK  = threading.Lock()   # guards matplotlib figure generation
 
 
@@ -586,6 +587,10 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
 #ffLabel { color:#cdd6f4; font-size:13px; }
 #qbtn   { color:#f38ba8; }
 #status { font-size:11px; color:#6c7086; }
+#sessRow { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
+#sessId  { flex:1; min-width:0; background:#313244; color:#cdd6f4; border:1px solid #45475a;
+           border-radius:4px; padding:6px 8px; font-family:monospace; font-size:12px; }
+#copyBtn { padding:6px 14px; }
 </style>
 </head>
 <body>
@@ -594,6 +599,12 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
     <img id="vstream" src="/video" alt="video stream">
   </div>
   <div id="sensor">
+    <div id="sessRow">
+      <span style="color:#6c7086;font-size:12px;">Session:</span>
+      <input id="sessId" type="text" readonly value="" title="session_id as stored in the DB — click to select"
+             onclick="this.select()">
+      <button id="copyBtn" onclick="copySession()">📋 Copy</button>
+    </div>
     <div id="animalRow">
       <span style="color:#6c7086;font-size:12px;">Animal ID:</span>
       <!-- buttons injected by JS -->
@@ -622,6 +633,23 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
 let selectedAid = null;
 let sensorTimer = null;
 const LOOKBACK = 2.0;
+
+// ── session_id (copyable) ───────────────────────────────────────────────────
+fetch('/api/session').then(r=>r.json()).then(s=>{
+  document.getElementById('sessId').value = s.session_id;
+});
+function copySession(){
+  const box = document.getElementById('sessId'), btn = document.getElementById('copyBtn');
+  const done = ok => { btn.textContent = ok ? '✓ Copied' : 'Ctrl+C'; setTimeout(()=>btn.textContent='📋 Copy', 1500); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(box.value).then(()=>done(true), ()=>fallback());
+  } else { fallback(); }
+  function fallback(){
+    box.focus(); box.select();
+    let ok = false; try { ok = document.execCommand('copy'); } catch(e) {}
+    done(ok);
+  }
+}
 
 // ── populate animal buttons ──────────────────────────────────────────────────
 fetch('/api/animals').then(r=>r.json()).then(aids=>{
@@ -700,6 +728,10 @@ def video():
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n")
             time.sleep(0.02)
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/api/session")
+def api_session():
+    return jsonify({"session_id": SESSION_ID})
 
 @app.route("/api/animals")
 def api_animals():
@@ -952,7 +984,7 @@ def parse_args():
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    global SENSOR_DATA, SENSOR_AIDS
+    global SENSOR_DATA, SENSOR_AIDS, SESSION_ID
     args = parse_args()
 
     vid = Path(args.video)
@@ -964,6 +996,7 @@ def main():
         log(f"session_id auto-derived: {args.session_id}")
     else:
         log(f"session_id (manual override): {args.session_id}")
+    SESSION_ID = args.session_id
 
     # ── Drive: pull canonical DB before reading ───────────────────────────────
     dm = DriveManager(bypass=args.bypass_upload_check, caller=__file__)
