@@ -49,6 +49,9 @@ sampling:
 timeline:
   bin_minutes: 15           # must match the kinetics sampling interval. Used by the
                             # Kinetic Matcher, Sensor Sequencer and vision windows.
+  embed_mean_min_frames: 5  # resolved_cow_timeline.embed_mean: effective frames
+                            # (appearance_quality) a cow needs in one camera mode
+                            # within a window; fewer → NULL
 
 # Day/night = the camera's own mode, detected per frame from the pixels by
 # track_and_dump.py and stored per row in raw_tracks.is_night. The cameras
@@ -107,7 +110,9 @@ gallery:
   ema_alpha: 0.15           # synthetic ids + TempPoseGallery only (real ids: contribution)
   min_embeds: 10            # min EFFECTIVE frames (sum of appearance_quality weights)
                             # per temp_id and camera mode to contribute to a gallery
-  synthetic_merge_alpha: 0.5  # blend weight when a synthetic id resolves to a real one
+  synthetic_merge_alpha: 0.5  # when a synthetic id resolves to a real one, its pose history
+                            # joins the real cow's ledger as one row with this source weight
+                            # and legacy_seed_frames effective frames
   source_weights:           # 0 = never updates the gallery
     manual: 1.0
     kinetic: 1.0
@@ -189,6 +194,10 @@ appearance_quality:
                                # robust_mean above already handles separately)
     min_gap: 0.15             # (mean within-cluster cosine) - (between-cluster cosine)
                                # must exceed this to flag
+    max_interleave_frac: 0.10 # a real switch is one group BEFORE a frame and the other
+                               # AFTER it. At most this fraction of the frames may be on the
+                               # wrong side of the best switch point — one cow whose two
+                               # sides look different alternates and fails this
 
 cosine_resolver:
   threshold: 0.75           # single cosine threshold — Cosine Resolver AND
@@ -209,6 +218,11 @@ identity:
   source_priority: [manual, kinetic, boundary_rendezvous, cosine]
   # Sources Boundary Rendezvous may never overwrite.
   protected_sources: [manual, kinetic]
+  # Sources trusted to resolve a synthetic id: when a temp_id that held
+  # synthetic id S (on an earlier run, or linked from another session) now
+  # gets real id R from one of these, S is folded into R everywhere.
+  # Cosine is left out on purpose — appearance alone doesn't merge histories.
+  resolve_synthetic_sources: [manual, kinetic, boundary_rendezvous]
 
 # ── Stage 2-B: vision features (vision_features/) ────────────────────────────
 vision:

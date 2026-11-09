@@ -93,6 +93,9 @@ class MeanEmbedReport:
     split_suspected: bool
     split_gap: float | None            # within-cluster cosine - between-cluster cosine
     split_cluster_frac: float | None   # size of the smaller cluster, as a frame-weight fraction
+    split_interleave_frac: float | None = None  # frame weight on the wrong side of the best
+                                                # single switch point (0 = clean before/after)
+    switch_frame: int | None = None    # frame_index of the first frame after that point
 
 
 def _trim_outliers(stack: np.ndarray, w: np.ndarray) -> np.ndarray:
@@ -129,47 +132,77 @@ def _trim_outliers(stack: np.ndarray, w: np.ndarray) -> np.ndarray:
     return keep
 
 
-def _check_split(stack: np.ndarray, w: np.ndarray) -> tuple[bool, float | None, float | None]:
-    """Spherical 2-means on the (already outlier-trimmed) frame set: flags a
-    likely tracker ID switch when the frames split into two well-separated,
-    non-trivial clusters. Never merges or splits anything itself — a pure
-    diagnostic for gallery_ledger.id_switch_flags."""
-    isc = config.params().appearance_quality.id_switch
-    if not isc.enabled or len(stack) < 4 or w.sum() < isc.min_frames:
-        return False, None, None
-
+def _two_groups(stack: np.ndarray, w: np.ndarray):
+    """Spherical 2-means. Returns (labels, gap, smaller_group_frac) or None
+    when the frames don't separate into two groups at all."""
     # Seeds in O(n) (no n×n similarity matrix — a long track has tens of
     # thousands of frames): the frame least like the mean, then the frame
     # least like that one.
     i = int(np.argmin(stack @ _wmean(stack, w)))
     j = int(np.argmin(stack @ stack[i]))
     if i == j:
-        return False, None, None
+        return None
     c0, c1 = _l2_unit(stack[i]), _l2_unit(stack[j])
-
     labels = None
     for _ in range(10):
-        d0, d1 = stack @ c0, stack @ c1
-        new_labels = d1 > d0           # True → cluster 1
+        new_labels = (stack @ c1) > (stack @ c0)       # True → group 1
         if new_labels.all() or (~new_labels).all():
-            return False, None, None   # collapsed to one cluster
+            return None
         if labels is not None and np.array_equal(new_labels, labels):
             break
         labels = new_labels
         c0 = _wmean(stack[~labels], w[~labels])
         c1 = _wmean(stack[labels], w[labels])
-
-    w0, w1 = w[~labels].sum(), w[labels].sum()
-    total = w0 + w1
-    frac = min(w0, w1) / total if total > 0 else 0.0
-    if frac < isc.min_cluster_frac:
-        return False, None, None
-
+    total = w.sum()
+    if total <= 0:
+        return None
+    frac = float(min(w[~labels].sum(), w[labels].sum()) / total)
     within = (np.sum((stack[~labels] @ c0) * w[~labels])
               + np.sum((stack[labels] @ c1) * w[labels])) / total
-    between = float(np.dot(c0, c1))
-    gap = float(within - between)
-    return gap >= isc.min_gap, gap, float(frac)
+    return labels, float(within - float(c0 @ c1)), frac
+
+
+def _best_switch_point(labels: np.ndarray, w: np.ndarray, frames: np.ndarray):
+    """Frames in time order. Finds the single split point t that best explains
+    the labels as "one group before t, the other after" (either way round).
+    Returns (wrong-side weight fraction, frame_index at t). O(n)."""
+    order = np.argsort(frames, kind="stable")
+    lab, ww, fr = labels[order], w[order], frames[order]
+    g1 = np.concatenate([[0.0], np.cumsum(ww * lab)])        # group-1 weight before t
+    g0 = np.concatenate([[0.0], np.cumsum(ww * ~lab)])       # group-0 weight before t
+    tot1, tot0 = g1[-1], g0[-1]
+    # 0-then-1: group-1 frames before t and group-0 frames after t are wrong
+    cost_01 = g1 + (tot0 - g0)
+    cost_10 = g0 + (tot1 - g1)
+    costs = np.minimum(cost_01, cost_10)
+    t = int(np.argmin(costs))
+    total = tot0 + tot1
+    frame_at_t = int(fr[t]) if t < len(fr) else int(fr[-1])
+    return (float(costs[t] / total) if total > 0 else 1.0), frame_at_t
+
+
+def _check_split(stack: np.ndarray, w: np.ndarray, frames: np.ndarray | None):
+    """Likely tracker ID switch: the frames form two well-separated, non-
+    trivial groups AND, in time order, one group comes before a single frame
+    and the other after it. One cow whose two sides embed differently gives
+    two groups too, but they alternate through the track and fail the time
+    test. Without frame indices the time test can't run → never flags.
+    A pure diagnostic for gallery_ledger.id_switch_flags.
+    Returns (suspected, gap, smaller_frac, interleave_frac, switch_frame)."""
+    isc = config.params().appearance_quality.id_switch
+    none = (False, None, None, None, None)
+    if not isc.enabled or len(stack) < 4 or w.sum() < isc.min_frames:
+        return none
+    groups = _two_groups(stack, w)
+    if groups is None:
+        return none
+    labels, gap, frac = groups
+    if frac < isc.min_cluster_frac or gap < isc.min_gap:
+        return False, gap, frac, None, None
+    if frames is None:
+        return False, gap, frac, None, None
+    inter, switch_frame = _best_switch_point(labels, w, frames)
+    return inter <= isc.max_interleave_frac, gap, frac, inter, switch_frame
 
 
 def mean_embed_report(rows: pd.DataFrame, col: str = "embed",
@@ -187,14 +220,19 @@ def mean_embed_report(rows: pd.DataFrame, col: str = "embed",
     vector = _wmean(stack[keep], w[keep]) if keep.any() else _wmean(stack, w)
     n_trimmed = float(w[~keep].sum())
 
-    split_suspected, split_gap, split_frac = (
-        _check_split(stack[keep], w[keep]) if check_split else (False, None, None))
+    frames = (rows["frame_index"].to_numpy() if "frame_index" in rows.columns else None)
+    if check_split:
+        split_suspected, split_gap, split_frac, inter, switch_frame = _check_split(
+            stack[keep], w[keep], frames[keep] if frames is not None else None)
+    else:
+        split_suspected, split_gap, split_frac, inter, switch_frame = (False, None, None, None, None)
 
     return MeanEmbedReport(
         vector=vector, n_total=n_total, n_trimmed=n_trimmed,
         trim_frac=(n_trimmed / n_total) if n_total > 0 else 0.0,
         split_suspected=split_suspected, split_gap=split_gap,
-        split_cluster_frac=split_frac,
+        split_cluster_frac=split_frac, split_interleave_frac=inter,
+        switch_frame=switch_frame,
     )
 
 

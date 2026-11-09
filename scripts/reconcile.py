@@ -14,11 +14,15 @@ Steps (in order):
   Gallery preview        — in-memory blend of this session's manual/kinetic ids (for cosine queries)
   Cosine Resolver        — heal temp_id switches, cross-video/cross-camera continuity
   Boundary Rendezvous    — cross-camera match via shared-zone tracks (see cross_camera.py)
+  Synthetic id resolution — fold synthetic ids that this run's trusted ids prove real
   Duplicate Resolver     — merge temp_ids assigned to the same AnimalId (tracker switches)
-  Gallery commit         — the run's single flat-gallery update, weighted by id source
+  Gallery commit         — the run's flat-gallery update via the contribution ledger
+                           (gallery_ledger.py); cosine ids pass a margin gate first
+  ID-switch check        — flag tracks whose frames look like two animals (review only)
+  Identity record        — session_assignments + match_method (identity_record.py)
   Sensor Sequencer       — forward-fill behavior/kinetics to video time grid
   Vision Feature Extraction — posture/facing from keypoints, update pose-conditioned gallery
-  Timeline Writer        — write resolved_cow_timeline rows
+  Timeline Writer        — embed_mean per (cow, window), write resolved_cow_timeline rows
 
 Usage:
     python3 reconcile.py --session <session_id> [--dry_run] [--params my.yaml]
@@ -200,7 +204,10 @@ CREATE TABLE IF NOT EXISTS resolved_cow_timeline (
     lying_flag      INTEGER,
     restlessness    REAL,
     kps_coverage    REAL,
-    embed_mean      TEXT    -- JSON list[128] mean-pooled over window
+    embed_mean      TEXT,   -- JSON list[128]: robust, quality-weighted mean of the cow's
+                            -- frames in the window, in ONE camera mode (see next column)
+    embed_mean_is_night INTEGER  -- camera mode of embed_mean (1 = IR); day and night
+                                 -- embeddings are not comparable
 );
 
 CREATE TABLE IF NOT EXISTS calving_ledger (
@@ -265,6 +272,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
         # DBs created before appearance-quality weighting existed
         "ALTER TABLE video_sessions ADD COLUMN frame_w INTEGER",
         "ALTER TABLE video_sessions ADD COLUMN frame_h INTEGER",
+        # DBs created before the timeline's embed_mean was populated
+        "ALTER TABLE resolved_cow_timeline ADD COLUMN embed_mean_is_night INTEGER",
     ):
         try:
             conn.execute(sql)
@@ -652,13 +661,6 @@ def compute_mean_embed(embed_rows: pd.DataFrame) -> np.ndarray:
     return appearance_quality.weighted_mean_embed(embed_rows)
 
 
-def compute_mean_embed_report(embed_rows: pd.DataFrame):
-    """Same as compute_mean_embed() but also returns the outlier-trim and
-    ID-switch-split diagnostics (appearance_quality.MeanEmbedReport) — use
-    this wherever a possible tracker ID switch should be surfaced."""
-    return appearance_quality.mean_embed_report(embed_rows)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Gallery I/O
 # ─────────────────────────────────────────────────────────────────────────────
@@ -731,6 +733,44 @@ def preview_galleries(embed_df: pd.DataFrame, confirmed: dict,
     return galleries
 
 
+def flag_id_switches(embed_df: pd.DataFrame, assignment: dict, conn: sqlite3.Connection,
+                     session_id: str, dry_run: bool = False) -> int:
+    """
+    Likely tracker ID switches (appearance_quality.mean_embed_report, params
+    appearance_quality.id_switch): every track of the session in every camera
+    mode it has enough frames in — assigned, synthetic AND unresolved (an
+    unresolved track still feeds the TempPoseGallery, where a hidden switch
+    can cause a wrong cross-session match). A stitched chain is checked as
+    one track, so a wrong stitch link shows up the same way.
+
+    Replaces the session's flags in id_switch_flags. Review only — nothing
+    is split, merged or unassigned. Returns the number of flags.
+    """
+    isc = config.params().appearance_quality.id_switch
+    gallery_ledger.clear_id_switch_flags(conn, session_id, dry_run=dry_run)
+    if not isc.enabled:
+        return 0
+    n = 0
+    for modality, mdf in split_by_modality(embed_df).items():
+        for tid, rows in mdf.groupby("temp_id"):
+            if effective_frames(rows) < isc.min_frames:
+                continue
+            rep = appearance_quality.mean_embed_report(rows)
+            if not rep.split_suspected:
+                continue
+            aid = assignment.get(tid)
+            who = (f"AnimalId {aid}" if aid is not None and not is_synthetic(aid)
+                   else f"synthetic {aid}" if aid is not None else "unresolved")
+            log(f"  [{modality}] t{tid} ({who}): possible ID SWITCH at frame "
+                f"{rep.switch_frame} — two groups (gap {rep.split_gap:.3f}, smaller "
+                f"{rep.split_cluster_frac:.0%}, {rep.split_interleave_frac:.0%} on the wrong "
+                f"side) — flagged for review")
+            gallery_ledger.flag_id_switch(conn, session_id, int(tid), aid, modality, rep,
+                                          dry_run=dry_run)
+            n += 1
+    return n
+
+
 def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                      conn: sqlite3.Connection, gallery_dir: str, session_id: str,
                      dry_run: bool = False) -> tuple[dict, set | None]:
@@ -750,9 +790,6 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     drift_gate_cosine). Skipped: synthetic ids, a source weight of 0, fewer
     than gallery.min_embeds effective frames.
 
-    Item 10: each contributing track is also checked for a two-group split
-    (appearance_quality.mean_embed_report) and flagged in id_switch_flags —
-    for review only, nothing is changed automatically.
 
     Item 9 (gallery.cosine_gate): a cosine id contributes only if the track's
     mean is at least cosine_resolver.threshold + threshold_margin from the
@@ -770,7 +807,6 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     gp = P.gallery
     galleries = {m: load_gallery(gallery_dir, m) for m in MODALITIES}
     ledger = gallery_ledger.SessionCommit(conn, session_id, "flat", dry_run=dry_run)
-    gallery_ledger.clear_id_switch_flags(conn, session_id, dry_run=dry_run)
     gate = gp.cosine_gate
     cosine_ok: set | None = set() if gate.enabled else None
     counts: dict = {}
@@ -783,13 +819,14 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
     for modality, mdf in split_by_modality(embed_df).items():
         gallery = galleries[modality]
         refs = None   # {real_id -> reference vector}, built at the first cosine id
+        by_tid = dict(tuple(mdf.groupby("temp_id")))
         for tid, aid in order:
             if is_synthetic(aid):
                 continue
             source = provenance.get(tid, "cosine")
             weight = getattr(gp.source_weights, source)
-            tid_embeds = mdf[mdf["temp_id"] == tid]
-            if len(tid_embeds) == 0 or weight <= 0:
+            tid_embeds = by_tid.get(tid)
+            if tid_embeds is None or weight <= 0:
                 continue
             eff = effective_frames(tid_embeds)
             if eff < gp.min_embeds:
@@ -797,18 +834,11 @@ def commit_galleries(embed_df: pd.DataFrame, assignment: dict, provenance: dict,
                     f"(< {gp.min_embeds}) — skip")
                 continue
 
-            report = compute_mean_embed_report(tid_embeds)
+            report = appearance_quality.mean_embed_report(tid_embeds, check_split=False)
             if report.n_trimmed > 0:
                 log(f"  [{modality}] t{tid}: trimmed {report.n_trimmed:.1f} of "
                     f"{report.n_total:.1f} effective frames as outliers "
                     f"({report.trim_frac:.0%})")
-            if report.split_suspected:
-                log(f"  [{modality}] t{tid}: possible ID SWITCH — frames split into two "
-                    f"groups (gap={report.split_gap:.3f}, smaller group="
-                    f"{report.split_cluster_frac:.0%} of {report.n_total:.0f} effective "
-                    f"frames) — flagged for review, nothing changed")
-                gallery_ledger.flag_id_switch(conn, session_id, tid, aid, modality,
-                                              report, dry_run=dry_run)
 
             if source == "cosine" and gate.enabled:
                 if refs is None:
@@ -1060,8 +1090,8 @@ def cosine_resolver(
       synthetic id and assign it to both.
     If no match → leave unresolved.
 
-    Also runs backpropagation: if any confirmed real_id in this session was
-    previously a synthetic id, all timeline rows are updated.
+    (Synthetic → real resolution is a separate step after Boundary
+    Rendezvous: resolve_synthetic_ids.)
 
     Camera mode: embed_df.is_night is per frame, so a temp_id's embeds are
     split by mode and each mode's mean is only ever compared against that
@@ -1376,29 +1406,6 @@ def cosine_resolver(
     # (No gallery update here: cosine matches reach the flat galleries in
     # commit_galleries(), once every identity step has run.)
 
-    # ── Backpropagate: if any confirmed real_id was previously synthetic ──────
-    all_assignments = {**kinetic_assignment, **cosine_assignment}
-    for tid, aid in list(all_assignments.items()):
-        if not is_synthetic(aid):
-            continue
-        # This temp_id now has a confirmed real_id via kinetics or manual?
-        confirmed = kinetic_assignment.get(tid)
-        if confirmed and not is_synthetic(confirmed):
-            # Folds the synthetic id's slots in BOTH modes' pose galleries
-            # (and saves each) — a synthetic id can have been built up from
-            # day and night sightings alike.
-            rows = backpropagate_resolution(
-                synthetic_id   = aid,
-                real_id        = confirmed,
-                conn           = conn,
-                pose_galleries = pose_galleries,
-                gallery_dir    = gallery_dir,
-                dry_run        = dry_run,
-            )
-            log(f"  Backpropagated synthetic_id {aid} → real_id {confirmed} "
-                f"({rows} timeline rows updated)")
-            all_assignments[tid] = confirmed
-
     # NOTE: duplicate real_id resolution (multiple temp_ids matched to the same
     # AnimalId — expected now that assigned_aids has been replaced with the
     # temporal-overlap check above) is intentionally NOT done here. A prior
@@ -1422,6 +1429,45 @@ def cosine_resolver(
 # ─────────────────────────────────────────────────────────────────────────────
 # Sensor Sequencer (forward-fill to video time grid)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def window_embed_means(embed_df: pd.DataFrame, tracks_df: pd.DataFrame,
+                       assignment: dict, bin_minutes: int) -> pd.DataFrame:
+    """
+    resolved_cow_timeline.embed_mean: per (id, window), the robust, quality-
+    weighted mean embedding of every frame of that cow in the window
+    (appearance_quality.weighted_mean_embed, all of her temp_ids pooled).
+
+    Day and night embeddings live in different spaces, so each window uses
+    ONE camera mode — the one with more effective frames — recorded in
+    embed_mean_is_night. Needs timeline.embed_mean_min_frames effective
+    frames in that mode, else no value.
+
+    embed_df and tracks_df must already use final temp_ids (merges applied).
+    Returns [real_id, window_start_dt (Timestamp), embed_mean (JSON),
+    embed_mean_is_night].
+    """
+    cols = ["real_id", "window_start_dt", "embed_mean", "embed_mean_is_night"]
+    if embed_df.empty or not assignment or "frame_datetime" not in tracks_df.columns:
+        return pd.DataFrame(columns=cols)
+    min_eff = config.params().timeline.embed_mean_min_frames
+    e = embed_df[embed_df["temp_id"].isin(assignment.keys())]
+    t = tracks_df[["frame_index", "temp_id", "frame_datetime"]].drop_duplicates(
+        ["frame_index", "temp_id"])
+    e = e.merge(t, on=["frame_index", "temp_id"], how="inner")
+    if e.empty:
+        return pd.DataFrame(columns=cols)
+    e["real_id"] = e["temp_id"].map(assignment).astype(int)
+    e["window_start_dt"] = pd.to_datetime(e["frame_datetime"]).dt.floor(f"{bin_minutes}min")
+    rows = []
+    for (rid, win), g in e.groupby(["real_id", "window_start_dt"]):
+        per_mode = {bool(m): gm for m, gm in g.groupby("is_night")}
+        mode, gm = max(per_mode.items(), key=lambda kv: effective_frames(kv[1]))
+        if effective_frames(gm) < min_eff:
+            continue
+        vec = appearance_quality.weighted_mean_embed(gm)
+        rows.append((int(rid), win, json.dumps([round(float(x), 6) for x in vec]), int(mode)))
+    return pd.DataFrame(rows, columns=cols)
+
 
 def sensor_sequencer(
     tracks_df: pd.DataFrame,
@@ -1576,6 +1622,10 @@ def write_timeline(
         timeline_df["embed_mean"] = timeline_df["embed_mean"].where(
             timeline_df["embed_mean"].notna(), None
         )
+    if "embed_mean_is_night" in timeline_df.columns:
+        timeline_df["embed_mean_is_night"] = pd.Series(
+            [None if pd.isna(v) else int(v) for v in timeline_df["embed_mean_is_night"]],
+            index=timeline_df.index, dtype=object)
 
     if dry_run:
         log(f"[dry_run] Would insert {len(timeline_df)} rows into resolved_cow_timeline")
@@ -1588,7 +1638,7 @@ def write_timeline(
         "d_kin_x", "d_kin_y", "d_kin_z", "d_kin_r",
         "spine_angle", "pelvic_tilt", "tail_elevation",
         "limb_symmetry", "head_drop", "lying_flag",
-        "restlessness", "kps_coverage", "embed_mean",
+        "restlessness", "kps_coverage", "embed_mean", "embed_mean_is_night",
         # vision feature extractor columns (added by migrate_timeline_schema)
         "lying_fraction", "posture_transitions", "facing_dominant", "facing_entropy",
     ]
@@ -1663,6 +1713,70 @@ def _pair_conflict(frames_a: np.ndarray, boxes_a, frames_b: np.ndarray, boxes_b,
         box_b = _nearest_box(boxes_b, int(other[i]))
         iou = _iou(box_a, box_b) if box_a and box_b else 0.0
     return iou < iou_same, d, iou
+
+
+def resolve_synthetic_ids(conn: sqlite3.Connection, session_id: str, assignment: dict,
+                          provenance: dict, stitch_map: dict, gallery_dir: str,
+                          dry_run: bool = False) -> dict:
+    """
+    Fold synthetic ids into the real ids this run has confirmed.
+
+    A temp_id that now has real id R from a trusted source
+    (identity.resolve_synthetic_sources) but had synthetic id S on record —
+    from an earlier run of this session, or as a link written by another
+    session that paired its track with this one — proves S = R.
+    backpropagate_resolution() then rewrites S → R in the timeline (every
+    session), temp_id_merges, manual_assignments and session_assignments,
+    deletes S's reid_registry row and moves S's pose history into R's ledger.
+
+    Every raw fragment of a stitched track is checked. An S claimed by two
+    different real ids in this run is ambiguous and left alone (logged).
+    Temp_ids of THIS run that hold S get R in `assignment` (provenance
+    unchanged), so the Duplicate Resolver, which runs next, merges them with
+    R's track or unassigns them if they were on screen at the same time.
+    Returns {S -> R} for the ids folded.
+    """
+    P = config.params()
+    trusted = set(P.identity.resolve_synthetic_sources)
+    fragments: dict = {}
+    for raw, root in stitch_map.items():
+        fragments.setdefault(root, set()).add(raw)
+
+    claims: dict = {}   # S -> {R: [temp_ids]}
+    for tid, rid in assignment.items():
+        if is_synthetic(rid) or provenance.get(tid) not in trusted:
+            continue
+        for raw in {tid} | fragments.get(tid, set()):
+            for (sid_,) in conn.execute(
+                    "SELECT DISTINCT real_id FROM session_assignments "
+                    "WHERE session_id = ? AND temp_id = ? AND real_id < 0",
+                    (session_id, int(raw))).fetchall():
+                claims.setdefault(int(sid_), {}).setdefault(int(rid), []).append(int(tid))
+
+    if not claims:
+        log("No synthetic ids to resolve.")
+        return {}
+    folds = {}
+    for S, by_real in sorted(claims.items()):
+        if len(by_real) > 1:
+            log(f"  synthetic {S}: claimed by {sorted(by_real)} in this run — ambiguous, "
+                f"left unresolved")
+            continue
+        folds[S] = next(iter(by_real))
+
+    pose_galleries = {m: PoseGallery.load(gallery_dir, m) for m in MODALITIES}
+    for S, R in folds.items():
+        rows = backpropagate_resolution(synthetic_id=S, real_id=R, conn=conn,
+                                        pose_galleries=pose_galleries,
+                                        gallery_dir=gallery_dir, dry_run=dry_run)
+        moved = [t for t, a in assignment.items() if a == S]
+        for t in moved:
+            assignment[t] = R
+        log(f"  synthetic {S} → AnimalId {R} (via t{sorted(claims[S][R])}, "
+            f"{provenance.get(claims[S][R][0])}): {rows} timeline row(s)"
+            + (f"; this run's t{moved} now {R}" if moved else "")
+            + (" [dry_run]" if dry_run else ""))
+    return folds
 
 
 def find_real_id_for_temp(conn: sqlite3.Connection, session_id: str,
@@ -2057,6 +2171,11 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         if before_boundary.get(tid) != aid:
             provenance[tid] = "boundary_rendezvous"
 
+    # ── Synthetic ids proved real by this run ────────────────────────────────
+    section("Synthetic id resolution")
+    resolve_synthetic_ids(conn, args.session, full_assignment, provenance, stitch_map,
+                          gallery_dir, dry_run=args.dry_run)
+
     # ── Duplicate Resolver — resolve duplicates across all assignments (kinetic+manual+cosine)
     full_assignment, merge_map = resolve_duplicate_assignments(
         assignment   = full_assignment,
@@ -2076,6 +2195,13 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         embed_df_final["temp_id"] = embed_df_final["temp_id"].replace(merge_map)
     _, cosine_ok = commit_galleries(embed_df_final, full_assignment, provenance, conn,
                                     gallery_dir, session_id=args.session, dry_run=args.dry_run)
+
+    # ── ID-switch check — every track, resolved or not (review flags only) ───
+    section("ID-switch check")
+    n_flags = flag_id_switches(embed_df_final, full_assignment, conn, args.session,
+                               dry_run=args.dry_run)
+    log(f"{n_flags} track(s) flagged (python3 gallery_ledger.py list-id-switch-flags)"
+        if n_flags else "No likely ID switches.")
 
     # ── Identity record — session_assignments (identity_record.py) ───────────
     # raw temp_id → final temp_id (stitching, then Duplicate Resolver merges).
@@ -2147,6 +2273,20 @@ def run(session: str, dry_run: bool = False, bypass_upload_check: bool = False) 
         dry_run       = args.dry_run,
         merge_map     = raw_to_final,   # stitching + Duplicate Resolver, raw → final
     )
+
+    # ── embed_mean per (cow, window) ──────────────────────────────────────────
+    if not timeline_df.empty:
+        em = window_embed_means(embed_df_final, tracks_df, full_assignment,
+                                P.timeline.bin_minutes)
+        key = pd.to_datetime(timeline_df["window_start_dt"])
+        timeline_df = timeline_df.drop(columns=["embed_mean", "embed_mean_is_night"],
+                                       errors="ignore")
+        timeline_df["_win"] = key.values
+        timeline_df = timeline_df.merge(
+            em.rename(columns={"window_start_dt": "_win"}), on=["real_id", "_win"],
+            how="left").drop(columns=["_win"])
+        log(f"embed_mean filled for {int(timeline_df['embed_mean'].notna().sum())}"
+            f"/{len(timeline_df)} timeline rows")
 
     # ── Timeline Writer — write to DB ─────────────────────────────────────────
     write_timeline(timeline_df, args.session, conn, dry_run=args.dry_run)

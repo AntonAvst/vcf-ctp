@@ -48,6 +48,7 @@ from typing import NamedTuple
 import numpy as np
 
 import config
+import gallery_ledger
 from ..schema import (
     EMBED_DIM, N_SLOTS, GALLERY_SLOTS, SLOT_NAMES,
     Posture, Facing,
@@ -528,11 +529,33 @@ def backpropagate_resolution(
     conn.commit()
 
     # ── Fold gallery vectors (every modality) ───────────────────────────────
-    alpha = config.params().gallery.synthetic_merge_alpha
+    # The real cow's slots are built by the gallery contribution ledger, so
+    # the synthetic id's history joins her ledger as ONE row per slot under a
+    # pseudo-session (source 'synthetic', source weight
+    # gallery.synthetic_merge_alpha, gallery.contribution.legacy_seed_frames
+    # effective frames). It is drift-gated, decays and can be rejected like any
+    # other row. A plain EMA fold would be overwritten by her next commit.
+    gp = config.params().gallery
+    pseudo_session = f"__synthetic__{synthetic_id}"
     for modality, pose_gallery in pose_galleries.items():
-        if synthetic_id in pose_gallery.embeds:
-            pose_gallery.merge_and_delete(synthetic_id, real_id, alpha=alpha)
-            pose_gallery.save(gallery_dir, modality)
+        if synthetic_id not in pose_gallery.embeds:
+            continue
+        ledger = gallery_ledger.SessionCommit(conn, pseudo_session, "pose")
+        for s in range(N_SLOTS):
+            vec = pose_gallery.get_slot_vector(synthetic_id, s)
+            if vec is None:
+                continue
+            res = ledger.record(
+                real_id=real_id, modality=modality, slot_idx=s, source="synthetic",
+                source_weight=gp.synthetic_merge_alpha,
+                n_effective_frames=gp.contribution.legacy_seed_frames, vector=vec,
+                current_vector=pose_gallery.get_slot_vector(real_id, s))
+            if res.status == "active":
+                pose_gallery.set_slot_vector(real_id, s, res.vector_after, res.n_contributions)
+        ledger.finish()
+        del pose_gallery.embeds[synthetic_id]
+        del pose_gallery.counts[synthetic_id]
+        pose_gallery.save(gallery_dir, modality)
 
     return rows_updated
 

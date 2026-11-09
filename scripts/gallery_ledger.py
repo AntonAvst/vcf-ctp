@@ -115,7 +115,9 @@ CREATE TABLE IF NOT EXISTS gallery_contributions (
     modality            TEXT    NOT NULL,   -- 'day' | 'night'
     gallery             TEXT    NOT NULL,   -- 'flat' | 'pose'
     slot_idx            INTEGER NOT NULL,   -- -1 (FLAT_SLOT) for 'flat'; 0-7 for 'pose'
-    source              TEXT    NOT NULL,   -- 'manual' | 'kinetic' | 'boundary_rendezvous' | 'cosine' | 'legacy'
+    source              TEXT    NOT NULL,   -- 'manual' | 'kinetic' | 'boundary_rendezvous' | 'cosine'
+                                             -- | 'legacy' (pre-ledger vector) | 'synthetic' (a
+                                             -- resolved synthetic id's pose history)
     source_weight       REAL    NOT NULL,   -- gallery.source_weights[source] snapshot at commit time
     n_effective_frames  REAL    NOT NULL,
     vector              TEXT    NOT NULL,   -- JSON list[128], L2-normalised
@@ -133,12 +135,14 @@ CREATE TABLE IF NOT EXISTS id_switch_flags (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          TEXT    NOT NULL,
     temp_id             INTEGER NOT NULL,
-    real_id             INTEGER,            -- NULL if flagged before an id was resolved
+    real_id             INTEGER,            -- NULL = unresolved track; negative = synthetic id
     modality            TEXT    NOT NULL,
     n_effective_frames  REAL    NOT NULL,
     trim_frac           REAL    NOT NULL,
     split_gap           REAL    NOT NULL,
     split_cluster_frac  REAL    NOT NULL,
+    interleave_frac     REAL,               -- frame weight on the wrong side of the switch point
+    switch_frame        INTEGER,            -- frame_index where the second animal takes over
     created_dt          TEXT    NOT NULL,
     reviewed             INTEGER NOT NULL DEFAULT 0,
     UNIQUE(session_id, temp_id, modality)
@@ -149,6 +153,12 @@ CREATE TABLE IF NOT EXISTS id_switch_flags (
 def migrate_schema(conn: sqlite3.Connection) -> None:
     """Safe to call every run (CREATE TABLE/INDEX IF NOT EXISTS)."""
     conn.executescript(SCHEMA_SQL)
+    for sql in ("ALTER TABLE id_switch_flags ADD COLUMN interleave_frac REAL",
+                "ALTER TABLE id_switch_flags ADD COLUMN switch_frame INTEGER"):
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass   # column already present
     conn.commit()
 
 
@@ -496,10 +506,11 @@ def flag_id_switch(conn: sqlite3.Connection, session_id: str, temp_id: int,
         return
     conn.execute(
         "INSERT OR REPLACE INTO id_switch_flags (session_id, temp_id, real_id, modality, "
-        "n_effective_frames, trim_frac, split_gap, split_cluster_frac, created_dt) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (session_id, int(temp_id), real_id, modality, report.n_total, report.trim_frac,
-         report.split_gap, report.split_cluster_frac, pd.Timestamp.now().isoformat()))
+        "n_effective_frames, trim_frac, split_gap, split_cluster_frac, interleave_frac, "
+        "switch_frame, created_dt) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, int(temp_id), None if real_id is None else int(real_id), modality,
+         report.n_total, report.trim_frac, report.split_gap, report.split_cluster_frac,
+         report.split_interleave_frac, report.switch_frame, pd.Timestamp.now().isoformat()))
     conn.commit()
 
 
@@ -642,10 +653,12 @@ def main() -> None:
             rows = list_id_switch_flags(conn, unreviewed_only=not args.all)
             print(f"{len(rows)} flag(s):")
             for r in rows:
+                sw = r.get("switch_frame")
                 print(f"  id={r['id']:<6} {r['session_id']:<42} temp_id={r['temp_id']:<6} "
-                      f"real_id={r['real_id']} {r['modality']:<5} gap={r['split_gap']:.3f} "
-                      f"smaller_group={r['split_cluster_frac']:.0%} trimmed={r['trim_frac']:.0%} "
-                      f"reviewed={bool(r['reviewed'])}")
+                      f"real_id={r['real_id'] if r['real_id'] is not None else 'unresolved'} "
+                      f"{r['modality']:<5} switch@frame={sw if sw is not None else '?'} "
+                      f"gap={r['split_gap']:.3f} smaller_group={r['split_cluster_frac']:.0%} "
+                      f"trimmed={r['trim_frac']:.0%} reviewed={bool(r['reviewed'])}")
         elif args.cmd == "review-id-switch-flag":
             mark_id_switch_reviewed(conn, args.id)
             print(f"flag id={args.id} marked reviewed")

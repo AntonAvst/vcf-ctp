@@ -181,7 +181,7 @@ Reconcile thresholds are no longer passed by `track_and_dump.py` — reconcile r
 | Tracklet Stitching | `stitching.enabled` / `max_gap_s` / `max_dist` / `dist_per_s` / `end_window_s` / `max_size_ratio` / `ambiguity_margin` | true / 8.5 / 0.5 / 0.05 / 1.0 / 1.5 / 0.15 |
 | Noise Filter | `noise_filter.min_duration_s` / `min_detections` | 2.0 / 25 |
 | Kinetic Matcher | `kinetic_match.corr_threshold` / `min_active_bins` / `min_temp_id_frames` / `activity_pct` | 0.7 / 3 / 0.10 / 0.25 |
-| Shared time grid | `timeline.bin_minutes` (matcher, Sensor Sequencer, vision windows) | 15 |
+| Shared time grid | `timeline.bin_minutes` (matcher, Sensor Sequencer, vision windows) / `embed_mean_min_frames` (timeline `embed_mean`) | 15 / 5 |
 | Camera mode (read per row from `raw_tracks.is_night`, set by track_and_dump.py) | `camera_mode.chroma_tol` / `color_pixel_frac` / `debounce_seconds` / `sample_stride` | 6 / 0.05 / 2.0 / 8 |
 | Legacy is_night fallback — only rows with NULL `is_night` (tracked before per-frame detection) | `session.night_start_hour` / `night_end_hour` / `night_fraction` | 20 / 6 / 0.5 |
 | Gallery commit (flat + pose, real ids) | `gallery.source_weights` (manual / kinetic / boundary_rendezvous / cosine) / `min_embeds` (effective frames) | 1.0 / 1.0 / 0.5 / 0.5 / 10 |
@@ -189,11 +189,12 @@ Reconcile thresholds are no longer passed by `track_and_dump.py` — reconcile r
 | Synthetic ids + TempPoseGallery (still EMA) | `gallery.ema_alpha` / `synthetic_merge_alpha` | 0.15 / 0.5 |
 | Appearance quality (every step that pools embeddings) | `appearance_quality.min_px` / `full_px` / `edge_margin_px` / `edge_weight` | 24 / 96 / 4 / 0.3 (size provisional) |
 | Robust session mean (every pooled embedding) | `appearance_quality.robust_mean.enabled` / `min_frames_for_trim` / `trim_mad_k` / `max_trim_frac` | true / 20 / 3.0 / 0.3 |
-| ID-switch flag (Gallery commit) | `appearance_quality.id_switch.enabled` / `min_frames` / `min_cluster_frac` / `min_gap` | true / 20 / 0.25 / 0.15 (provisional) |
+| ID-switch check (every track) | `appearance_quality.id_switch.enabled` / `min_frames` / `min_cluster_frac` / `min_gap` / `max_interleave_frac` | true / 20 / 0.25 / 0.15 / 0.10 (provisional) |
 | Cosine Resolver | `cosine_resolver.threshold` (also Boundary Rendezvous tier 2) / `min_embeds` | 0.75 / 5 |
 | Cosine ids → gallery (margin gate) | `gallery.cosine_gate.enabled` / `threshold_margin` / `second_best_margin` | true / 0.05 / 0.10 (provisional) |
 | Cosine + Duplicate Resolver | `cooccurrence.iou_same_animal` / `frame_tolerance_min` / `gap_multiplier` | 0.3 / 20 / 2.0 |
 | Duplicate Resolver, Boundary Rendezvous | `identity.source_priority` / `protected_sources` | manual > kinetic > boundary_rendezvous > cosine / manual, kinetic |
+| Synthetic id resolution | `identity.resolve_synthetic_sources` (+ `gallery.synthetic_merge_alpha`, `contribution.legacy_seed_frames` for the pose history) | manual, kinetic, boundary_rendezvous (0.5 / 200) |
 
 ---
 
@@ -294,7 +295,7 @@ vision_features/
 - Runs live posture + facing classification per frame if `vision_features/` is present (optional import)
 - **`draw_masks` (cli.yaml; QA/visualization only):** overlays segmentation mask polygons as a translucent fill + outline, drawn beneath the bbox/label pills so text stays legible. Reads `outputs/<session_id>/qa_masks/masks_part*.parquet` — the file `track_and_dump.py` produces with `save_masks: true`. No-op with a log warning if that file doesn't exist for the session (re-run `track_and_dump.py` with `save_masks: true` first). Toggleable live in-browser ("🎭 Mask" button), same generic toggle mechanism as Bbox/Pose/Direction — flips `STATE.show_mask` via `POST /api/control {action: "toggle_mask"}`.
 - Browser controls: pause / fast-forward (1×/2×/4×/8×) / quit; sensor chart auto-refreshes every 3 s; feature toggles: Bbox, ID, Keypoints, Pose, Direction, Mask
-- CLI: `--video`, `--session_id` (override), `--bypass_upload_check`, `--params`. All overlay options (`draw_pose`, `draw_masks`, `kp_index`, `kp_conf_thresh`, `hide_occluded`, `port`, `start`, `limit`, …) are in `cli.yaml` → `display_tracks:`. Its `kp_conf_thresh` is a display filter only, independent of `params pose.kp_conf_thresh`.
+- CLI: `--video`, `--session_id` (override), `--start N` (first frame, overrides `cli.yaml` for this run — the review queue's commands use it), `--bypass_upload_check`, `--params`. All overlay options (`draw_pose`, `draw_masks`, `kp_index`, `kp_conf_thresh`, `hide_occluded`, `port`, `start`, `limit`, …) are in `cli.yaml` → `display_tracks:`. Its `kp_conf_thresh` is a display filter only, independent of `params pose.kp_conf_thresh`.
 - Requires: `pip install flask`
 
 ---
@@ -435,14 +436,16 @@ def parse(self, df_raw: pd.DataFrame, source_file: str) -> pd.DataFrame:
 | **Manual Merge** | Load `manual_assignments` from DB; manual overrides kinetic on conflict | *(was Step A.5)* |
 | **Appearance Quality** | Weight per detection for every step that pools embeddings (`appearance_quality.py`): 0 below `min_px` box size (sqrt(w·h)), rising linearly to 1 at `full_px`; × `edge_weight` when the box touches the frame border (frame size from `video_sessions.frame_w/frame_h`; skipped when unknown). Weight-0 frames are dropped from the embeddings; every `min_embeds` / `min_slot_frames` threshold counts effective frames (sum of weights). A track's mean embedding is also outlier-trimmed (`appearance_quality.robust_mean`): frames whose cosine to the preliminary mean falls more than `trim_mad_k` robust SDs (1.4826 × MAD) below the median are dropped, at most `max_trim_frac` of the effective frames, only for tracks with ≥ `min_frames_for_trim`. Never used for positions or kinetics. | — |
 | **Gallery preview** | In memory only: stored flat galleries plus this session's manual/kinetic ids blended in, so the Cosine Resolver can match a fragment to a cow confirmed earlier in the same session. Nothing saved. | *(was Step B)* |
-| **Cosine Resolver** | 3-tier query per unresolved temp_id: (1) flat real_id gallery, (2) pose-conditioned real_id gallery, (3) TempPoseGallery — cross-session, **cross-camera** temp matching (cows move freely between cameras, so this is not restricted to one). If a match to a real_id is found → assign it. If a match to another temp_id is found → inherit the id `session_assignments` has for it, or mint a new synthetic id (the other session's temp_id is recorded as a link row). A temp_id's embeds are split by camera mode and each mode's mean is only compared with that mode's galleries; real-id steps (1–2) run in every mode the temp_id has ≥ `min_embeds` in (most embeds first) before any temp-gallery match (3). Its matches reach the galleries in the Gallery commit (below), in every mode with enough frames. Backpropagates: if a synthetic id gets resolved to a real_id, all prior timeline rows are updated. Falls back to kinetics-only if all galleries are empty. | *(was Step C)* |
+| **Cosine Resolver** | 3-tier query per unresolved temp_id: (1) flat real_id gallery, (2) pose-conditioned real_id gallery, (3) TempPoseGallery — cross-session, **cross-camera** temp matching (cows move freely between cameras, so this is not restricted to one). If a match to a real_id is found → assign it. If a match to another temp_id is found → inherit the id `session_assignments` has for it, or mint a new synthetic id (the other session's temp_id is recorded as a link row). A temp_id's embeds are split by camera mode and each mode's mean is only compared with that mode's galleries; real-id steps (1–2) run in every mode the temp_id has ≥ `min_embeds` in (most embeds first) before any temp-gallery match (3). Its matches reach the galleries in the Gallery commit (below), in every mode with enough frames. Falls back to kinetics-only if all galleries are empty. | *(was Step C)* |
 | **Boundary Rendezvous** | Cows crossing between cameras 26/33/38 are linked via known shared-zone polygons (`camera_topology` in `cross_camera.py`). A session's track dwelling in a shared zone past a dwell threshold is staged in `boundary_observations`; a matching observation from the zone's other camera triggers an immediate cross-camera resolve, scored by a tiered hierarchy — both-sides-kinetic → cosine → motion-magnitude correlation → single-cow-in-zone sanity check — mirroring reconcile's own kinetic-over-appearance trust order, with two new, lower-priority tiers for cases reconcile never had to handle before. Order-agnostic: works regardless of which camera's session is processed first, or how long apart. Matches on the flat embedding, not the pose-conditioned one, so it resolves in time for Sensor Sequencer to include the result. | *(was Step C.5)* |
+| **Synthetic id resolution** | A temp_id that now has a real id R from a trusted source (`identity.resolve_synthetic_sources`: manual, kinetic, boundary_rendezvous — not cosine) but had synthetic id S on record — from an earlier run of this session, or as a link from another session that paired its track with this one, checked for every raw fragment — proves S = R. Backpropagation then rewrites S → R in the timeline (every session), `temp_id_merges`, `manual_assignments` and `session_assignments`, deletes S's reid_registry row and moves S's pose history into R's ledger (one `synthetic` row per slot). This run's temp_ids holding S get R, so the Duplicate Resolver below merges or separates them. An S claimed by two different cows is left alone (logged). | — |
 | **Duplicate Resolver** | When several temp_ids claim the same AnimalId, rank them by the source of their id (manual > kinetic > boundary_rendezvous > cosine), then frame count. Fragments never on screen together in different spots are the same animal split by the tracker: merged into the winner, embed rows remapped. A temp_id on screen at the same time as the winner in a different spot is a different animal: it loses the id and stays unassigned. A run replaces the session's `temp_id_merges` rows from earlier runs. | *(was Step A.6)* |
-| **Gallery commit** | The run's **single** flat-gallery update, once every id is final (merged fragments pooled under their winner). Per temp_id and camera mode: robust, quality-weighted mean → recorded as this session's row in the gallery contribution ledger (`gallery_ledger.py`, table `gallery_contributions`); the cow's vector is rebuilt as the weighted mean of all its active rows (see `reid_registry`). The session's rows from earlier runs are replaced as a whole, so a re-run applies nothing twice and a cow it no longer contributes to is rebuilt without it. A contribution whose cosine with the cow's current vector is below `gallery.contribution.drift_gate_cosine` is held for review instead. Synthetic ids and source weight 0 never contribute. A cosine id contributes only if it clears the margin gate (`gallery.cosine_gate`): cosine to the cow ≥ `cosine_resolver.threshold` + `threshold_margin`, and ≥ every other cow + `second_best_margin`; the pose slots follow that decision. The id itself is assigned either way. Each contributing track is also checked for a two-group split of its frames (likely tracker ID switch) and flagged in `id_switch_flags` — review only, nothing is changed. Writes reid_registry. | — |
+| **Gallery commit** | The run's **single** flat-gallery update, once every id is final (merged fragments pooled under their winner). Per temp_id and camera mode: robust, quality-weighted mean → recorded as this session's row in the gallery contribution ledger (`gallery_ledger.py`, table `gallery_contributions`); the cow's vector is rebuilt as the weighted mean of all its active rows (see `reid_registry`). The session's rows from earlier runs are replaced as a whole, so a re-run applies nothing twice and a cow it no longer contributes to is rebuilt without it. A contribution whose cosine with the cow's current vector is below `gallery.contribution.drift_gate_cosine` is held for review instead. Synthetic ids and source weight 0 never contribute. A cosine id contributes only if it clears the margin gate (`gallery.cosine_gate`): cosine to the cow ≥ `cosine_resolver.threshold` + `threshold_margin`, and ≥ every other cow + `second_best_margin`; the pose slots follow that decision. The id itself is assigned either way. Writes reid_registry. | — |
+| **ID-switch check** | Every track of the session — assigned, synthetic and unresolved; a stitched chain counts as one track — in each camera mode with ≥ `id_switch.min_frames`: its outlier-trimmed frames are split into two groups (spherical 2-means), and it is flagged in `id_switch_flags` when the groups are well separated (`min_gap`), the smaller holds ≥ `min_cluster_frac`, and in frame order one group comes before a single switch frame and the other after it (≤ `max_interleave_frac` of the frames on the wrong side). One cow whose two sides look different alternates through the track and fails that last test. Review only. | — |
 | **Identity record** | Writes `session_assignments` (identity_record.py): one row per raw temp_id of the session with its final id and source, plus link rows for other sessions' temp_ids tied to a synthetic id this run. Replaces everything the session wrote before. Raises each cow's `reid_registry.match_method` to the best source seen (never lowers it). | — |
 | **Sensor Sequencer** | Δf_12/f_23/v/kinR → forward-fill to video time grid | *(was Step D)* |
 | **Vision Feature Extractor** | Load kps from Parquet → classify posture + facing per frame → aggregate to window scalars → write to timeline → update pose-conditioned gallery | *(was Step B-vision)* |
-| **Timeline Writer** | Insert rows into `resolved_cow_timeline` | *(was Step E)* |
+| **Timeline Writer** | Fill `embed_mean` per (cow, window), then insert rows into `resolved_cow_timeline` (replacing the session's earlier rows) | *(was Step E)* |
 
 **Output written:** `resolved_cow_timeline` — central join table
 
@@ -523,10 +526,10 @@ vector      = L2( Σ weight × row.vector / Σ weight )     over active rows, we
 ```
 - Old contributions fade by elapsed days (`half_life_days` 180); stronger evidence counts more (source weight, frames^0.5). Exponential decay keeps two rows' weight ratio constant, so a stored vector stays correct between commits.
 - **Re-runs replace, never stack:** a run sets aside all of its session's earlier rows for that gallery, records its new ones, and rebuilds any cow it no longer contributes to (re-assigned, below `min_embeds`, slot lost). `--dry_run` previews exactly what a real run would do.
-- **Drift gate:** each row stores `drift` = cosine(cow's vector from the other rows, this row). Below `drift_gate_cosine` the row is `held_for_review` and doesn't count until approved. The gate is below `cosine_resolver.threshold`, so it guards kinetic / manual / boundary ids that contradict the cow's appearance — a cosine id has already matched this gallery.
+- **Drift gate:** each row stores `drift` = cosine(cow's vector from the other rows, this row). Below `drift_gate_cosine` the row is `held_for_review` and doesn't count until approved. The gate is below `cosine_resolver.threshold`, so it guards kinetic / manual / boundary ids that contradict the cow's appearance — a cosine id has already matched this gallery. The gate depends on processing ORDER: a re-run is gated against the gallery as it stands then, so re-running a session after others were committed can change its stored `drift` (and in principle its held/active status). Re-running the same session twice in a row changes nothing.
 - **Exact removal:** `python3 gallery_ledger.py reject ID` (or `--session S --real_id R` for one session's whole contribution to one cow) takes it out and rebuilds; a human approve/reject survives re-runs of that session. `remove` deletes the row, but the next re-run writes it again.
 - **Pre-ledger galleries:** the first commit to a key whose gallery holds a vector but has no rows seeds that vector as one `legacy` row (`legacy_seed_frames` 200), so deploying the ledger didn't reset every cow to one session.
-- Synthetic ids and TempPoseGallery are scratch space and keep the plain EMA (`gallery.ema_alpha`).
+- Synthetic ids and TempPoseGallery are scratch space and keep the plain EMA (`gallery.ema_alpha`). When a synthetic id resolves to a real cow, each of its pose slots joins her ledger as one `synthetic` row (pseudo-session `__synthetic__<id>`, source weight `synthetic_merge_alpha`, `legacy_seed_frames` effective frames) — drift-gated and removable like any other row.
 - Routing is **per frame** (`raw_tracks.is_night`): day frames update day galleries only, night frames night galleries only. A session that spans the camera's colour↔IR switch updates both — that is how the night gallery learns cows first confirmed in daylight (and vice versa)
 - Galleries **never** cross-contaminate across modalities
 - reconcile uploads **both** modalities' gallery files after every run (a mixed session, a backprop fold or a temp-gallery purge can touch either)
@@ -547,7 +550,8 @@ vector      = L2( Σ weight × row.vector / Σ weight )     over active rows, we
   - lying_flag (bbox aspect ratio heuristic) — *pending (superseded by lying_fraction)*
   - restlessness (variance of spine_angle over window) — *pending*
   - kps_coverage (mean conf across 19 kp — reliability indicator) — *pending*
-  - embed_mean (JSON list[128], mean-pooled over window) — *pending*
+  - **embed_mean** (JSON list[128]) — ✓ active: robust, appearance-quality-weighted mean of all the cow's frames in the window (all her temp_ids), in ONE camera mode — the one with more effective frames; NULL below `timeline.embed_mean_min_frames`
+  - **embed_mean_is_night** (int) — ✓ active: that camera mode (1 = IR). Day and night embeddings aren't comparable
   - **lying_fraction** (float [0,1] — fraction of confident frames lying) — ✓ active
   - **posture_transitions** (int — standing↔lying switches in window) — ✓ active
   - **facing_dominant** (str — modal facing direction) — ✓ active
@@ -589,15 +593,15 @@ vector      = L2( Σ weight × row.vector / Σ weight )     over active rows, we
 
 ### `gallery_contributions` — gallery contribution ledger
 - One row per (session_id, real_id, modality, gallery `'flat'|'pose'`, slot_idx) — slot_idx −1 for flat, 0–7 for pose slots; UNIQUE on those five
-- source (`manual` | `kinetic` | `boundary_rendezvous` | `cosine` | `legacy`), source_weight (snapshot), n_effective_frames, vector (JSON list[128]), drift, created_dt
+- source (`manual` | `kinetic` | `boundary_rendezvous` | `cosine` | `legacy` | `synthetic` — a resolved synthetic id's pose history), source_weight (snapshot), n_effective_frames, vector (JSON list[128]), drift, created_dt
 - status: `active` | `held_for_review` | `rejected`; reviewed_dt set by a human decision (carried over to re-runs)
 - session_id `__legacy__` = a pre-ledger gallery vector seeded on first use
 - Written by reconcile.py (flat) and the Vision Feature Extractor (pose) via `gallery_ledger.SessionCommit`; reviewed with the `gallery_ledger.py` CLI
 
 ### `id_switch_flags` — likely tracker ID switches (review queue)
-- session_id, temp_id, real_id, modality, n_effective_frames, trim_frac, split_gap, split_cluster_frac, created_dt, reviewed; UNIQUE(session_id, temp_id, modality)
-- A track's (outlier-trimmed) frames split into two groups by spherical 2-means; flagged when the smaller group holds ≥ `id_switch.min_cluster_frac` of the frames and (within-group − between-group cosine) ≥ `min_gap`
-- Never acts on anything; a re-run replaces the session's flags. Only tracks that reach the Gallery commit are checked
+- session_id, temp_id, real_id (NULL = unresolved, negative = synthetic), modality, n_effective_frames, trim_frac, split_gap, split_cluster_frac, interleave_frac, switch_frame, created_dt, reviewed; UNIQUE(session_id, temp_id, modality)
+- Written by the ID-switch check (see Stage 2) for every track of the session; `switch_frame` is the frame_index where the second animal takes over — jump there in display_tracks.py to review
+- Never acts on anything; a re-run replaces the session's flags
 
 ### `tracklet_stitches` — tracklet stitching log
 - One row per stitched fragment: session_id, loser_tid (raw temp_id that was renamed), root_tid (the chain's first temp_id, which it now carries), prev_tid (fragment it was linked to directly), gap_s, dist (box sizes), size_ratio, created_dt
@@ -676,6 +680,10 @@ python3 calving_ledger_ingest.py \
 # 6. Validate config after editing
 python3 config.py
 
+# 6a. Debug + calibrate (see Testing & Calibration)
+python3 pipeline_check.py all --out report.txt              # [--session S] [--truth manual|kinetic|all] [--kinetics X.csv]
+python3 pipeline_check.py review --export queue.csv         # then fill 'verdict', and: review --ingest queue.csv
+
 # 6b. Review gallery contributions held by the drift gate, and ID-switch flags
 python3 gallery_ledger.py list-pending                     # [--real_id 7507]
 python3 gallery_ledger.py approve 42                        # or reject 42 / remove 42
@@ -690,6 +698,30 @@ python3 drive_manager.py retry-buffer
 ```
 
 ---
+
+## Testing & Calibration (`pipeline_check.py`)
+
+One read-only tool for three jobs; every report is short plain text (paste it into a chat or notes). It never writes the DB, galleries or params. By default it pulls the DB from Drive like the other scripts; `--db / --outputs / --gallery_dir` use local copies instead.
+
+**Debugging — does each feature do what it should on real data?**
+- `summary` — per session: detections, stitched chains, merges, ids by source, links, gallery contributions by status, ID-switch flags, timeline fill (modality bits, embed_mean).
+- `selfcheck` — invariants across every feature, PASS / WARN / FAIL with examples: galleries == ledger rebuild (flat + pose), reid_registry mirror, every recorded temp_id exists, fragments carry their chain's id, link rows, synthetic ids not dangling, match_method ≥ its evidence, manual labels honoured (or WARN: re-run needed), merges consistent, flags point at real frames, one timeline row per (session, cow, window), aligned windows, embed_mean well-formed.
+- `snapshot --out X.json` + `diff A.json B.json` — the whole pipeline state minus timestamps. Re-run idempotency: re-run the SAME session twice in a row, then diff — must be identical (a re-run after other sessions were committed may legitimately change `drift` only). Dry-run safety: snapshot → `--dry_run` → snapshot → identical. Param change: see exactly what moved.
+
+**Calibration — ground truth is pluggable (`--truth manual | kinetic | all`)**
+- Now: manual labels (`assign_identity.py --assign`) on the long tracks of a few sessions — no reconcile needed for labels. A chain whose fragments carry different labels is reported (wrong stitch link or wrong label).
+- When kinetics arrive: `kinetic --kinetics X.csv` scores the Kinetic Matcher against the manual labels (`corr_threshold`, `min_active_bins`) without running reconcile; after reconcile runs, `--truth kinetic` / `all` uses kinetic ids as extra ground truth, and `labels` lists manual-vs-kinetic disagreements.
+- `quality` (no labels) `min_px` / `full_px` / `edge_weight`: per box-size bin, how often a frame is closer to its own track (out-of-sample: the other half of the track) than to every track on screen at the same time. Win rate is averaged per track; bins with < 5 tracks never drive a suggestion.
+- `trim` (no labels) robust mean: trimmed share per track, tracks hitting the cap, and (with labels) whether trimming moves tracks toward their cow.
+- `cosine` — `cosine_resolver.threshold`, `gallery.cosine_gate` margins, `drift_gate_cosine`: labeled tracks scored against per-cow references from OTHER tracks, cross-session (the real case) and any-other-track.
+- `idswitch` — `min_gap` / `max_interleave_frac`: false flags on labeled tracks, detection of artificial switches (two different cows' tracks spliced), false flags on same-cow splices.
+- `window` — `embed_mean_min_frames`.
+
+**Review — what only watching the video can judge:** `review --export queue.csv` lists ID-switch flags (at `switch_frame`), held gallery contributions, cosine / boundary / kinetic / synthetic ids, merges, co-occurring separations, a sample of stitch links and label conflicts — each with the `display_tracks.py --start` command and a blank `verdict` (y / n / ?). `review --ingest queue.csv` gives precision per category.
+
+**Order of work:** (1) reconcile the sessions twice → `selfcheck` + `diff`; (2) label long tracks in display_tracks → `labels`; (3) `all` → adjust params.yaml → re-run → `diff` to see the effect; (4) `review --export`, watch, `--ingest`; (5) kinetics arrive → `kinetic`, then `--truth all`.
+
+**Cannot be calibrated with current data:** `gallery.contribution.half_life_days` / `frames_weight_power` (need weeks–months per cow); `legacy_seed_frames` and the known_temp_ids backfill (only matter for galleries built before the ledger — none here). Posture / facing thresholds (`vision.posture`, `vision.facing`) need frames labeled in the video; Boundary Rendezvous needs cross-camera ground truth.
 
 ## Key Design Decisions
 
@@ -707,7 +739,7 @@ python3 drive_manager.py retry-buffer
 12. **Dual day/night gallery, two layers per cow** — each cow has a flat fallback vector (`gallery_embed_{day|night}` in SQLite) and up to 8 pose-conditioned vectors (`gallery_pose_{day|night}.npy`). The 8-slot gallery is the primary query target; the flat vector is the Level 3 fallback when all pose slots are empty. Modalities never cross-contaminate. Modality is the camera's own mode per frame (see 25), not the session.
 13. **Pluggable vision feature extractor** — `vision_features/` is a self-contained package; adding a new feature means one new file in `features/` and two lines in `extractor.py`; no other files change
 14. **Pose-conditioned 8-slot gallery** — 8 slots per cow per modality = {standing, lying} × {left, right, toward, away}. Only high-confidence classified frames contribute to each slot. Cosine resolver queries exact slot first, then degrades gracefully to posture-level then flat. Galleries build up progressively — early sessions use flat fallback; discrimination improves automatically as slots populate.
-15. **Synthetic IDs for unresolved cows** — when a temp_id matches another temp_id cross-session but no real_id is known yet, reconcile.py mints a negative synthetic id (from `synthetic_id_counter.npy`). The synthetic id propagates consistently until a future kinetic match resolves it to a real AnimalId, at which point all prior timeline rows are backpropagated automatically.
+15. **Synthetic IDs for unresolved cows** — when a temp_id matches another temp_id cross-session but no real_id is known yet, reconcile.py mints a negative synthetic id (from `synthetic_id_counter.npy`). The synthetic id propagates consistently until a later run gives one of its tracks a real AnimalId from a trusted source (manual, kinetic or boundary — not appearance alone); the Synthetic id resolution step then folds it into that cow everywhere (timeline rows of every session, identity record, pose history). This used to sit inside the Cosine Resolver, where it could never trigger.
 16. **Drive as single source of truth** — all structured data lives on Google Drive (`thesis_google_drive:vcf_ctp_data`). Local disk is a write buffer only. drive_manager.py enforces this via dirty flags that block read scripts from running against stale Drive data.
 17. **Collar CSVs auto-discovered by time window** — reconcile.py and track_and_dump.py call `load_collar_data()` which lists Drive's `collar_data/`, parses `s/e` timestamps from canonical filenames, and merges all overlapping files. No `--kinetics` argument needed in normal operation.
 18. **Batch processing with single model load** — track_and_dump.py accepts a directory as `--source`. Models and DB are loaded once; `process_video()` is called per file. A `processing_log.csv` on Drive records every video processed, its outcome, and performance metrics.
@@ -719,7 +751,7 @@ python3 drive_manager.py retry-buffer
 24. **Two config files, strict, no code defaults** — `params.yaml` (what is computed) and `cli.yaml` (how it runs / QA output), loaded by `config.py` into frozen typed objects; unknown or missing keys are errors. One value per concept: e.g. a single `cosine_resolver.threshold` used by both the Cosine Resolver and Boundary Rendezvous, a single `cameras` list. Structural constants that stored data depends on stay fixed in `schema.py`. Safety switches (`--dry_run`, `--bypass_upload_check`) stay one-shot flags so they can't be left on in a file. Each session keeps a copy of the params it ran with, and `processing_log.csv` records the hash.
 25. **Day/night = the camera's mode, per frame, from the pixels** — replaced the clock rule (`session.night_*`), which labelled a whole session at once and drifts with the season (sunset moves by ~3 h between June and December). The cameras switch to grayscale themselves, so the pixels are ground truth: track_and_dump.py labels every frame (colour-pixel fraction + debounce) and stores it per row in `raw_tracks.is_night`. Everything downstream routes per row — Gallery Builder, Cosine Resolver, the pose-gallery update, backprop — so a video that switches mid-way is split correctly instead of being shoved into one modality. Per-row rather than per-session also means a dusk-crossing track whose identity is confirmed in daylight populates that cow's night gallery for free. A re-run purges the session's entries from **both** temp galleries first, so a session whose labels changed doesn't leave stale entries in the other modality's file. The clock rule survives only as a fallback for rows tracked before this existed.
 26. **Galleries are rebuilt from a contribution ledger, not accumulated by EMA** — the EMA could neither be re-run safely (each run applied its update again) nor corrected (a wrong match stayed blended in forever). Each session's contribution is a row in `gallery_contributions`; the vector is a decayed, evidence-weighted mean of the rows, recomputed on change. A re-run replaces all of its session's rows (including contributions it no longer makes), a per-cow drift gate holds sudden jumps for review, human decisions survive re-runs, and removal is exact. Scoped to real ids: synthetic ids and the TempPoseGallery are short-lived scratch space and keep the EMA.
-27. **Robust track mean + ID-switch flag, review only** — a track's mean embedding drops outlier frames (robust z-score on cosine to the mean, capped) everywhere embeddings are pooled. At the Gallery commit the same frames are tested for a clean two-group split, the signature of a tracker ID switch, and flagged in `id_switch_flags`. Flagged tracks are not split or unassigned automatically: the test can't yet tell a switch from one cow whose two sides look different, so a human decides.
+27. **Robust track mean + ID-switch flag, review only** — a track's mean embedding drops outlier frames (robust z-score on cosine to the mean, capped) everywhere embeddings are pooled. Every track's frames are also tested for the signature of a tracker ID switch — two clearly different groups, one before a single frame and the other after it — and flagged in `id_switch_flags`. Requiring the before/after split is what separates a switch from one cow whose two sides look different (those groups alternate). Flagged tracks are not split or unassigned automatically: a wrong split would corrupt two cows' histories, so a human decides, starting from `switch_frame`.
 28. **Identity record per session, replaced on every run** — `known_temp_ids` was an append-only JSON list per cow, so a re-run that changed a temp_id's id left the old one behind, and readers got whichever entry they scanned first. `session_assignments` is a table keyed by (session, raw temp_id, writer) that each run rewrites wholesale, including its links into other sessions. `match_method` is deliberately the opposite — a monotonic summary ("best evidence ever seen"); the current truth for any session is in the table.
 29. **Cosine ids are gated before they teach the gallery, not before they are assigned** — an appearance match that is barely above the threshold, or nearly as close to another cow, would otherwise feed the gallery that produced it and pull it toward the wrong cow. The gate sits at the Gallery commit, so it covers flat, pose-slot and temp-gallery-inherited matches alike, and it scores against each cow's vector without this session's earlier runs (a re-run can't vouch for itself). Kept as a gate rather than `source_weights.cosine: 0` so clear cosine matches still enrich galleries across sessions; setting the weight to 0 remains a config-only switch.
 
@@ -762,6 +794,7 @@ python3 drive_manager.py retry-buffer
     tracklet_stitch.py                      # Tracklet Stitching — called by reconcile.py
     appearance_quality.py                   # per-frame appearance weight + robust mean / ID-switch check
     gallery_ledger.py                       # gallery contribution ledger + review CLI — reconcile, extractor
+    pipeline_check.py                       # debugging + calibration + review queue (read-only)
     identity_record.py                      # session_assignments + match_method — reconcile, display_tracks, assign_identity
     cross_camera.py                         # Boundary Rendezvous — called by reconcile.py, not standalone
     track_and_dump.py
@@ -857,17 +890,38 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 ---
 
 ## ToDo
+
+- [x] resolve session id logic (video name, time, etc...) — see Key Design Decision 23 / `make_session_id`
+- [x] change day-night logic to grayscale vs rgb — per-frame camera-mode detection in `track_and_dump.py`, stored in `raw_tracks.is_night`, routed per row everywhere downstream; see Key Design Decision 25
+- [x] Gallery Builder runs twice when the Duplicate Resolver merges anything — replaced by a single Gallery commit per run with per-source weights (`gallery.source_weights`). Also: the timeline, `temp_id_merges` and pending `boundary_observations` are now replaced on re-run instead of duplicated, and boundary match outcomes are recorded so a re-run re-applies them.
+  - [x] Contribution ledger: re-running a session no longer re-applies its flat- or pose-gallery update — `gallery_ledger.py`, see Key Design Decision 26.
+- [x] Per-frame appearance quality weight — `appearance_quality.py`; box size ramp + frame-edge penalty, effective-frame thresholds, weighted pose slots and boundary embeddings. `video_sessions.frame_w/frame_h` added (new sessions only).
   - [ ] Calibrate `appearance_quality.min_px` / `full_px` once embeddings are available: per-frame agreement with its track's mean vs box size, per camera. 24 / 96 are provisional (June 16 boxes: median ~40 px).
+- [x] ~~The Cosine Resolver's soft update overwrites `reid_registry.match_method`~~ — `match_method` is now upgrade-only (best source ever seen), and `assign_identity.py` reads `session_assignments` instead of it (Key Design Decision 28)
+- [x] Identity record — `session_assignments` replaces append-only `known_temp_ids`; display_tracks.py, the Cosine Resolver's temp step and assign_identity.py read it (also fixes assign_identity's `→ None`: it never selected `real_id`)
 - [x] Gate cosine matches before they update a gallery — `gallery.cosine_gate` (Key Design Decision 29)
   - [ ] Calibrate `threshold_margin` / `second_best_margin`: on kinetically confirmed tracks, compare the margin a cosine query would have had for right vs. wrong cows
+- [x] Carry a provenance tag through Manual Merge→Gallery Builder→Duplicate Resolver — `provenance` dict + `identity.source_priority` in `params.yaml`
+- [x] drop camera_id restriction in TempPoseGallery
+- [x] Delete stale Drive-side parquet parts before re-uploading on reprocess — `track_and_dump.py` removes leftover `embeds_part*`/`kps_part*` parts and crops from an earlier run of the same video after uploading (`dm.remove_stale_remote_files`). Readers only ever use the local `outputs/<session_id>/`, which is wiped before each run, so this keeps the Drive copy accurate rather than fixing a double-count.
+- [x] Cross-camera identity tracking (continuation of the point above) — see `cross_camera.py` / Boundary Rendezvous
+  - [x] Implement tier-3 motion-magnitude correlation — `make_motion_corr_fn` / `motion_magnitude_corr` in `cross_camera.py`. On synthetic tracks (same cow seen at different scales and opposite directions, 1 px jitter): same cow r≈0.998, different cows ≤0.48; still matches with up to ~1.5 s clock offset, fails at 10 s. `motion_corr_threshold` not yet checked against real crossings.
+- [x] Reset the tracker between videos in batch mode.
+- [x] Collapse match_identity.py and reconcile's inline correlation logic into one implementation — `kinetic_match.py`; `score_up_to()` and `kinetic_match.live_min_active_bins` removed (no callers). Old and new verified identical on cam26's real tracks (assignments, r, all 325 scored pairs).
+- [x] Move vision-feature constants into the config file, including CLI plumbing — `config/params.yaml` + `config/cli.yaml`, see Configuration
 - [ ] Move from strict hierarchical override to a fused confidence score once ≥3–4 matching signals exist, keeping manual as a hard override.
+- [x] Short-gap tracklet stitching — `tracklet_stitch.py`, runs before the noise filter and the Kinetic Matcher. Purely geometric; velocity extrapolation was tested and dropped (no gain).
+- [x] Minimum-occurrence-count filter — reconcile's Noise Filter step (`noise_filter:` in params.yaml). Box size was tested as an extra criterion and dropped: short tracks aren't smaller than long ones on the June 16 data, so size belongs in a per-frame appearance weight instead.
+- [x] Config file for constants/thresholds — done in one pass, not incrementally (all scripts)
 - [ ] Configurable ID-matching hierarchy (e.g. manual > kinetic = cosine > ocr) with tie-break rules.
+- [x] Gallery contribution ledger, robust to drift — `gallery_ledger.py` / `gallery_contributions`: per-session rows, day-based decay, evidence weighting, per-cow drift gate with review, exact removal, re-run safe for flat and pose galleries (Key Design Decision 26)
   - [ ] Calibrate `gallery.contribution.drift_gate_cosine` on the stored `drift` of kinetic contributions; consider a per-cow adaptive threshold (from each cow's own drift history) instead of one global value
 - [x] Robust session mean + ID-switch flag — `appearance_quality.robust_mean` / `id_switch`, flags in `id_switch_flags` (Key Design Decision 27)
-  - [ ] Require the two groups to be split in time (one before, one after a switch point) — one cow whose left and right sides embed differently currently gives interleaved groups and a false flag. Calibrate `id_switch.min_gap` on real switches
-  - [ ] Check unresolved tracks too (only tracks that reach the Gallery commit are checked)
-- [ ] Persist per-session cosine drift and populate embed_mean — drift now stored per gallery contribution (`gallery_contributions.drift`); timeline `embed_mean` still pending
-- [ ] Synthetic-id backpropagation in the Cosine Resolver looks unreachable: it only runs for a temp_id that has a synthetic id AND a kinetic/manual one, but the Cosine Resolver never queries kinetic/manual temp_ids, so that combination can't occur. Verify and fix (pre-existing)
+  - [x] Groups must split in time (one before, one after a switch frame) — `id_switch.max_interleave_frac`; `switch_frame` stored
+  - [x] Unresolved and synthetic tracks checked too — separate ID-switch check over every track
+  - [ ] Calibrate `id_switch.min_gap` / `max_interleave_frac` on real switches
+- [x] Persist per-session cosine drift and populate embed_mean — drift per gallery contribution (`gallery_contributions.drift`); `embed_mean` + `embed_mean_is_night` per cow per window
+- [x] Synthetic-id backpropagation was unreachable inside the Cosine Resolver (it needed a temp_id with both a synthetic and a kinetic/manual id, which the Cosine Resolver never queries) — replaced by the Synthetic id resolution step, driven by `session_assignments`
 ---
 - [ ] retrain pose estimator (open question: masked crops vs. raw crops as input — masked-crop training would be an out-of-distribution shift for the current pose model; not yet decided)
 - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed

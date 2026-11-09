@@ -99,6 +99,7 @@ class Sampling:
 @dataclass(frozen=True)
 class Timeline:
     bin_minutes: int
+    embed_mean_min_frames: float   # effective frames a cow needs in a window for embed_mean
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,8 @@ class IdSwitchCheck:
                                    # not a split — robust_mean trims those separately)
     min_gap: float                # (mean within-cluster cosine) - (between-cluster cosine)
                                    # must exceed this to flag
+    max_interleave_frac: float    # in frame order, at most this fraction of the frames may
+                                   # sit on the "wrong" side of the best single switch point
 
 
 @dataclass(frozen=True)
@@ -242,6 +245,7 @@ class Cooccurrence:
 class Identity:
     source_priority: list
     protected_sources: list
+    resolve_synthetic_sources: list   # sources trusted to resolve a synthetic id to a real one
 
 
 @dataclass(frozen=True)
@@ -566,6 +570,12 @@ def _validate_params(p: Params) -> None:
     if not 0.0 < isc.min_cluster_frac <= 0.5:
         raise ConfigError(f"appearance_quality.id_switch.min_cluster_frac: must be in "
                           f"(0, 0.5], got {isc.min_cluster_frac}")
+    if not 0.0 <= isc.max_interleave_frac <= 0.5:
+        raise ConfigError(f"appearance_quality.id_switch.max_interleave_frac: must be in "
+                          f"[0, 0.5], got {isc.max_interleave_frac}")
+    if p.timeline.embed_mean_min_frames < 0:
+        raise ConfigError(f"timeline.embed_mean_min_frames: must be >= 0, "
+                          f"got {p.timeline.embed_mean_min_frames}")
     if isc.min_gap < 0:
         raise ConfigError(f"appearance_quality.id_switch.min_gap: must be >= 0, "
                           f"got {isc.min_gap}")
@@ -617,6 +627,10 @@ def _validate_params(p: Params) -> None:
     stray = set(p.identity.protected_sources) - set(pri)
     if stray:
         raise ConfigError(f"identity.protected_sources {sorted(stray)} are not in "
+                          f"identity.source_priority")
+    stray = set(p.identity.resolve_synthetic_sources) - set(pri)
+    if stray:
+        raise ConfigError(f"identity.resolve_synthetic_sources {sorted(stray)} are not in "
                           f"identity.source_priority")
 
     ids = p.camera_ids

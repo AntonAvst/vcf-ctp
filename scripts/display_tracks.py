@@ -937,11 +937,15 @@ def parse_args():
     ap.add_argument("--bypass_upload_check", action="store_true",
                     help="Skip dirty-flag check when reading from Drive "
                          "(proceeds with potentially stale data — use with caution)")
+    ap.add_argument("--start", type=int, default=None,
+                    help="First frame to show — overrides cli.yaml display_tracks.start for this "
+                         "run (pipeline_check.py review rows use it to jump to the frame in question)")
     config.add_params_arg(ap)   # cameras for session_id derivation
     cli_args = ap.parse_args()
     config.init(cli_args.params)
     opts = vars(config.cli().display_tracks)
-    return argparse.Namespace(**opts, **vars(cli_args))
+    given = {k: v for k, v in vars(cli_args).items() if not (k == "start" and v is None)}
+    return argparse.Namespace(**{**opts, **given})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
