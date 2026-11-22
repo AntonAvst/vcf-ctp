@@ -232,6 +232,20 @@ vision:
     min_kps_coverage: 0.05  # mean kp conf below → UNCERTAIN
     min_det_conf: 0.10
     ar_conf_weight: 0.70    # posture_conf = w·aspect-ratio clarity + (1-w)·kp coverage
+    # Limb-extension fallback — resolves AR-ambiguous frames only, never
+    # overrides a clear AR call. NOT yet calibrated against labeled data;
+    # plot each ratio's distribution for known standing/lying frames before
+    # trusting these thresholds. Reference is withers-sacrum spine length when
+    # confidently visible, else bbox diagonal — the two ratios are on
+    # different scales, hence separate threshold pairs below. The bbox pair
+    # is a rougher guess than the spine pair (no direct anatomical precedent).
+    min_kp_conf: 0.10                     # shoulder/hip & hoof (and spine, when used) conf needed to use that leg
+    limb_extended_min_ratio_spine: 0.70   # leg dist / spine(withers-sacrum) dist ≥ this → STANDING
+    limb_folded_max_ratio_spine: 0.40     # ≤ this → LYING; between = stays UNCERTAIN
+    limb_extended_min_ratio_bbox: 0.30    # leg dist / bbox diagonal ≥ this → STANDING
+    limb_folded_max_ratio_bbox: 0.12      # ≤ this → LYING; between = stays UNCERTAIN
+    min_limb_weight: 0.15                 # evidence floor (conf × legs-visible fraction) to trust this signal at all
+    limb_resolved_conf_scale: 0.60        # posture_conf scale-down vs a clean AR-based call
   facing:
     min_kp_conf: 0.05       # back keypoint usable above this
     min_body_axis_px: 20.0  # shorter spine axis → UNCERTAIN

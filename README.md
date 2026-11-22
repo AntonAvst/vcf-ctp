@@ -18,7 +18,7 @@ Two YAML files hold every setting; scripts keep no defaults of their own.
 |---|---|---|
 | `config/params.yaml` | Everything that changes what the pipeline **computes** | model paths, detection/pose thresholds, kinetic match, gallery contribution ledger, robust mean / ID-switch check, cosine threshold, co-occurrence, trust order, posture/facing thresholds, cross-camera tiers, cameras + zone polygons |
 | `config/cli.yaml` | How scripts **run** and what QA output they produce | `save_crops`, `save_masks`, `crop_tags`, display overlays, metrics output, Drive/local storage |
-| `vision_features/schema.py` | **Fixed** structural constants — not config | `EMBED_DIM`=128, `N_KP`=19, KP map, 8 gallery slots, ImageNet mean/std, `BACK_KPS` |
+| `vision_features/schema.py` | **Fixed** structural constants — not config | `EMBED_DIM`=128, `N_KP`=26, KP map, 8 gallery slots, ImageNet mean/std, `BACK_KPS` |
 
 - `config.py` loads both into frozen, typed objects. **Strict:** a missing key, an unknown key (typo) or a wrong type is an error naming the key; cross-field rules are checked too (`standing_max_ar < lying_min_ar`, `manual` first in `source_priority`, topology cameras must be listed under `cameras`, ASCII camera codes, values in [0,1] where required).
 - Validate after editing: `python3 config.py` (or `python3 config.py my_params.yaml`)
@@ -125,7 +125,7 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 ---
 
 ### `track_and_dump.py`
-- Runs YOLO detection + ByteTrack/BoT-SORT tracking + YOLOv8-Pose (19 kp) + Embedder128 (MobileNetV3 → 128D L2-norm)
+- Runs YOLO detection + ByteTrack/BoT-SORT tracking + YOLOv8-Pose (26 kp) + Embedder128 (MobileNetV3 → 128D L2-norm)
 - **Detector accepts either a plain detection model or a YOLO-seg (instance segmentation) model** — same `models.detector` setting in params.yaml, auto-detected via `det_model.task` at load time (logged at startup: `det. task : detect|segment`)
   - **Segmentation model loaded** → `r.masks.xy` polygons are extracted per detection (same index order as `r.boxes`) and used to build **background-removed crops for the embedder only** (`masked_crops_from_polys()`), fixing background contamination in ReID embeddings. Pose-model input and saved crop JPEGs (`save_crops`) deliberately keep using raw bbox crops — unaffected, so the existing pose model's input distribution doesn't shift.
   - **Plain detection model loaded** → behavior unchanged from before segmentation support; embedder uses raw bbox crops.
@@ -135,7 +135,7 @@ All blocked scripts accept `--bypass_upload_check` to skip the flag check and pr
 - Models loaded **once** at startup and reused across all videos in a batch
 - DB pulled from Drive **once** at startup and reused across all videos
 - Outputs to Drive via `drive_manager` per session: `calving_project.db` (SQLite), `embeds.parquet`, `kps.parquet`, optional `crops/`
-- Arrays (embed[128], kps[19×3], kps_kconf[19]) stored in Parquet — **never in SQLite**
+- Arrays (embed[128], kps[26×3], kps_kconf[26]) stored in Parquet — **never in SQLite**
 - **Camera mode (day colour / night IR) detected per frame from the pixels** — the cameras switch themselves to grayscale when light drops, possibly mid-video, so day/night is read from the video, not the clock. Each frame's metric is the fraction of (strided) pixels with `max(|R−G|,|G−B|,|R−B|) > chroma_tol`: ~0 in IR mode, clearly above 0 in colour mode even when the scene is washed out (mean HSV saturation was rejected — it's unstable on the dark pixels that dominate night frames). A frame is night if the fraction is ≤ `color_pixel_frac`. A new mode is only recorded after it holds for `debounce_seconds` (filter-swap / auto-exposure flicker is ignored; the first frame sets the starting mode). Stored per row in `raw_tracks.is_night`; `video_sessions.is_night` (majority) and `night_frame_fraction` are summaries. Cost ≈ 0.3 ms per 1080p frame. End-of-video log: % night, each switch with frame + wall time, and the metric's p1/p5/median/p95/p99 for threshold tuning.
 - **QA-only mask persistence (`save_masks` in cli.yaml):** when enabled with a segmentation model, mask polygons are additionally written to `outputs/<session_id>/qa_masks/masks_part*.parquet` (own schema, own filename prefix) — purely for visualization in `display_tracks.py` (`draw_masks`). Structurally isolated from the canonical outputs: separate subdirectory, separate file prefix, **never uploaded to Drive** (the end-of-video upload loop globs `embeds_part*`/`kps_part*` directly in `outdir`, non-recursive — `qa_masks/` is invisible to it by directory and by filename pattern), never touches `raw_tracks` or any other pipeline stage. No-op with a log line if the loaded model has no segmentation head.
 - Parses wall-clock start time from filename token `_S<YYYYMMDDHHmmss>`
@@ -211,8 +211,8 @@ vision_features/
 ├── extractor.py         # orchestrator — the only file reconcile.py touches
 ├── features/
 │   ├── __init__.py
-│   ├── posture.py       # standing / lying classifier (bbox aspect ratio + kps_coverage)
-│   └── facing.py        # left / right / toward / away classifier (nose→sacrum vector)
+│   ├── posture.py       # standing / lying classifier (bbox aspect ratio + kps_coverage; limb-extension fallback for AR-ambiguous frames)
+│   └── facing.py        # left / right / toward / away classifier (spine axis: withers→tail_base)
 └── gallery/
     ├── __init__.py
     └── pose_conditioned.py  # 8-slot pose-conditioned ReID gallery (load/update/query/save)
@@ -222,7 +222,7 @@ vision_features/
 
 | Classifier | Signal | Output |
 |---|---|---|
-| Posture | Bbox aspect ratio (AR ≤ `standing_max_ar` 0.85 → standing, ≥ `lying_min_ar` 1.10 → lying, band = uncertain) + kps_coverage gate — `params.yaml vision.posture` | `posture` ∈ {standing, lying, uncertain}, `posture_conf` |
+| Posture | Bbox aspect ratio (AR ≤ `standing_max_ar` 0.85 → standing, ≥ `lying_min_ar` 1.10 → lying, band = uncertain) + kps_coverage gate, **plus** a limb-extension fallback that resolves AR-ambiguous frames only (shoulder/hip→hoof pixel distance ÷ spine length, falling back to ÷ bbox diagonal when spine keypoints aren't confident; extended → standing, folded → lying, below confidence floor → stays uncertain) — `params.yaml vision.posture`, see Key Design Decision 30 | `posture` ∈ {standing, lying, uncertain}, `posture_conf` |
 | Facing | Spine axis from `schema.BACK_KPS` (withers→tail base); angle zones `toward_center`/`away_center` ± `depth_half_width` — `params.yaml vision.facing` | `facing` ∈ {left, right, toward, away, uncertain}, `facing_conf` |
 
 **Window aggregates written to `resolved_cow_timeline`:**
@@ -547,10 +547,10 @@ vector      = L2( Σ weight × row.vector / Σ weight )     over active rows, we
   - pelvic_tilt (kp7 ↔ kp10) — *pending*
   - tail_elevation (kp5/kp6 vs kp4) — *pending*
   - limb_symmetry (L/R hock distance ratio) — *pending*
-  - head_drop (kp0/kp1 vs kp2) — *pending*
+  - head_drop (nose/forehead vs withers) — *pending — indices from this note are stale after the 26-kp switch (old kp0/kp1 vs kp2 was nose/forehead vs withers; new kp2 is eye_L, not withers — withers is now kp4). Needs re-deriving against the new KP enum before implementing, not a literal index swap.*
   - lying_flag (bbox aspect ratio heuristic) — *pending (superseded by lying_fraction)*
   - restlessness (variance of spine_angle over window) — *pending*
-  - kps_coverage (mean conf across 19 kp — reliability indicator) — *pending*
+  - kps_coverage (mean conf across 26 kp — reliability indicator) — *pending*
   - **embed_mean** (JSON list[128]) — ✓ active: robust, appearance-quality-weighted mean of all the cow's frames in the window (all her temp_ids), in ONE camera mode — the one with more effective frames; NULL below `timeline.embed_mean_min_frames`
   - **embed_mean_is_night** (int) — ✓ active: that camera mode (1 = IR). Day and night embeddings aren't comparable
   - **lying_fraction** (float [0,1] — fraction of confident frames lying) — ✓ active
@@ -628,7 +628,30 @@ vector      = L2( Σ weight × row.vector / Σ weight )     over active rows, we
 
 ---
 
-## Pose Keypoint Index Map (19 kp)
+## Pose Keypoint Index Map (26 kp)
+
+Replaced the original 19-kp scheme in Nov 2026 — full rebuild, not an extension; indices are
+**not** backward-compatible with any 19-kp Parquet data (see Key Design Decision 3 / Storage
+Architecture). Source: Roboflow project `cow-pose-estimation-2` v2 (`_annotations_coco.json`),
+`data.yaml`: `kpt_shape: [26, 3]`.
+
+```
+0  nose          1  eye_R           2  eye_L           3  neck
+4  withers       5  spine_mid       6  sacrum          7  tail_base
+8  tail_mid      9  tail_tip       10  shoulder_L     11  carpus_L
+12 fetlock_fore_L  13 hoof_fore_L  14  shoulder_R     15  carpus_R
+16 fetlock_fore_R 17 hoof_fore_R   18  hip_L          19  hock_L
+20 fetlock_back_L 21 hoof_back_L   22  hip_R          23  hock_R
+24 fetlock_back_R 25 hoof_back_R
+```
+
+Skeleton (bone connectivity, used by `display_tracks.py`'s pose overlay) comes directly from
+the same `_annotations_coco.json`'s `skeleton` array, converted from 1-indexed to 0-indexed —
+not hand-drawn. `BACK_KPS` (the four landmarks `facing.py`'s spine axis uses) is still
+`(withers, spine_mid, sacrum, tail_base)`, same four body parts as the old scheme, now at
+indices 4/5/6/7 instead of 2/3/4/5.
+
+**19-kp scheme (historical, for anyone diffing old sessions' Parquet files):**
 ```
 0  nose          1  forehead      2  withers       3  spine_mid
 4  sacrum        5  tail_base     6  tail_tip       7  shoulder_L
@@ -722,13 +745,13 @@ One read-only tool for three jobs; every report is short plain text (paste it in
 
 **Order of work:** (1) reconcile the sessions twice → `selfcheck` + `diff`; (2) label long tracks in display_tracks → `labels`; (3) `all` → adjust params.yaml → re-run → `diff` to see the effect; (4) `review --export`, watch, `--ingest`; (5) kinetics arrive → `kinetic`, then `--truth all`.
 
-**Cannot be calibrated with current data:** `gallery.contribution.half_life_days` / `frames_weight_power` (need weeks–months per cow); `legacy_seed_frames` and the known_temp_ids backfill (only matter for galleries built before the ledger — none here). Posture / facing thresholds (`vision.posture`, `vision.facing`) need frames labeled in the video; Boundary Rendezvous needs cross-camera ground truth.
+**Cannot be calibrated with current data:** `gallery.contribution.half_life_days` / `frames_weight_power` (need weeks–months per cow); `legacy_seed_frames` and the known_temp_ids backfill (only matter for galleries built before the ledger — none here). Posture / facing thresholds (`vision.posture`, `vision.facing`) need frames labeled in the video; Boundary Rendezvous needs cross-camera ground truth. The new limb-extension posture fallback (`limb_extended_min_ratio_spine` / `limb_folded_max_ratio_spine` / `limb_extended_min_ratio_bbox` / `limb_folded_max_ratio_bbox` / `min_limb_weight` / `limb_resolved_conf_scale`) is pure anatomical-reasoning placeholders, not fit to any labeled data — plot each ratio's distribution against known standing/lying frames before trusting it. The bbox-normalized pair is a rougher guess than the spine pair.
 
 ## Key Design Decisions
 
 1. **No ReID during inference** — temp_ids saved raw; all identity resolution is post-hoc in reconcile.py
 2. **Wall-clock as universal join key** — frame_datetime links video to collar data; filename `_S<timestamp>` is the source
-3. **Arrays in Parquet, never SQLite blobs** — embed[128], kps[19×3], kps_kconf[19] live in per-session Parquet files; SQLite holds integer row pointers
+3. **Arrays in Parquet, never SQLite blobs** — embed[128], kps[26×3], kps_kconf[26] live in per-session Parquet files; SQLite holds integer row pointers
 4. **real_id is nullable** — pipeline doesn't block on unresolved identities; modality_mask signals quality
 5. **Two-stage identity resolution** — kinetic matching (primary) confirms AnimalId; cosine resolver (secondary) heals temp_id switches and enables cross-video, cross-camera continuity. Cosine resolver uses a 3-tier query: flat gallery → pose-conditioned gallery → TempPoseGallery (cross-session, cross-camera temp matching)
 6. **Manual assignment as first-class fallback** — `assign_identity.py` writes to `manual_assignments`; reconcile merges these with kinetic results, manual taking priority
@@ -755,6 +778,7 @@ One read-only tool for three jobs; every report is short plain text (paste it in
 27. **Robust track mean + ID-switch flag, review only** — a track's mean embedding drops outlier frames (robust z-score on cosine to the mean, capped) everywhere embeddings are pooled. Every track's frames are also tested for the signature of a tracker ID switch — two clearly different groups, one before a single frame and the other after it — and flagged in `id_switch_flags`. Requiring the before/after split is what separates a switch from one cow whose two sides look different (those groups alternate). Flagged tracks are not split or unassigned automatically: a wrong split would corrupt two cows' histories, so a human decides, starting from `switch_frame`.
 28. **Identity record per session, replaced on every run** — `known_temp_ids` was an append-only JSON list per cow, so a re-run that changed a temp_id's id left the old one behind, and readers got whichever entry they scanned first. `session_assignments` is a table keyed by (session, raw temp_id, writer) that each run rewrites wholesale, including its links into other sessions. `match_method` is deliberately the opposite — a monotonic summary ("best evidence ever seen"); the current truth for any session is in the table.
 29. **Cosine ids are gated before they teach the gallery, not before they are assigned** — an appearance match that is barely above the threshold, or nearly as close to another cow, would otherwise feed the gallery that produced it and pull it toward the wrong cow. The gate sits at the Gallery commit, so it covers flat, pose-slot and temp-gallery-inherited matches alike, and it scores against each cow's vector without this session's earlier runs (a re-run can't vouch for itself). Kept as a gate rather than `source_weights.cosine: 0` so clear cosine matches still enrich galleries across sessions; setting the weight to 0 remains a config-only switch.
+30. **Limb-extension as a posture fallback, not a competitor to aspect ratio** — bbox AR stays the primary posture signal; a new per-leg geometric check (shoulder/hip→hoof pixel distance ÷ a body-scale reference, using the 26-kp scheme's named joints) only activates for frames AR already calls `UNCERTAIN`, and only when at least one leg's keypoints clear a confidence floor — frames with all four legs too occluded to measure stay `UNCERTAIN` rather than guessing. The reference is withers↔sacrum spine length when confidently visible, falling back to the bbox diagonal when it isn't — spine keypoints are exactly the ones most likely low-confidence while the cow is actually lying, so the fallback covers the cases the signal is most needed for. Spine- and bbox-normalized ratios are on different scales and use separate threshold pairs (`*_spine` / `*_bbox`), never compared against one shared number. Confidence for limb-resolved frames is deliberately scaled down (`limb_resolved_conf_scale`) relative to a clean AR call either way. All four thresholds are unvalidated placeholders pending labeled data (see Calibration); the bbox pair is a rougher guess than the spine pair, having no direct anatomical precedent to reason from.
 
 ---
 
@@ -763,7 +787,7 @@ One read-only tool for three jobs; every report is short plain text (paste it in
 ### Decision: SQLite + Parquet + Google Drive
 
 **Database engine:** SQLite for all structured tables. Zero infrastructure, full SQL, pandas-native.  
-**Array storage:** Parquet files (pyarrow) for embed[128], kps[19×3], kps_kconf[19] — one file pair per session. SQLite stores integer row pointers, never raw blobs.  
+**Array storage:** Parquet files (pyarrow) for embed[128], kps[26×3], kps_kconf[26] — one file pair per session. SQLite stores integer row pointers, never raw blobs.  
 **Cloud storage:** Google Drive via rclone (`thesis_google_drive` remote). drive_manager.py handles all sync.  
 **Raw video:** Local disk only — not synced. Re-processable from source.
 
@@ -771,7 +795,7 @@ One read-only tool for three jobs; every report is short plain text (paste it in
 | Artifact | Size/hour |
 |---|---|
 | Parquet embeds (embed[128] float32, Snappy) | ~180 MB |
-| Parquet keypoints (kps[19×3] + kps_kconf) | ~80 MB |
+| Parquet keypoints (kps[26×3] + kps_kconf) | ~110 MB *(scaled from the old 19-kp ~80 MB by array width; not re-measured against real 26-kp output yet)* |
 | resolved_cow_timeline (scalar features) | ~20 MB |
 | SQLite DB (all structured tables) | negligible |
 | reid_gallery .npy flat (total, not per hour) | ~1 MB |
@@ -924,7 +948,14 @@ raw_data/videos/                            # LOCAL ONLY — never synced
 - [x] Persist per-session cosine drift and populate embed_mean — drift per gallery contribution (`gallery_contributions.drift`); `embed_mean` + `embed_mean_is_night` per cow per window
 - [x] Synthetic-id backpropagation was unreachable inside the Cosine Resolver (it needed a temp_id with both a synthetic and a kinetic/manual id, which the Cosine Resolver never queries) — replaced by the Synthetic id resolution step, driven by `session_assignments`
 ---
-- [ ] retrain pose estimator (open question: masked crops vs. raw crops as input — masked-crop training would be an out-of-distribution shift for the current pose model; not yet decided)
+- [ ] retrain pose estimator — **in progress**, new 26-kp scheme (`cow-pose-estimation-2` v2, Roboflow, Nov 2026; see Pose Keypoint Index Map). Masked vs. raw crops as training input still undecided (masked-crop training would be an out-of-distribution shift for the current pose model).
+  - [x] `schema.py` / `track_and_dump.py` / `display_tracks.py` updated for the new scheme — `N_KP` 19→26, full `KP` enum rebuild, `BACK_KPS` re-pointed at the same four landmarks' new indices, skeleton overlay rebuilt from the dataset's own COCO-format skeleton array. Two pre-existing literal-`19` bugs found and fixed along the way (track_and_dump.py's Parquet writer, display_tracks.py's reshape) that would have silently truncated the new 26-wide arrays on write.
+  - [x] Added a limb-extension posture fallback alongside the scheme switch, since the new joints (hocks, fetlocks, hooves) support it — see Key Design Decision 30. Not yet calibrated.
+  - [x] Found and fixed a `flip_idx` bug in the Roboflow export's `data.yaml` (shipped as an identity mapping — no left/right swap on horizontal flip, corrupting left/right keypoint labels on ~half of training images under `fliplr` augmentation). Worked around by disabling `fliplr` for this training run rather than trusting the corrected list, since flipping isn't essential with a clean 565-image train set.
+  - [ ] Training run in progress (YOLOv8n-pose, backbone-transfer from COCO-pretrained weights); first attempt OOM-killed by WSL2 at epoch 4, resumed with lower `--workers`/`--batch`.
+  - [ ] Validate the trained model (pose mAP, qualitative spot-check) before pointing `params.yaml` → `models.pose` at it — the old 19-kp model stays in production until then.
+  - [ ] Calibrate the new limb-extension thresholds and re-validate `vision.posture` / `vision.facing` against the new scheme — see Calibration.
+  - [ ] Old sessions' 19-wide `kps.parquet` files are not migrated; still no versioning strategy for mixed-width historical data once the new model goes live.
 - [ ] Cross-check a Boundary Rendezvous pairing against independent identity claims already on record elsewhere (non-adjacent-camera conflict case) — explicitly deferred, not yet designed
 - [ ] decide what to do with clumping — **blocked on evaluation**, see below
 ---

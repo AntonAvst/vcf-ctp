@@ -15,6 +15,44 @@ Supporting signal : kps_coverage
                     detect occlusion / ambiguous frames, not as a primary
                     classifier.
 
+Secondary signal : limb extension ratio
+                    For each leg (shoulder_L/R→hoof_fore_L/R, hip_L/R→hoof_back_L/R),
+                    the pixel distance between its two joints, normalised by a
+                    body-scale reference independent of posture. Standing legs are
+                    extended → ratio close to the leg's full anatomical proportion;
+                    lying legs fold under or out to the side → ratio collapses
+                    toward zero.
+
+                    The reference is withers↔sacrum spine length when those two
+                    keypoints are confidently visible, falling back to the bbox
+                    diagonal otherwise. The fallback matters: spine keypoints are
+                    exactly the ones most likely to be low-confidence when the cow
+                    IS lying (body collapsed, rear obscured), so without it the
+                    signal would be unavailable for a disproportionate share of the
+                    frames it's most needed for. The bbox diagonal is always
+                    available once detection succeeds at all, at the cost of being
+                    a cruder, less purely-anatomical reference. Spine- and
+                    bbox-normalized ratios are on different numeric scales and use
+                    separate threshold pairs (`*_spine` / `*_bbox` in params.yaml)
+                    — never compared against one shared threshold.
+
+                    Used ONLY to resolve frames that bbox AR leaves UNCERTAIN (the
+                    ambiguous band between standing_max_ar and lying_min_ar) — it
+                    does not override a clear AR-based classification. This keeps
+                    it a fallback for borderline cases, not a competing primary
+                    signal, since AR is the better-validated of the two.
+
+                    Needs at least one leg's both joints + a usable reference
+                    (spine or bbox) above min_kp_conf; frames with legs too
+                    occluded to measure stay UNCERTAIN rather than guessing.
+
+                    All four limb_*_ratio_{spine,bbox} thresholds in params.yaml
+                    are starting estimates, NOT calibrated against labeled data
+                    yet — plot each ratio's distribution for a labeled
+                    standing/lying validation set before trusting them. The bbox
+                    variant in particular is a rougher guess than the spine one,
+                    since it has no direct anatomical precedent to reason from.
+
 Per-frame outputs (returned as dict of 1D arrays, length = N_frames):
     "posture"        : np.ndarray[int8]   — Posture enum values (0/1/2)
     "posture_conf"   : np.ndarray[float32]— confidence of the classification [0,1]
@@ -30,7 +68,7 @@ casting them as a vote.
 import numpy as np
 
 import config
-from ..schema import Posture
+from ..schema import KP, Posture
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Thresholds — config/params.yaml → vision.posture
@@ -44,6 +82,110 @@ from ..schema import Posture
 
 def _cfg():
     return config.params().vision.posture
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Limb-extension geometry — see module docstring "Secondary signal" above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (joint, hoof) pairs — one per leg. Order doesn't matter, all four are pooled.
+_LEG_PAIRS: tuple[tuple[KP, KP], ...] = (
+    (KP.SHOULDER_L, KP.HOOF_FORE_L),
+    (KP.SHOULDER_R, KP.HOOF_FORE_R),
+    (KP.HIP_L,      KP.HOOF_BACK_L),
+    (KP.HIP_R,      KP.HOOF_BACK_R),
+)
+_SPINE_REF: tuple[KP, KP] = (KP.WITHERS, KP.SACRUM)
+
+
+def _limb_extension(
+    kps: np.ndarray,        # (N, 26, 3)
+    kps_kconf: np.ndarray,  # (N, 26)
+    bbox: np.ndarray,       # (N, 4) — x1, y1, x2, y2; bbox-diagonal fallback reference
+    cfg,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per-frame limb-extension ratio, its evidence weight, and which scale
+    reference was used.
+
+    Normalizing reference, in priority order:
+      1. withers↔sacrum spine length — preferred: purely anatomical, doesn't
+         move when the cow's posture/bbox shape changes.
+      2. bbox diagonal (sqrt(w²+h²)) — fallback for when the spine keypoints
+         aren't confidently visible. This matters more than an edge case: a
+         lying cow's spine keypoints are exactly the ones most likely to be
+         low-confidence (body collapsed, rear obscured), so without this
+         fallback the signal would be unavailable for a disproportionate
+         share of the frames it's most needed for.
+
+    Spine-normalized and bbox-normalized ratios are NOT on the same numeric
+    scale (a bbox diagonal spans the whole animal; the spine segment is just
+    the torso) — callers must use the separate `*_spine` / `*_bbox` threshold
+    pairs in params.yaml, keyed off the returned `ref_is_spine` flag, rather
+    than one threshold for both.
+
+    Returns
+    -------
+    limb_score   : (N,) float32 — confidence-weighted mean, across available
+                   legs, of (joint→hoof distance) / reference_length.
+                   NaN where no leg + usable reference was found.
+    limb_weight  : (N,) float32 in [0,1] — how much evidence backs limb_score.
+                   0.0 where limb_score is NaN. Scales with both per-leg
+                   keypoint confidence AND how many of the 4 legs were usable,
+                   so a frame with one barely-confident leg visible scores low
+                   even if that one leg's confidence alone looks OK.
+    ref_is_spine : (N,) bool — True where the spine reference was used,
+                   False where it fell back to the bbox diagonal. Meaningless
+                   where limb_score is NaN.
+    """
+    N = len(kps)
+    w_i, s_i = int(_SPINE_REF[0]), int(_SPINE_REF[1])
+
+    spine_c   = np.minimum(kps_kconf[:, w_i], kps_kconf[:, s_i])       # (N,)
+    spine_len = np.linalg.norm(kps[:, w_i, :2] - kps[:, s_i, :2], axis=1)  # (N,)
+    spine_ok  = (spine_c >= cfg.min_kp_conf) & (spine_len > 1.0)
+
+    bw = bbox[:, 2] - bbox[:, 0]
+    bh = bbox[:, 3] - bbox[:, 1]
+    bbox_diag = np.sqrt(bw ** 2 + bh ** 2)
+    bbox_ok   = (bw > 2.0) & (bh > 2.0)
+
+    ref_is_spine = spine_ok                                   # prefer spine whenever usable
+    ref_len      = np.where(ref_is_spine, spine_len, bbox_diag)
+    ref_ok       = ref_is_spine | bbox_ok                      # need SOME usable reference
+
+    n_legs = len(_LEG_PAIRS)
+    leg_ratio  = np.full((N, n_legs), np.nan, dtype=np.float32)
+    leg_weight = np.zeros((N, n_legs), dtype=np.float32)
+
+    for li, (joint, hoof) in enumerate(_LEG_PAIRS):
+        ji, hi = int(joint), int(hoof)
+        d = np.linalg.norm(kps[:, ji, :2] - kps[:, hi, :2], axis=1)
+        c = np.minimum(kps_kconf[:, ji], kps_kconf[:, hi])
+        usable = ref_ok & (c >= cfg.min_kp_conf)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = d / np.maximum(ref_len, 1e-6)
+        leg_ratio[usable, li]  = ratio[usable]
+        leg_weight[usable, li] = c[usable]
+
+    total_w = leg_weight.sum(axis=1)
+    has_any = total_w > 0
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        weighted_sum = np.nansum(np.nan_to_num(leg_ratio) * leg_weight, axis=1)
+        limb_score = np.where(has_any, weighted_sum / np.maximum(total_w, 1e-6), np.nan)
+
+    n_legs_usable = (leg_weight > 0).sum(axis=1)
+    # Mean per-leg confidence, scaled down further by how few legs were visible
+    # at all — one confident leg is weaker evidence than four confident legs.
+    limb_weight = np.where(
+        has_any,
+        (total_w / n_legs) * (n_legs_usable / n_legs),
+        0.0,
+    ).astype(np.float32)
+
+    return limb_score.astype(np.float32), limb_weight, ref_is_spine
 
 
 def extract_posture(
@@ -107,6 +249,39 @@ def extract_posture(
     posture[standing_mask] = int(Posture.STANDING)
     posture[lying_mask]    = int(Posture.LYING)
 
+    # ── limb-extension fallback for AR-ambiguous frames ─────────────────────
+    # Only touches frames that passed quality gates but fell in the ambiguous
+    # AR band — never overrides a clear AR-based call above.
+    ambiguous_mask = quality_ok & ~standing_mask & ~lying_mask
+    limb_resolved_mask = np.zeros(N, dtype=bool)
+    limb_score = limb_weight = None
+
+    if ambiguous_mask.any():
+        limb_score, limb_weight, ref_is_spine = _limb_extension(kps, kps_kconf, bbox, cfg)
+        resolvable = ambiguous_mask & (limb_weight >= cfg.min_limb_weight) & ~np.isnan(limb_score)
+
+        # Spine- and bbox-normalized ratios live on different scales, so each
+        # gets its own threshold pair — never compare limb_score to a single
+        # shared threshold regardless of which reference produced it.
+        resolvable_spine = resolvable & ref_is_spine
+        resolvable_bbox  = resolvable & ~ref_is_spine
+
+        limb_standing = (
+            (resolvable_spine & (limb_score >= cfg.limb_extended_min_ratio_spine)) |
+            (resolvable_bbox  & (limb_score >= cfg.limb_extended_min_ratio_bbox))
+        )
+        limb_lying = (
+            (resolvable_spine & (limb_score <= cfg.limb_folded_max_ratio_spine)) |
+            (resolvable_bbox  & (limb_score <= cfg.limb_folded_max_ratio_bbox))
+        )
+        # limb_score strictly between the two applicable thresholds: genuinely
+        # ambiguous even by this signal, so it's left as UNCERTAIN rather than
+        # guessing.
+
+        posture[limb_standing] = int(Posture.STANDING)
+        posture[limb_lying]    = int(Posture.LYING)
+        limb_resolved_mask = limb_standing | limb_lying
+
     # ── per-frame confidence ──────────────────────────────────────────────────
     # Confidence is a combination of:
     #   - how far the aspect ratio is from the ambiguous boundary
@@ -128,6 +303,16 @@ def extract_posture(
     w_ar       = cfg.ar_conf_weight
     kps_weight = np.clip(kps_coverage, 0, 1)
     conf_out   = (w_ar * ar_conf + (1.0 - w_ar) * kps_weight).astype(np.float32)
+
+    # Limb-resolved frames: confidence = limb_weight, scaled down by
+    # limb_resolved_conf_scale since this signal only ever activates where
+    # AR already couldn't decide — treat it as less certain than a clean
+    # AR-based call even when limb_weight itself is high.
+    if limb_resolved_mask.any():
+        conf_out[limb_resolved_mask] = (
+            cfg.limb_resolved_conf_scale * limb_weight[limb_resolved_mask]
+        ).astype(np.float32)
+
     conf_out[posture == int(Posture.UNCERTAIN)] = 0.0
 
     return {
