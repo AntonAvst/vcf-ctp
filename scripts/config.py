@@ -255,6 +255,15 @@ class PostureParams:
     min_kps_coverage: float
     min_det_conf: float
     ar_conf_weight: float
+    # Limb-extension fallback (resolves AR-ambiguous frames only) — see
+    # posture.py's module docstring and Key Design Decision 30.
+    min_kp_conf: float
+    limb_extended_min_ratio_spine: float
+    limb_folded_max_ratio_spine: float
+    limb_extended_min_ratio_bbox: float
+    limb_folded_max_ratio_bbox: float
+    min_limb_weight: float
+    limb_resolved_conf_scale: float
 
 
 @dataclass(frozen=True)
@@ -504,6 +513,8 @@ def _validate_params(p: Params) -> None:
         ("vision.min_slot_conf", p.vision.min_slot_conf),
         ("vision.facing.lying_conf_penalty", p.vision.facing.lying_conf_penalty),
         ("vision.posture.ar_conf_weight", p.vision.posture.ar_conf_weight),
+        ("vision.posture.min_limb_weight", p.vision.posture.min_limb_weight),
+        ("vision.posture.limb_resolved_conf_scale", p.vision.posture.limb_resolved_conf_scale),
     ]:
         _unit(v, where)
 
@@ -609,6 +620,14 @@ def _validate_params(p: Params) -> None:
     if p.vision.posture.standing_max_ar >= p.vision.posture.lying_min_ar:
         raise ConfigError("vision.posture: standing_max_ar must be < lying_min_ar "
                           "(the gap between them is the UNCERTAIN band)")
+
+    pz = p.vision.posture
+    if pz.limb_folded_max_ratio_spine >= pz.limb_extended_min_ratio_spine:
+        raise ConfigError("vision.posture: limb_folded_max_ratio_spine must be < "
+                          "limb_extended_min_ratio_spine (the gap between them is the UNCERTAIN band)")
+    if pz.limb_folded_max_ratio_bbox >= pz.limb_extended_min_ratio_bbox:
+        raise ConfigError("vision.posture: limb_folded_max_ratio_bbox must be < "
+                          "limb_extended_min_ratio_bbox (the gap between them is the UNCERTAIN band)")
 
     f = p.vision.facing
     if not 0 < f.depth_half_width < 90:
