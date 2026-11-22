@@ -36,6 +36,11 @@ from drive_manager import DriveManager, DriveNotSyncedError, DriveUnavailableErr
 from track_and_dump import parse_filename, make_session_id
 import config
 import identity_record
+try:
+    import cross_camera
+except Exception as _e:
+    cross_camera = None
+    print(f"[viewer] WARNING: cross_camera not importable ({_e}) — zones toggle will be a no-op")
 
 
 # ── optional deps checked at runtime ─────────────────────────────────────────
@@ -69,6 +74,7 @@ class _State:
         self.show_pose      = True
         self.show_direction = True
         self.show_mask      = True
+        self.show_zones     = True
 
     def toggle_pause(self):
         with self._lock:
@@ -104,6 +110,7 @@ class _State:
                         show_kp=self.show_kp, show_pose=self.show_pose,
                         show_direction=self.show_direction,
                         show_mask=self.show_mask,
+                        show_zones=self.show_zones,
                         current_dt=self.current_dt.isoformat()
                         if self.current_dt else None)
 
@@ -186,6 +193,37 @@ def draw_mask_overlay(img, poly_pts, color, alpha=0.35, outline_thickness=1):
     cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
     cv2.polylines(img, [pts], isClosed=True, color=color,
                   thickness=outline_thickness, lineType=cv2.LINE_AA)
+
+
+def draw_zones(img, zone_pairs, color=(0, 215, 255), thickness=2, alpha=0.12):
+    """
+    Draw each Boundary Rendezvous shared zone for this camera as a translucent
+    dashed-looking polygon (thin fill + solid outline) with the partner
+    camera's name labeled at its centroid. zone_pairs is this camera's rows
+    from cross_camera._zone_pairs_for_camera() — each has "this_poly"
+    (params.yaml pixel coords, this camera's own frame) and "partner_cam".
+    QA/visualization only; never affects the actual boundary-rendezvous logic,
+    which reads zone_a_poly/zone_b_poly from params.yaml directly.
+    """
+    if not zone_pairs:
+        return
+    for zp in zone_pairs:
+        poly = zp.get("this_poly")
+        if not poly or len(poly) < 3:
+            continue
+        pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
+        cv2.polylines(img, [pts], isClosed=True, color=color,
+                      thickness=thickness, lineType=cv2.LINE_AA)
+        cx = int(np.mean(pts[:, 0, 0])); cy = int(np.mean(pts[:, 0, 1]))
+        label = f"\u2194 {zp.get('partner_cam', '?')}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(img, (cx - tw//2 - 6, cy - th - 8), (cx + tw//2 + 6, cy + 6),
+                      (0, 0, 0), -1)
+        cv2.putText(img, label, (cx - tw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    color, 2, cv2.LINE_AA)
 
 
 def draw_box(img, x1, y1, x2, y2, tid, conf=None, animal_id=None, features=None,
@@ -632,6 +670,7 @@ button.active { background:#a6e3a1; color:#1e1e2e; }
   <button id="t_pose"      class="active" onclick="toggleFeature('pose')">🦴 Pose</button>
   <button id="t_direction" class="active" onclick="toggleFeature('direction')">🧭 Direction</button>
   <button id="t_mask"      class="active" onclick="toggleFeature('mask')">🎭 Mask</button>
+  <button id="t_zones"     class="active" onclick="toggleFeature('zones')">🚧 Zones</button>
   <button id="qbtn" onclick="doQuit()">⏹ Quit</button>
   <span id="clock"></span>
   <span id="status"></span>
@@ -690,7 +729,7 @@ function refreshSensor(){
 
 // ── status polling ───────────────────────────────────────────────────────────
 let paused=false;
-const FEATURES = ['bbox','id','kp','pose','direction','mask'];
+const FEATURES = ['bbox','id','kp','pose','direction','mask','zones'];
 setInterval(()=>{
   fetch('/api/status').then(r=>r.json()).then(s=>{
     paused = s.paused;
@@ -796,6 +835,45 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
     H   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     log(f"Video: {W}x{H} @ {fps:.2f} fps")
 
+    # ── cross-camera boundary zones for the "Zones" toggle ──────────────────
+    # camera_id comes from video_sessions (authoritative; session_id itself is
+    # an opaque key per README #23), falling back to parse_filename() for a
+    # session not in the DB yet. QA overlay only — never touches params.yaml.
+    zone_pairs = []
+    if cross_camera is not None:
+        camera_id = None
+        try:
+            c3 = sqlite3.connect(str(db))
+            row = c3.execute("SELECT camera_id FROM video_sessions WHERE session_id=?",
+                              (args.session_id,)).fetchone()
+            c3.close()
+            if row and row[0]:
+                camera_id = row[0]
+        except Exception:
+            pass
+        if camera_id is None:
+            try:
+                camera_id, *_ = parse_filename(str(vid))
+            except Exception:
+                camera_id = None
+        if camera_id:
+            try:
+                zone_pairs = cross_camera._zone_pairs_for_camera(camera_id)
+                if zone_pairs:
+                    log(f"Zones: {len(zone_pairs)} shared boundary(ies) for camera_id={camera_id!r}")
+                    for zp in zone_pairs:
+                        poly = zp.get("this_poly") or []
+                        xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
+                        if xs and ys and (min(xs) < 0 or max(xs) > W or min(ys) < 0 or max(ys) > H):
+                            log(f"WARNING: zone vs {zp.get('partner_cam')} extends outside "
+                                f"this {W}x{H} frame — params.yaml may be stale for this camera")
+                else:
+                    log(f"Zones: no camera_topology entries for camera_id={camera_id!r}")
+            except Exception as e:
+                log(f"WARNING: could not load camera_topology for zones overlay: {e}")
+        else:
+            log("Zones: could not determine this session's camera_id — zones toggle will be a no-op")
+
     row_stream = stream_sqlite(str(db), args.session_id,
                                start_frame=args.start,
                                want_pose=args.draw_pose,
@@ -840,6 +918,7 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         _show_pose      = _snap["show_pose"]
         _show_direction = _snap["show_direction"]
         _show_mask      = _snap["show_mask"]
+        _show_zones     = _snap["show_zones"]
 
         # ── advance past any fast-forwarded frames FIRST, then read the one
         # frame we are actually going to display. Previously cap.read() ran
@@ -898,6 +977,9 @@ def _video_loop(args, assignment, scores_df, session_start_dt, vision_index=None
         if session_start_dt is not None:
             current_fdt = session_start_dt + timedelta(seconds=frame_idx/fps)
         if current_fdt: STATE.set_dt(current_fdt)
+
+        if _show_zones and zone_pairs:
+            draw_zones(frame, zone_pairs)
 
         for d in dets:
             _aid = assignment.get(int(d["temp_id"]))

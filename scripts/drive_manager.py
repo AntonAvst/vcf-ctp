@@ -111,6 +111,18 @@ _FLAG_FILES = {
 DRIVE_DB_PATH        = "calving_project.db"
 DRIVE_GALLERY_PREFIX = "reid_gallery"
 DRIVE_COLLAR_PREFIX  = "collar_data"
+
+# Collar CSV kinds. The canonical filename prefix is f"{kind}_data_";
+# discovery also accepts the legacy prefixes (upload-kinetics wrote
+# "kinetics_data_" before the naming fix). A file's kind is decided by its
+# columns on upload, never by the command or the source filename.
+COLLAR_KINDS = ("kinetic", "behavior")
+_COLLAR_LEGACY_PREFIXES = {"kinetic": ("kinetics_data_",), "behavior": ()}
+_COLLAR_REQUIRED_COLS = {
+    "kinetic":  {"KineticsCountX", "KineticsCountY", "KineticsCountZ", "KineticsCountR"},
+    "behavior": {"f_1_2", "f_2_3", "v"},
+}
+COLLAR_IDS_SUFFIX = ".ids.txt"   # sidecar next to each collar CSV: one AnimalId per line
 DRIVE_OUTPUTS_PREFIX = "outputs"
 DRIVE_MODELS_PREFIX  = "models"
 
@@ -887,8 +899,11 @@ def find_collar_files(session_start_dt: "datetime",
     Discover collar CSV files on Drive whose time window overlaps the session.
 
     Canonical filename format (set by _cmd_upload_collar):
-        kinetic_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<ids>.csv
-        behavior_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<ids>.csv
+        kinetic_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__n<count>_<hash8>.csv
+        behavior_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__n<count>_<hash8>.csv
+    Only the prefix and the s/e timestamps are parsed, so older names with the
+    full ID list after "__" are still discovered, as are legacy
+    "kinetics_data_" files. The <name>.ids.txt sidecars are ignored here.
 
     kind: "kinetic" | "behavior"
 
@@ -901,7 +916,9 @@ def find_collar_files(session_start_dt: "datetime",
     """
     import re as _re
 
-    prefix   = f"{kind}_data_"
+    if kind not in COLLAR_KINDS:
+        raise ValueError(f"find_collar_files: kind must be one of {COLLAR_KINDS}, got {kind!r}")
+    prefixes  = (f"{kind}_data_",) + _COLLAR_LEGACY_PREFIXES[kind]
     drive_dir = f"{DRIVE_ROOT}/{DRIVE_COLLAR_PREFIX}/"
 
     # List files on Drive
@@ -919,7 +936,11 @@ def find_collar_files(session_start_dt: "datetime",
         return []
 
     all_files = [line.strip() for line in r.stdout.splitlines() if line.strip()]
-    candidates = [f for f in all_files if f.startswith(prefix) and f.endswith(".csv")]
+    candidates = [f for f in all_files if f.startswith(prefixes) and f.endswith(".csv")]
+    legacy = [f for f in candidates if f.startswith(_COLLAR_LEGACY_PREFIXES[kind])]
+    if legacy:
+        _log(f"find_collar_files: {len(legacy)} legacy-named {kind} file(s) on Drive "
+             f"(e.g. {legacy[0][:40]}...) — still used; re-upload to rename")
 
     if not candidates:
         _log(f"find_collar_files: no {kind}_data_*.csv files found on Drive")
@@ -992,9 +1013,17 @@ def load_collar_data(session_start_dt: "datetime",
     for f in files:
         try:
             df = _pd.read_csv(str(f), parse_dates=["datetime"])
-            dfs.append(df)
         except Exception as e:
             _log(f"  load_collar_data: could not read {f.name}: {e}")
+            continue
+        # Guard against a file of the other kind under this kind's name (the
+        # old upload-kinetics named behavior files "kinetics_data_...").
+        missing = _COLLAR_REQUIRED_COLS[kind] - set(df.columns)
+        if missing:
+            _log(f"  WARNING: {f.name} is named {kind} data but lacks columns "
+                 f"{sorted(missing)} — not used")
+            continue
+        dfs.append(df)
 
     if not dfs:
         return None
@@ -1005,8 +1034,10 @@ def load_collar_data(session_start_dt: "datetime",
     after  = len(merged)
     if before != after:
         _log(f"  load_collar_data({kind}): deduplicated {before - after} overlapping rows")
+    aids = sorted(merged["AnimalId"].unique().tolist())
+    shown = aids if len(aids) <= 20 else aids[:10] + ["..."] + aids[-3:]
     _log(f"  load_collar_data({kind}): {after} rows, "
-         f"animals: {sorted(merged['AnimalId'].unique().tolist())}")
+         f"{len(aids)} animals: {shown}")
     return merged
 
 
@@ -1163,26 +1194,26 @@ def _print_status() -> None:
     print()
 
 
-def _build_collar_filename(csv_path: Path, kind: str = "kinetic_data") -> "str | None":
+def _scan_collar_csv(csv_path: Path) -> "dict | None":
     """
-    Scan a collar CSV and build a canonical filename:
-        s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<id1>_<id2>_....csv
+    Scan a collar CSV and return what its canonical name is built from:
+        {"kind": "kinetic"|"behavior", "start": datetime, "end": datetime,
+         "ids": [AnimalId strings, sorted numerically]}
 
-    Returns the new filename string, or None if the file should be skipped.
+    Returns None (with a SKIP log line) if the file should not be uploaded.
 
     Rules:
-      - Skip files with fewer than 2 data lines (header + at least 2 rows).
-      - Datetime column must be named 'datetime'.
-      - Animal ID column must be named 'AnimalId'.
+      - Need a header + at least 2 data rows.
+      - 'datetime' and 'AnimalId' columns are required.
+      - Kind is decided by the columns (_COLLAR_REQUIRED_COLS), not by the
+        filename: KineticsCountX/Y/Z/R → kinetic, f_1_2/f_2_3/v → behavior.
       - Start = earliest datetime across all rows; end = latest.
-      - Animal IDs are sorted ascending and joined with '_'.
     """
     import csv as _csv
 
     try:
         with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-            reader = _csv.reader(fh)
-            rows = list(reader)
+            rows = list(_csv.reader(fh))
     except Exception as e:
         _log(f"  Cannot read {csv_path.name}: {e}")
         return None
@@ -1197,13 +1228,19 @@ def _build_collar_filename(csv_path: Path, kind: str = "kinetic_data") -> "str |
 
     header = [h.strip() for h in rows[0]]
 
-    # Locate required columns
     try:
         dt_col  = header.index("datetime")
         aid_col = header.index("AnimalId")
     except ValueError:
         _log(f"  SKIP {csv_path.name} — missing 'datetime' or 'AnimalId' column")
         return None
+
+    kinds = [k for k, cols in _COLLAR_REQUIRED_COLS.items() if cols <= set(header)]
+    if len(kinds) != 1:
+        _log(f"  SKIP {csv_path.name} — columns don't identify it as kinetic or behavior "
+             f"data (header: {header})")
+        return None
+    kind = kinds[0]
 
     datetimes = []
     animal_ids: set = set()
@@ -1224,8 +1261,7 @@ def _build_collar_filename(csv_path: Path, kind: str = "kinetic_data") -> "str |
         try:
             animal_ids.add(str(int(float(aid_raw))))
         except ValueError:
-            if aid_raw:
-                animal_ids.add(aid_raw)
+            animal_ids.add(aid_raw)
 
     if not datetimes:
         _log(f"  SKIP {csv_path.name} — no parseable datetime values")
@@ -1234,25 +1270,74 @@ def _build_collar_filename(csv_path: Path, kind: str = "kinetic_data") -> "str |
         _log(f"  SKIP {csv_path.name} — no parseable AnimalId values")
         return None
 
-    dt_fmt  = "%Y_%m_%d-%H_%M_%S"
-    t_start = min(datetimes).strftime(dt_fmt)
-    t_end   = max(datetimes).strftime(dt_fmt)
-    ids_str = "_".join(
-        sorted(animal_ids, key=lambda x: int(x) if x.isdigit() else x)
-    )
-    return f"{kind}_s{t_start}-e{t_end}__{ids_str}.csv"
+    # Numeric ids in numeric order, any non-numeric ones after them
+    ids = sorted(animal_ids, key=lambda x: (0, int(x), "") if x.isdigit() else (1, 0, x))
+    return {"kind": kind, "start": min(datetimes), "end": max(datetimes), "ids": ids}
+
+
+def _collar_ids_hash(ids: "list[str]") -> str:
+    """Short, order-independent fingerprint of an AnimalId set (8 hex chars)."""
+    import hashlib
+    key = "_".join(sorted(ids, key=lambda x: (0, int(x), "") if x.isdigit() else (1, 0, x)))
+    return hashlib.sha1(key.encode()).hexdigest()[:8]
+
+
+def _build_collar_filename(kind: str, start: datetime, end: datetime,
+                           ids: "list[str]") -> str:
+    """
+    Canonical collar filename:
+        <kind>_data_s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__n<count>_<hash8>.csv
+
+    The ID list itself is not in the name (a farm-wide export has hundreds of
+    ids and overflows the 255-byte filename limit); it goes in the
+    <name>.ids.txt sidecar. Same window + same ids → same name, so a repeated
+    upload is detectable; same window + different ids → different names.
+    """
+    dt_fmt = "%Y_%m_%d-%H_%M_%S"
+    return (f"{kind}_data_s{start.strftime(dt_fmt)}-e{end.strftime(dt_fmt)}"
+            f"__n{len(ids)}_{_collar_ids_hash(ids)}.csv")
+
+
+def _collar_sidecar_name(csv_name: str) -> str:
+    """kinetic_data_...csv → kinetic_data_....ids.txt"""
+    return csv_name[:-len(".csv")] + COLLAR_IDS_SUFFIX
+
+
+def _list_drive_collar_files() -> "set[str] | None":
+    """Names in collar_data/ on Drive, or None if Drive can't be listed."""
+    try:
+        r = subprocess.run(["rclone", "lsf", f"{DRIVE_ROOT}/{DRIVE_COLLAR_PREFIX}/"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        _log(f"  WARNING: could not list Drive collar_data/: {e}")
+        return None
+    if r.returncode != 0:
+        if "not found" in r.stderr.lower():
+            return set()   # folder doesn't exist yet — first upload
+        _log(f"  WARNING: could not list Drive collar_data/: {r.stderr.strip()}")
+        return None
+    return {line.strip() for line in r.stdout.splitlines() if line.strip()}
 
 
 def _cmd_upload_collar(dir_path: str, kind: str) -> None:
     """
-    Batch-upload all .csv files from a directory as collar data (kinetics or behavior).
+    Batch-upload the .csv files of one collar kind ("kinetic" | "behavior")
+    from a directory.
 
     For each file:
-      1. Skip files with fewer than 2 data lines.
-      2. Scan the file and derive a canonical filename from its content:
-             s<YYYY_MM_DD-HH_MM_SS>-e<YYYY_MM_DD-HH_MM_SS>__<id1>_<id2>_....csv
-      3. Copy renamed file to local collar_data/, then upload to Drive.
+      1. Scan it (_scan_collar_csv). Skip it if it has fewer than 2 data lines,
+         or if its columns show it's the other kind — a directory holding both
+         exports can be passed to both commands, each takes only its own files.
+      2. Build the canonical name (s/e window + id count + id-set hash).
+      3. Skip it if a file with that name is already on Drive (same window,
+         same cows — a repeated upload) or was already produced in this batch.
+      4. Copy it under the new name to local collar_data/, write the
+         <name>.ids.txt sidecar next to it, and upload both to Drive.
     """
+    if kind not in COLLAR_KINDS:
+        raise ValueError(f"_cmd_upload_collar: kind must be one of {COLLAR_KINDS}, got {kind!r}")
+    other_cmd = {"kinetic": "upload-behavior", "behavior": "upload-kinetics"}[kind]
+
     p = Path(dir_path).expanduser().resolve()
     if not p.exists():
         _log(f"ERROR: path not found: {p}")
@@ -1267,8 +1352,15 @@ def _cmd_upload_collar(dir_path: str, kind: str) -> None:
         _log(f"No .csv files found in: {p}")
         return
 
-    _log(f"Scanning {len(csv_files)} CSV file(s) in {p} ...")
+    _log(f"Scanning {len(csv_files)} CSV file(s) in {p} for {kind} data ...")
     LOCAL_COLLAR_DIR.mkdir(parents=True, exist_ok=True)
+
+    on_drive = _list_drive_collar_files()
+    if on_drive is None:
+        _log("  WARNING: Drive listing failed — cannot check for files already uploaded; "
+             "an existing file with the same name will be overwritten")
+        on_drive = set()
+    seen_this_batch: set = set()
 
     uploaded = skipped = failed = 0
 
@@ -1284,19 +1376,43 @@ def _cmd_upload_collar(dir_path: str, kind: str) -> None:
 
             _log(f"  Processing: {csv_path.name}")
 
-            new_name = _build_collar_filename(csv_path, kind=f"{kind}_data")
-            if new_name is None:
+            info = _scan_collar_csv(csv_path)
+            if info is None:
+                skipped += 1
+                continue
+            if info["kind"] != kind:
+                _log(f"  SKIP {csv_path.name} — contains {info['kind']} data "
+                     f"(upload it with {other_cmd})")
                 skipped += 1
                 continue
 
+            new_name = _build_collar_filename(kind, info["start"], info["end"], info["ids"])
+            if new_name in on_drive:
+                _log(f"  SKIP {csv_path.name} — already on Drive as {new_name} "
+                     f"(same time window and same {len(info['ids'])} cows)")
+                skipped += 1
+                continue
+            if new_name in seen_this_batch:
+                _log(f"  SKIP {csv_path.name} — duplicate of another file in this batch "
+                     f"({new_name})")
+                skipped += 1
+                continue
+            seen_this_batch.add(new_name)
+
             local_dest = LOCAL_COLLAR_DIR / new_name
             shutil.copy2(str(csv_path), str(local_dest))
-            _log(f"  Renamed  : {csv_path.name}  ->  {new_name}")
+            sidecar_name = _collar_sidecar_name(new_name)
+            local_sidecar = LOCAL_COLLAR_DIR / sidecar_name
+            local_sidecar.write_text("\n".join(info["ids"]) + "\n", encoding="utf-8")
+            _log(f"  Renamed  : {csv_path.name}  ->  {new_name}  "
+                 f"({len(info['ids'])} cows, {info['start']} – {info['end']})")
 
             drive_rel = f"{DRIVE_COLLAR_PREFIX}/{new_name}"
             ok = write_file(local_dest, drive_rel, caller="drive_manager_cli")
-            if ok:
-                _log(f"  Uploaded : {new_name}  ->  {DRIVE_ROOT}/{drive_rel}")
+            ok_ids = write_file(local_sidecar, f"{DRIVE_COLLAR_PREFIX}/{sidecar_name}",
+                                caller="drive_manager_cli")
+            if ok and ok_ids:
+                _log(f"  Uploaded : {new_name} (+ {COLLAR_IDS_SUFFIX})  ->  {DRIVE_ROOT}/{drive_rel}")
                 uploaded += 1
             else:
                 _log(f"  Buffered : {new_name} (upload failed — will retry)")
@@ -1432,7 +1548,7 @@ def main() -> None:
         if not arg:
             _log("ERROR: provide a directory path:  upload-kinetics /path/to/collar_data/")
             sys.exit(1)
-        _cmd_upload_collar(arg, "kinetics")
+        _cmd_upload_collar(arg, "kinetic")
 
     elif cmd == "upload-behavior":
         if not arg:
