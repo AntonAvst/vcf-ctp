@@ -4,15 +4,15 @@ vision_features/features/facing.py
 Per-frame facing direction classification: LEFT | RIGHT | TOWARD | AWAY | UNCERTAIN.
 
 Primary signal : spine axis derived from the two best back keypoints in
-                 {WITHERS(2), SPINE_MID(3), SACRUM(4), TAIL_BASE(5)}.
+                 {WITHERS(4), SPINE_MID(5), SACRUM(6), TAIL_BASE(7)}.
 
-                 Head/neck keypoints (NOSE=0, FOREHEAD=1, NECK=18) are
-                 intentionally excluded — they are too mobile and occlude
-                 easily, making them unreliable direction anchors.
+                 Head/neck/eye keypoints (NOSE=0, EYE_R=1, EYE_L=2, NECK=3)
+                 are intentionally excluded — they are too mobile and
+                 occlude easily, making them unreliable direction anchors.
 
 Spine axis selection (per frame)
 ─────────────────────────────────
-Candidate back KPs: WITHERS(2), SPINE_MID(3), SACRUM(4), TAIL_BASE(5).
+Candidate back KPs: WITHERS(4), SPINE_MID(5), SACRUM(6), TAIL_BASE(7).
 
 Two selection strategies are tried in order:
 
@@ -256,8 +256,8 @@ def _angle_confidence(angle_deg: float, facing_label: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_facing(
-    kps: np.ndarray,                      # (N, 19, 3) — x, y, conf
-    kps_kconf: np.ndarray,                # (N, 19)    — per-keypoint confidence
+    kps: np.ndarray,                      # (N, 26, 3) — x, y, conf
+    kps_kconf: np.ndarray,                # (N, 26)    — per-keypoint confidence
     bbox: np.ndarray,                     # (N, 4)     — x1, y1, x2, y2 (unused, kept for API compat)
     posture: np.ndarray | None = None,    # (N,) int8 Posture values — optional
 ) -> dict[str, np.ndarray]:
@@ -266,8 +266,8 @@ def extract_facing(
 
     Parameters
     ----------
-    kps        : (N, 19, 3)  keypoint array [x, y, conf].
-    kps_kconf  : (N, 19)     per-keypoint confidence.
+    kps        : (N, 26, 3)  keypoint array [x, y, conf].
+    kps_kconf  : (N, 26)     per-keypoint confidence.
     bbox       : (N, 4)      bounding boxes — not used, kept for API compatibility.
     posture    : (N,)        optional; LYING frames receive a confidence penalty.
 

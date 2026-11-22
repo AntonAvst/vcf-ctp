@@ -25,7 +25,7 @@ from enum import IntEnum
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMBED_DIM: int = 128          # Embedder128 output, gallery vector width
-N_KP: int = 19                # pose model keypoints (see KP below)
+N_KP: int = 26                # pose model keypoints (see KP below) — cow-pose-estimation-2, Nov 2026
 
 # ImageNet normalisation for the MobileNetV3 backbone (RGB order)
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
@@ -33,29 +33,51 @@ IMAGENET_STD:  tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Keypoint index map  (N_KP = 19)
+# Keypoint index map  (N_KP = 26)
+#
+# Source: Roboflow project "cow-pose-estimation-2" v2 (_annotations_coco.json
+# categories[1].keypoints), Nov 2026. Replaces the old 19-point scheme below —
+# this is a full rebuild, not an extension: indices are NOT backward-compatible
+# with any 19-kp Parquet data (see N_KP docstring above re: full rebuild on
+# structural-constant changes).
+#
+#   0  nose          1  forehead      2  withers       3  spine_mid
+#   4  sacrum        5  tail_base     6  tail_tip       7  shoulder_L
+#   8  elbow_L       9  fetlock_fore_L  10 shoulder_R  11 elbow_R
+#   12 fetlock_fore_R  13 hock_R      14 hock_L        15 fetlock_hind_L
+#   16 fetlock_hind_R  17 udder_center  18 neck
+#
+# (kept here only as a historical note for anyone diffing old sessions —
+# the enum below is the live one.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KP(IntEnum):
-    NOSE             = 0
-    FOREHEAD         = 1
-    WITHERS          = 2
-    SPINE_MID        = 3
-    SACRUM           = 4
-    TAIL_BASE        = 5
-    TAIL_TIP         = 6
-    SHOULDER_L       = 7
-    ELBOW_L          = 8
-    FETLOCK_FORE_L   = 9
-    SHOULDER_R       = 10
-    ELBOW_R          = 11
-    FETLOCK_FORE_R   = 12
-    HOCK_R           = 13
-    HOCK_L           = 14
-    FETLOCK_HIND_L   = 15
-    FETLOCK_HIND_R   = 16
-    UDDER_CENTER     = 17
-    NECK             = 18
+    NOSE              = 0
+    EYE_R              = 1
+    EYE_L              = 2
+    NECK               = 3
+    WITHERS            = 4
+    SPINE_MID          = 5
+    SACRUM             = 6
+    TAIL_BASE          = 7
+    TAIL_MID           = 8
+    TAIL_TIP           = 9
+    SHOULDER_L         = 10
+    CARPUS_L           = 11
+    FETLOCK_FORE_L     = 12
+    HOOF_FORE_L        = 13
+    SHOULDER_R         = 14
+    CARPUS_R           = 15
+    FETLOCK_FORE_R     = 16
+    HOOF_FORE_R        = 17
+    HIP_L              = 18
+    HOCK_L             = 19
+    FETLOCK_BACK_L     = 20
+    HOOF_BACK_L        = 21
+    HIP_R              = 22
+    HOCK_R             = 23
+    FETLOCK_BACK_R     = 24
+    HOOF_BACK_R        = 25
 
 
 assert len(KP) == N_KP, "KP enum and N_KP disagree"
@@ -63,6 +85,7 @@ assert len(KP) == N_KP, "KP enum and N_KP disagree"
 # Back keypoints defining the spine axis for facing classification, ordered
 # anterior → posterior (facing.py relies on this order: lower list index =
 # more forward). Head/neck excluded on purpose — they move independently.
+# Same four landmarks as the old 19-kp scheme, just at their new indices.
 BACK_KPS: tuple[KP, ...] = (KP.WITHERS, KP.SPINE_MID, KP.SACRUM, KP.TAIL_BASE)
 
 

@@ -47,8 +47,8 @@ def _cfg():
 
 
 def extract_posture(
-    kps: np.ndarray,        # (N, 19, 3) — x, y, conf  (pixel coords, conf∈[0,1])
-    kps_kconf: np.ndarray,  # (N, 19)    — per-keypoint confidence
+    kps: np.ndarray,        # (N, 26, 3) — x, y, conf  (pixel coords, conf∈[0,1])
+    kps_kconf: np.ndarray,  # (N, 26)    — per-keypoint confidence
     bbox: np.ndarray,       # (N, 4)     — x1, y1, x2, y2
     det_conf: np.ndarray | None = None,  # (N,) — optional detection confidences
 ) -> dict[str, np.ndarray]:
@@ -57,8 +57,8 @@ def extract_posture(
 
     Parameters
     ----------
-    kps        : (N, 19, 3)  raw keypoint array; third dimension is [x, y, conf].
-    kps_kconf  : (N, 19)     per-keypoint confidence scores.
+    kps        : (N, 26, 3)  raw keypoint array; third dimension is [x, y, conf].
+    kps_kconf  : (N, 26)     per-keypoint confidence scores.
     bbox       : (N, 4)      bounding boxes [x1, y1, x2, y2].
     det_conf   : (N,)        optional; detection confidence per frame.
                              If None, det_conf check is skipped.

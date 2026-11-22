@@ -516,9 +516,9 @@ class KpsWriter:
                 "frame_index": pa.array([r["frame_index"] for r in chunk], pa.int32()),
                 "temp_id":     pa.array([r["temp_id"]     for r in chunk], pa.int32()),
                 "kps": pa.FixedSizeListArray.from_arrays(
-                    pa.array(kps_arr.ravel().tolist(), pa.float32()), 57),
+                    pa.array(kps_arr.ravel().tolist(), pa.float32()), N_KP * 3),
                 "kps_kconf": pa.FixedSizeListArray.from_arrays(
-                    pa.array(kconf_arr.ravel().tolist(), pa.float32()), 19),
+                    pa.array(kconf_arr.ravel().tolist(), pa.float32()), N_KP),
             }, schema=KPS_SCHEMA)
             self._writer.write_table(tbl)
             self._part_rows += len(chunk)
